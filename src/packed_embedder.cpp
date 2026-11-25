@@ -2,6 +2,7 @@
 // Read original TFLite FlatBuffer in place (mmap); no TensorFlow dependency.
 // Only the verified Gemma Section0 / Section2 decode graph topology is accepted.
 // Output equivalence must be independently proven against reference tensors.
+#include "packed_embedder.h"
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -342,6 +343,25 @@ struct Model {
     }
 };
 
+} // namespace
+
+namespace gemma4 {
+std::vector<uint8_t> compute_packed_embedding(
+        const std::string& model_file, int section, int token) {
+    const Model model(model_file, section, token);
+    const std::vector<float> output = model.run();
+    const size_t byte_size = output.size() * sizeof(float);
+    std::vector<uint8_t> bytes(byte_size);
+    std::memcpy(bytes.data(), output.data(), byte_size);
+    std::cout << "PACKED_EMBED_RAM_READY: section=" << section
+              << " token=" << token << " bytes=" << bytes.size()
+              << "\n" << std::flush;
+    return bytes;
+}
+} // namespace gemma4
+
+#ifndef GEMMA4_PACKED_EMBED_LIBRARY
+namespace {
 struct Args {
     std::string model,output,reference;
     int token=-1,section=-1;
@@ -430,3 +450,5 @@ int main(int argc,char** argv) {
         return 1;
     }
 }
+
+#endif // GEMMA4_PACKED_EMBED_LIBRARY

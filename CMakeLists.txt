@@ -67,3 +67,11 @@ target_compile_options(gemma4-packed-embed PRIVATE -Wall -Wextra -Wpedantic)
 if(BUILD_TESTING)
   add_test(NAME packed_embedder_help COMMAND gemma4-packed-embed --help)
 endif()
+
+# Stage 5.9: reuse verified native packed embedding code in same QNN process.
+# Do not link CLI main into the QNN executable.
+add_library(gemma4-packed-embed-core STATIC src/packed_embedder.cpp)
+target_compile_definitions(gemma4-packed-embed-core PRIVATE GEMMA4_PACKED_EMBED_LIBRARY=1)
+target_include_directories(gemma4-packed-embed-core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_compile_options(gemma4-packed-embed-core PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(gemma4-qnn-run PRIVATE gemma4-packed-embed-core)
