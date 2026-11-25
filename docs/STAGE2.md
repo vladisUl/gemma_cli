@@ -66,6 +66,21 @@ find ~/gemma4_qnn_test -type f -name '*.raw' -size 1536c -print
 
 Если вход хранится только в WSL, ищите там среди артефактов теста; копируйте нужный файл на Radxa через `scp`. По одному лишь размеру нельзя определить, какой файл является настоящим входом LM Head. Эталонные 262144 байта logits также должны соответствовать **этому же входу**.
 
+## Результат проверки `QnnGraph_execute` на Q8B (2026-11-25)
+
+Реальный тест с сохранённой парой `real_result_decode_17` и `real_result_head_17` **успешно выполнен** на устройстве:
+
+```text
+QNN_EXECUTE_OK: qnn_partition_1 load_ms=81.007 avg_execute_ms=12.716 repeat=1 ... bytes=262144
+REFERENCE_MATCH: 262144 bytes identical
+```
+
+Вход: 1536 байт sfix8 из `real_result_decode_17/Result_0/LanguageModel_decode_graph_LanguageModel_transformer_stack_transformer_transformer_final_norm_composite_quantized_native.raw`.
+
+Эталон: `real_result_head_17/Result_0/StatefulPartitionedCall_30_native.raw` (262144 байта sfix8).
+
+Это подтверждает прямой QNN inference LM Head и точное совпадение с `qnn-net-run`. Для следующего этапа — 38 входов Decode — см. [Stage 3](STAGE3.md).
+
 ## Тест 2: LM Head на NPU
 
 Используйте **именно сохранённый вход LM Head** из уже удачного запуска `qnn-net-run`. Это сырой квантованный тензор, а не текст и не float32 embeddings. Никаких нулевых заглушек.
