@@ -80,15 +80,23 @@ public:
             release();
             throw;
         }
-        if(registered_!=30)
+        if(registered_!=30) {
+            release();
             throw std::runtime_error("STAGE82_REGISTERED_KV_NOT_30");
-        size_t sum=0;
-        for(const auto& b:buffers_)sum+=b.bytes;
-        std::cout<<"STAGE82_MEM_REGISTERED: tensors="<<registered_
-                 <<" bytes="<<sum<<" source=rpcmem fd_handles=1"
-                 <<" backend_io=memhandle decode_only=1"
-                 <<" cpu_mirror_only_new_slot=1\n"<<std::flush;
-        verify_equal("initial");
+        }
+        try {
+            size_t sum=0;
+            for(const auto& b:buffers_)sum+=b.bytes;
+            std::cout<<"STAGE82_MEM_REGISTERED: tensors="<<registered_
+                     <<" bytes="<<sum<<" source=rpcmem fd_handles=1"
+                     <<" backend_io=memhandle decode_only=1"
+                     <<" cpu_mirror_only_new_slot=1\n"<<std::flush;
+            verify_equal("initial");
+        } catch(...) {
+            // A constructor that throws does not run its own destructor.
+            release();
+            throw;
+        }
     }
     ~Stage82KvMem(){release();}
     Stage82KvMem(const Stage82KvMem&)=delete;
