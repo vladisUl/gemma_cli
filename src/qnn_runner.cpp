@@ -2,6 +2,8 @@
 // Uses QNN System metadata as the source of truth for graph I/O.
 // Intended for QAIRT 2.47 on Radxa Q8B; first target is Gemma 4 LM Head.
 #include <QNN/QnnInterface.h>
+#include <QNN/QnnMem.h>
+#include <QNN/QnnProfile.h>
 #include <QNN/System/QnnSystemInterface.h>
 #include "kv_cache.h"
 #include "cpu_aux.h"
@@ -368,6 +370,25 @@ struct QnnRuntime {
     Qnn_DeviceHandle_t device = nullptr;
     std::vector<Qnn_ContextHandle_t> contexts;
     bool device_created = false;
+    std::vector<std::pair<Qnn_GraphHandle_t,Qnn_ContextHandle_t>> graph_contexts;
+    bool profile_pending=false;
+    bool profile_detailed=false;
+    uint32_t profile_step=0;
+    std::string profile_label;
+
+    Qnn_ContextHandle_t context_for(Qnn_GraphHandle_t graph) const {
+        for(const auto& item:graph_contexts)
+            if(item.first==graph)return item.second;
+        throw std::runtime_error("STAGE82_CONTEXT_NOT_FOUND");
+    }
+    void profile_next(const std::string& label,uint32_t step,bool detailed) {
+        if(profile_pending)
+            throw std::runtime_error("STAGE82_PROFILE_ALREADY_ARMED");
+        profile_pending=true;
+        profile_label=label;
+        profile_step=step;
+        profile_detailed=detailed;
+    }
 
     explicit QnnRuntime(const std::string& path) : library(path) {
         const auto getter =
@@ -412,6 +433,7 @@ struct QnnRuntime {
         contexts.push_back(context);
         Qnn_GraphHandle_t graph = nullptr;
         check(api.graphRetrieve(context, name.c_str(), &graph), "graphRetrieve(" + name + ")");
+        graph_contexts.emplace_back(graph,context);
         return graph;
     }
 
@@ -419,10 +441,68 @@ struct QnnRuntime {
                  const std::vector<Qnn_Tensor_t>& inputs,
                  std::vector<Qnn_Tensor_t>& outputs) {
         const auto& api = provider->QNN_INTERFACE_VER_NAME;
-        check(api.graphExecute(graph, inputs.data(), static_cast<uint32_t>(inputs.size()),
-                                outputs.data(), static_cast<uint32_t>(outputs.size()),
-                                nullptr, nullptr),
-              "QnnGraph_execute");
+        if(!profile_pending) {
+            check(api.graphExecute(graph, inputs.data(), static_cast<uint32_t>(inputs.size()),
+                                   outputs.data(), static_cast<uint32_t>(outputs.size()),
+                                   nullptr, nullptr),"QnnGraph_execute");
+            return;
+        }
+        profile_pending=false;
+        if(!api.profileCreate || !api.profileFree || !api.profileGetEvents ||
+           !api.profileGetEventData)
+            throw std::runtime_error("STAGE82_QNN_PROFILE_APIS_UNAVAILABLE");
+        Qnn_ProfileHandle_t profile=nullptr;
+        check(api.profileCreate(backend,
+            profile_detailed?QNN_PROFILE_LEVEL_DETAILED:QNN_PROFILE_LEVEL_BASIC,
+            &profile),"STAGE82_PROFILE_CREATE");
+        try {
+            const auto t0=std::chrono::steady_clock::now();
+            check(api.graphExecute(graph, inputs.data(), static_cast<uint32_t>(inputs.size()),
+                                   outputs.data(), static_cast<uint32_t>(outputs.size()),
+                                   profile, nullptr),"STAGE82_PROFILE_GRAPH_EXECUTE");
+            const double graph_ms=std::chrono::duration<double,std::milli>(
+                std::chrono::steady_clock::now()-t0).count();
+            const QnnProfile_EventId_t* ids=nullptr;
+            uint32_t count=0;
+            check(api.profileGetEvents(profile,&ids,&count),"STAGE82_PROFILE_EVENTS");
+            std::cout<<"STAGE82_PROFILE_CALL: graph="<<profile_label
+                     <<" step="<<profile_step<<" graph_call_ms="<<graph_ms
+                     <<" top_events="<<count<<" level="
+                     <<(profile_detailed?"detailed":"basic")<<"\n"<<std::flush;
+            size_t emitted=0;
+            const auto dump=[&](auto&& self,QnnProfile_EventId_t id,
+                                uint32_t depth)->void {
+                if(emitted>=512 || depth>5)return;
+                QnnProfile_EventData_t data=QNN_PROFILE_EVENT_DATA_INIT;
+                if(api.profileGetEventData(id,&data)!=QNN_SUCCESS)return;
+                std::string name=data.identifier?data.identifier:"(none)";
+                for(char& c:name)
+                    if(c=='\n' || c=='\r' || c=='\t' || c==' ')c='_';
+                if(name.size()>120)name.resize(120);
+                std::cout<<"STAGE82_PROFILE_EVENT: graph="<<profile_label
+                         <<" step="<<profile_step<<" depth="<<depth
+                         <<" type="<<static_cast<uint32_t>(data.type)
+                         <<" unit="<<static_cast<uint32_t>(data.unit)
+                         <<" value="<<data.value<<" identifier="<<name
+                         <<"\n"<<std::flush;
+                ++emitted;
+                if(!api.profileGetSubEvents)return;
+                const QnnProfile_EventId_t* children=nullptr;
+                uint32_t n=0;
+                if(api.profileGetSubEvents(id,&children,&n)!=QNN_SUCCESS)return;
+                for(uint32_t j=0;j<n && emitted<512;++j)
+                    self(self,children[j],depth+1);
+            };
+            for(uint32_t k=0;k<count && emitted<512;++k)
+                dump(dump,ids[k],0);
+            std::cout<<"STAGE82_PROFILE_DONE: graph="<<profile_label
+                     <<" step="<<profile_step<<" reported_events="<<emitted
+                     <<" event_limit=512\n"<<std::flush;
+        } catch(...) {
+            api.profileFree(profile);
+            throw;
+        }
+        check(api.profileFree(profile),"STAGE82_PROFILE_FREE");
     }
 };
 
@@ -462,6 +542,10 @@ struct Options {
     bool dynamic_prefill = false;
     bool dynamic_benchmark = false;
     bool dynamic_bench_fixed_steps_set = false;
+    bool dynamic_memhandle_kv = false;
+    bool dynamic_bench_checksums = false;
+    bool dynamic_qnn_profile_set = false;
+    bool dynamic_qnn_profile_detailed = false;
     uint32_t dynamic_bench_fixed_steps = 0;
     bool dynamic_tie_policy_set = false;
     bool dynamic_allow_tie_lowest = false;
@@ -626,6 +710,12 @@ void usage(const char* executable) {
         << "  --dynamic-bench-fixed-steps N (1..256): Stage 8.1 synthetic\n"
         << "     fixed-token throughput: always update KV, ignore model EOS/ties.\n"
         << "     Requires --dynamic-prefill --dynamic-benchmark; NOT normal text.\n"
+        << "  --dynamic-kv-memhandle: Stage 8.2 opt-in RPCmem KV inputs;\n"
+        << "     requires --dynamic-bench-fixed-steps (NOT text generation).\n"
+        << "  --dynamic-bench-checksums: output digests for RAW/MEMHANDLE\n"
+        << "     equivalence preflight (may slow execution).\n"
+        << "  --dynamic-qnn-profile basic|detailed: sample select Decode/Head\n"
+        << "     graphExecute calls; profiling affects speed.\n"
         << "  --dynamic-tie-policy stop|lowest-id (default stop):\n"
         << "     lowest-id is EXPERIMENTAL, quantized-tie only, no FP32 claim.\n"
         << "  --prefill-stop-on-eos: LF107 continuation; EOS ids 1,106,50 stop.\n"
@@ -674,6 +764,18 @@ Options parse_options(int argc, char** argv) {
         }
         if (arg == "--prefill-kv-probe") {
             options.prefill_kv_probe = true;
+            continue;
+        }
+        if (arg == "--dynamic-bench-checksums") {
+            if(options.dynamic_bench_checksums)
+                throw std::runtime_error("--dynamic-bench-checksums duplicated");
+            options.dynamic_bench_checksums=true;
+            continue;
+        }
+        if (arg == "--dynamic-kv-memhandle") {
+            if(options.dynamic_memhandle_kv)
+                throw std::runtime_error("--dynamic-kv-memhandle duplicated");
+            options.dynamic_memhandle_kv=true;
             continue;
         }
         if (arg == "--dynamic-benchmark") {
@@ -764,6 +866,14 @@ Options parse_options(int argc, char** argv) {
                     "--dynamic-tie-policy must be stop or lowest-id exactly once");
             options.dynamic_tie_policy_set=true;
             options.dynamic_allow_tie_lowest=(value=="lowest-id");
+        }
+        else if (arg == "--dynamic-qnn-profile") {
+            if(options.dynamic_qnn_profile_set ||
+               (value!="basic" && value!="detailed"))
+                throw std::runtime_error(
+                    "--dynamic-qnn-profile expects basic|detailed exactly once");
+            options.dynamic_qnn_profile_set=true;
+            options.dynamic_qnn_profile_detailed=(value=="detailed");
         }
         else if (arg == "--dynamic-bench-fixed-steps") {
             if(options.dynamic_bench_fixed_steps_set ||
@@ -902,6 +1012,11 @@ Options parse_options(int argc, char** argv) {
         if (options.system.empty() || options.backend.empty())
             throw std::runtime_error("--jobs needs --system and --backend");
         if(options.dynamic_prefill) {
+            if((options.dynamic_memhandle_kv || options.dynamic_qnn_profile_set ||
+                options.dynamic_bench_checksums) &&
+               (!options.dynamic_benchmark || !options.dynamic_bench_fixed_steps_set))
+                throw std::runtime_error(
+                    "Stage 8.2 requires --dynamic-benchmark --dynamic-bench-fixed-steps");
             if(options.dynamic_bench_fixed_steps_set &&
                (!options.dynamic_benchmark ||
                 options.dynamic_tie_policy_set ||
@@ -936,6 +1051,9 @@ Options parse_options(int argc, char** argv) {
         if(options.dynamic_bench_fixed_steps_set)
             throw std::runtime_error(
                 "--dynamic-bench-fixed-steps requires --dynamic-prefill");
+        if(options.dynamic_memhandle_kv || options.dynamic_qnn_profile_set ||
+           options.dynamic_bench_checksums)
+            throw std::runtime_error("Stage 8.2 flags require --dynamic-prefill");
         if(!options.dynamic_prompt_tokens.empty() ||
            !options.dynamic_section0.empty() ||
            !options.dynamic_section1.empty() ||
@@ -1069,6 +1187,8 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.dynamic_prefill || options.dynamic_tie_policy_set ||
         options.dynamic_benchmark || options.dynamic_bench_fixed_steps_set ||
+        options.dynamic_memhandle_kv || options.dynamic_qnn_profile_set ||
+        options.dynamic_bench_checksums ||
         !options.dynamic_prompt_tokens.empty() ||
         !options.dynamic_section0.empty() || !options.dynamic_section1.empty() ||
         !options.dynamic_section2.empty() || options.dynamic_max_tokens!=16 ||
@@ -2650,6 +2770,7 @@ void execute_prefill_linked_decode(
                                   kv,options,scratch_caches);
 }
 
+#include "stage8_2_kv_memhandle.inc"
 #include "stage7_2_dynamic.inc"
 
 int run_replay_jobs(const Options& options) {

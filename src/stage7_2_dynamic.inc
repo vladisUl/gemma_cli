@@ -227,6 +227,9 @@ void run_stage7_2_dynamic(
         decode->input_buffers[found]=std::move(value);
         return found;
     };
+    std::unique_ptr<Stage82KvMem> stage82_mem;
+    if(options.dynamic_memhandle_kv)
+        stage82_mem=std::make_unique<Stage82KvMem>(runtime,*decode,links);
     // Stage 8.1: fixed-length SYNTHETIC load test. Each QNN graph is executed
     // for the same real inputs as Stage 7.x, but after the header LF107,
     // force token ID 236778 ("2") on EVERY subsequent Decode position.
@@ -248,6 +251,7 @@ void run_stage7_2_dynamic(
                  <<" decode_first_token="<<seed
                  <<" decode_replay_token="<<fixed_token
                  <<" context_capacity=4096"
+                 <<" kv_binding="<<(stage82_mem?"memhandle":"raw")
                  <<" synthetic_fixed_input=1 no_eos_stop=1"
                  <<" no_argmax_tie_stop=1 kv_feedback_each_step=1"
                  <<" excludes_context_load_from_decode_rate=1\n"<<std::flush;
@@ -278,9 +282,17 @@ void run_stage7_2_dynamic(
                 throw std::runtime_error("BENCH81_DECODE_INPUTS_INCOMPLETE");
             for(size_t i=0;i<decode->inputs.size();++i)
                 bind_raw(decode->inputs[i],decode->input_buffers[i]);
+            if(stage82_mem)stage82_mem->bind_all();
             const auto t1=std::chrono::steady_clock::now();
+            const bool profile_sample=options.dynamic_qnn_profile_set &&
+                (step==1 || step==2 || step==16 || step==64 ||
+                 step==128 || step==steps);
+            if(profile_sample)
+                runtime.profile_next("decode",step,options.dynamic_qnn_profile_detailed);
             runtime.execute(decode->handle,decode->inputs,decode->outputs);
             const auto t2=std::chrono::steady_clock::now();
+            if(profile_sample)
+                runtime.profile_next("head",step,options.dynamic_qnn_profile_detailed);
             execute_chained_decode_head(runtime,*decode,*head,hidden,true);
             const auto t3=std::chrono::steady_clock::now();
             size_t feedback_bytes=0,cache_updates=0;
@@ -291,12 +303,33 @@ void run_stage7_2_dynamic(
                     cache,slice,link.channels,4096,pos,
                     link.key?gemma4::KvLayout::Key:
                              gemma4::KvLayout::Value);
+                if(stage82_mem)stage82_mem->mirror_slot(link,slice,pos);
                 feedback_bytes+=slice.size();
                 ++cache_updates;
             }
             if(feedback_bytes!=9216 || cache_updates!=30)
                 throw std::runtime_error("BENCH81_KV_FEEDBACK_INVALID");
             const auto t4=std::chrono::steady_clock::now();
+            if(stage82_mem && step==steps)
+                stage82_mem->verify_equal("final");
+            if(options.dynamic_bench_checksums) {
+                const auto fnv=[](uint64_t& hash,
+                                  const std::vector<uint8_t>& v) {
+                    for(const uint8_t byte:v) {
+                        hash^=byte;
+                        hash*=uint64_t{1099511628211};
+                    }
+                };
+                uint64_t decode_hash=uint64_t{14695981039346656037};
+                uint64_t head_hash=uint64_t{14695981039346656037};
+                for(const auto& v:decode->output_buffers)
+                    fnv(decode_hash,v);
+                fnv(head_hash,head->output_buffers.at(0));
+                std::cout<<"STAGE82_CHECKSUM: step="<<step
+                         <<" decode_fnv="<<decode_hash
+                         <<" head_fnv="<<head_hash
+                         <<" comparable_raw_memhandle=1\n"<<std::flush;
+            }
             const double cpu=ms(t1,t0),dec=ms(t2,t1);
             const double head_call=ms(t3,t2),feedback=ms(t4,t3);
             const double total=ms(t4,t0);
@@ -333,7 +366,12 @@ void run_stage7_2_dynamic(
                  <<" first_step_ms="<<first_step_ms
                  <<" decode_steps_per_s="<<(steps_total>0?1000.0*steps/steps_total:0.0)
                  <<" workload_wall_ms="<<workload_wall_ms
-                 <<" synthetic_not_text_generation=1\n"<<std::flush;
+                 <<" synthetic_not_text_generation=1"
+                 <<" kv_binding="<<(stage82_mem?"memhandle":"raw")
+                 <<" qnn_profile="<<(options.dynamic_qnn_profile_set?
+                    (options.dynamic_qnn_profile_detailed?"detailed":"basic"):"off")
+                 <<" full_KV_verified="<<(stage82_mem?1:0)
+                 <<"\n"<<std::flush;
         return;
     }
 

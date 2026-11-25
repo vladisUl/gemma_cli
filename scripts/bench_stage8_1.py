@@ -176,7 +176,8 @@ def parse_fixed_log(log, requested_steps):
     }
 
 
-def run_fixed(work, runner, target, label, prompt, steps):
+def run_fixed(work, runner, target, label, prompt, steps,
+              extra_runner_args=()):
     raw = target / (label + ".raw")
     logfile = target / (label + ".log")
     start = time.perf_counter()
@@ -211,6 +212,7 @@ def run_fixed(work, runner, target, label, prompt, steps):
         "--dynamic-section2", str(
             work / "cpu_models/Section2_TFLiteModel_tf_lite_per_layer_embedder.tflite"),
     ]
+    command.extend(extra_runner_args)
     with logfile.open("wb") as file:
         status = subprocess.run(command, cwd=work, env=env,
                                 stdout=file, stderr=subprocess.STDOUT,

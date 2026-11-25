@@ -319,3 +319,126 @@ tokens, 1024 KV capacity, eight CPU threads, MTP disabled. The next
 performance investigation should first check per-step latency across
 positions and HTP clock/thermal behavior; true 256/256/1024 requires
 different validated QNN contexts.
+
+
+## Stage 8.2 — QNN HTP profile + RAW/MEMHANDLE KV A/B
+
+Status: **source committed; QAIRT 2.47 compilation and Q8B execution
+NOT yet confirmed**. This is an opt-in hardware compatibility
+experiment. No original AOT context or model is rebuilt or modified.
+
+### Problem
+
+QNN Decode takes 30 INT8 KV input tensors, each with context
+capacity 4096; together they total **37,748,736 bytes (36 MiB)**.
+Only 30 new slices totaling **9216 bytes (9 KiB)** are updated
+on the CPU after each Decode step. Stage 8.1 measured ~72.903 ms
+per blocking Decode graphExecute at the median of three runs. That
+time includes possible RPC/driver input transfer, not only HTP cycles.
+
+Current QNN I/O binds KV as QNN_TENSORMEMTYPE_RAW from std::vector.
+Qualcomm documents optional HTP RPC shared-buffer registration:
+a QnnMem_register handle for an rpcmem_alloc allocation may allow the
+backend to avoid the per-step input copy. The exact benefit and ABI
+support on Q8B with QAIRT 2.47 are to be determined experimentally.
+
+### Controlled implementation
+
+Three opt-in flags **only** accepted with `--dynamic-prefill`,
+`--dynamic-benchmark` and `--dynamic-bench-fixed-steps`:
+
+* `--dynamic-kv-memhandle`: allocate 30 RPCmem regions via
+  `libcdsprpc.so`, copy the 36 MiB KV once after ordinary Prefill,
+  register each fd using `QnnMem_register` in the **Decode QNN
+  context**, then bind the 30 KV Decode inputs with
+  `QNN_TENSORMEMTYPE_MEMHANDLE`. The remaining eight Decode inputs,
+  all Prefill inputs and LM Head continue in RAW. The original RAM
+  KV is also updated, with only the 9216 changed bytes mirrored
+  into registered RPCmem on each Decode step. KV bytes are verified
+  against the RAM copy at initialization and after the final step.
+  `QnnMem_deRegister` and `rpcmem_free` run before the contexts
+  are freed. If rpcmem is absent or registration fails, the test
+  **fails instead of silently switching back to RAW**. The optional
+  `GEMMA4_RPCMEM_LIBRARY` environment variable can point to the
+  actual libcdsprpc.so location.
+
+* `--dynamic-bench-checksums`: log 64-bit FNV-1a checksums of
+  every Decode output tensor and all LM Head INT8 logits after each
+  step. The short correctness preflight compares every checksum
+  from RAW and MEMHANDLE runs on the same fixed-token stream;
+  mismatches abort the benchmark.
+
+* `--dynamic-qnn-profile basic|detailed`: profile sampled
+  Decode and Head graphExecute calls (steps 1, 2, 16, 64, 128,
+  and the final step where present) via QNN profileCreate,
+  profileGetEvents, profileGetEventData and profileGetSubEvents.
+  Logs contain event type and unit **numeric IDs** as supplied by
+  the backend; never guess that an event represents raw HTP
+  compute. Profile collection is isolated from A/B speed runs.
+
+The ordinary Stage 7 CLI, original Stage 8.0 and the default
+Stage 8.1 RAW run are unchanged. Only the synthetic fixed-step
+benchmark permits MEMHANDLE; natural-language correctness still
+requires the unchanged exact 2+2 golden RAW regression, and
+registered memory requires matching ALL Decode+Head outputs in
+a separate synthetic multi-step preflight.
+
+### Start with compatibility/correctness only
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+python3 scripts/bench_stage8_2.py --mode probe --probe-steps 8
+```
+
+Expect `STAGE82_GOLDEN_OK`, followed by `STAGE82_PREFLIGHT_OK`
+and `STAGE82_OK`. If the board lacks the RPCmem library, export
+`GEMMA4_RPCMEM_LIBRARY=/actual/path/libcdsprpc.so` before
+retrying. A QNN MEM_REGISTER error means the ION fd or ABI may
+not be accepted by this backend; do not claim zero-copy until
+registration and byte-for-byte verification succeed.
+
+### Then run A/B and separate sampled profiling
+
+```bash
+python3 scripts/bench_stage8_2.py --mode ab \
+  --steps 256 --runs 3 --text 'Что ты умеешь?'
+python3 scripts/bench_stage8_2.py --mode profile \
+  --steps 256 --profile-level basic --text 'Что ты умеешь?'
+```
+
+Or after the compatibility check, `--mode all` performs both
+in one session. The script always checks 2+2 and eight-step
+output equivalence before attempting the long trials. A/B runs
+use independent fresh-process QNN contexts with NO QNN profiler,
+but all same synthetic 256 Decode+Head steps, full KV feedback
+and identical model binaries. Profile runs sample individual
+calls and deliberately should NOT be compared for throughput.
+
+Each run creates `~/gemma4_qnn_test/bench_stage8_2_.../` with
+golden log, two 8-step preflight logs, per-run RAW/MEMHANDLE
+QNN logs, optional QNN profile logs and `summary.json`.
+The summary explicitly states this remains **Prefill-128 with
+13-ish actual tokens, fixed Decode KV4096** and not the matched
+LiteRT-LM 256/256/1024 workload. Actual Prefill token count
+is read from the runtime. The fixed repeated token 236778 is
+synthetic; its step/s is not user-visible natural-language tok/s.
+
+### Interpretation
+
+The A/B ratio assesses the **entire decode loop** including
+updated KV slot mirrors, with all other knobs held constant.
+A successful MEMHANDLE path confirms registration and output
+equivalence, but alone does not prove zero-copy DMA behavior.
+QNN profiling may expose HOST RPC and HTP runtime events; their
+availability and semantics must be checked against the specific
+QAIRT 2.47 headers and backend outputs.
+
+Links:
+- Qualcomm QNN HTP Shared Buffer Tutorial
+- Qualcomm QNN HTP Qmem Graph documentation
+- QNN Profile API, QnnMem registration API
+
+No clock or thermal conclusions are drawn without measurements.
