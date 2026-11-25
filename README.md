@@ -106,6 +106,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 6.6 (подтверждён на Q8B):** настоящий запуск Prefill 30 K/V → Decode(pos17, probe token 568) → LM Head; 31 выход Decode рассчитан, 262144 INT8 logits, единственный argmax=236778. Начальные Prefill cache нулевые, 8 non-KV CPU, сохранённые Decode input bytes не использованы. **Stage 6.7 (код в GitHub, ожидает Q8B):** [scripts/test_prefill_decode_multistep.sh](scripts/test_prefill_decode_multistep.sh) запускает 2 linked Decode шага (позиции 17 и 18), записывает 30 выходных K/V slices первого шага в RAM, выбирает следующий token по INT8 argmax и вычисляет 8 новых CPU входов. 568 остаётся тестовым первым токеном, а не результатом самого Prefill; связанный вывод не сравнивается с независимыми сохранёнными эталонами. Добавлен тест сохранения K/V prefix при двух feedback updates.
 
+**Stage 6.7 (Q8B подтверждён):** Prefill KV → Decode(pos17, пробный token568) → LM Head argmax236778 → KV feedback в RAM → Decode(pos18, token236778) → LM Head argmax236862, все 8 non-KV CPU. **Stage 6.8 (новый код, ждёт Q8B):** [scripts/test_prefill_first_token.sh](scripts/test_prefill_first_token.sh) исключает пробный token568 — копирует в Decode первые 16 K/V Prefill rows, повторяет последний реальный ID `4368` на позиции `16`, получает **первый token-кандидат prompt** через LM Head, сравнивает все 30 K/V slices с последней строкой Prefill и подаёт новый ID в Decode(pos17). Результат ещё не проверен на плате и не является текстовой CLI генерацией без tokenizer.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.

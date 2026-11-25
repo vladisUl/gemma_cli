@@ -1526,3 +1526,98 @@ next token, вычисленным из Prefill — это пробный ID.
 Tokenizer, финальный Prefill hidden-state/first token и sampler
 ещё не связаны. INT8 greedy с неоднозначным максимумом
 отклоняется специально; это не production sampling.
+
+## Stage 6.7 — подтверждены два последовательных связанных Decode на Q8B
+
+Пользователь прислал успешный `test_prefill_decode_multistep.sh`:
+
+```text
+CHAIN_DECODE_HEAD_OK: ... logits_bytes=262144 head_execute_ms=11.7449 int8_argmax_id=236862 max_logit_q=118 argmax_ties=1
+PREFILL_LINK_NEXT_HEAD_OK: step=2 logits_bytes=262144 linked_KV_feedback=1 independent_reference_comparison=0
+PREFILL_LINK_MULTI_STEP_OK: steps=2 first_position=17 last_position=18 first_token=568 all_KV_from_prefill_or_feedback_RAM=1 all_nonKV_from_CPU=1 independent_reference_claim=0
+PREFILL_LINK_MULTISTEP_STAGE6_7_OK: 2 Prefill-linked Decode steps with KV feedback and INT8 argmax, no saved Decode inputs
+PREFILL_MULTISTEP_WRAPPER_OK: Stage 6.7 linked two Decode passes completed
+```
+
+Получился технический цикл: pos17 token568 (заданный вручную)
+→ LM Head argmax236778 → 30 KV slices через RAM feedback на
+позицию 17 → pos18 token236778 → LM Head argmax236862.
+Побайтовые baseline регрессии всех 3 QNN графов также прошли.
+Эти logits *не принадлежат* семантически корректному продолжению
+изначального prompt, так как первый token 568 не был предсказан.
+
+## Stage 6.8 — первый generated token без пробного токена 568
+
+**Новое дополнение, ещё не проверено на Q8B.**
+`qnn_partition_2` Prefill выдаёт 30 K/V blocks, но не выдаёт
+финальный hidden state для LM Head. Для получения логитов
+после реального prompt используем проверенный autoregressive трюк:
+повторно считаем **последний настоящий токен** через Decode,
+передав ему из Prefill только K/V префикса до этого токена.
+
+У текущего byte-verified prompt 17 настоящих ID,
+последний `4368` на позиции `16` (0-based).
+Новый флаг `--prefill-seed-last-prompt` (вместо
+`--prefill-kv-token 568`) изменяет linked эксперимент:
+
+1. Prefill запускается как прежде на 128 позициях,
+   проверяя восемь CPU inputs и 30 выходных KV blocks.
+2. При формировании отдельных KV-кэшей Decode копируются
+   **только первые 16 K/V rows**, а строка для токена 4368
+   удерживается для независимой перепроверки.
+3. NPU Decode получает pos16 + token4368, правильные
+   30 KV префиксных буферов и восемь новых Section0/1/2
+   CPU inputs. Сохранённые Decode inputs не используются.
+4. 30 выходных KV slices Decode сравниваются с
+   соответствующими последними K/V rows оригинального Prefill.
+   Выводятся количество отличающихся байтов для каждого
+   слоя и итог `PREFILL_LAST_PROMPT_KV_COMPARE`. **Побайтовое
+   равенство между разными QNN kernels не предположено:**
+   mismatch — диагностический факт, а не автоматическое
+   утверждение неверной семантики. Важно оценить результаты.
+5. LM Head получает hidden state этого же Decode;
+   по уникальному INT8 argmax выводится
+   `PREFILL_FIRST_TOKEN_FROM_PROMPT: token_id=...`.
+   Это первый token-кандидат, обусловленный исходным prompt,
+   а не независимым sample. Он выбран квантованным greedy
+   способом, без production sampling.
+6. Тест `N=2` помещает 30 KV slices Decode(pos16) в слот16;
+   на pos17 запускает Decode уже с **действительно полученным
+   первым токеном**; затем исполняет LM Head второй раз.
+   Далее цикл может повторяться до ранее установленного лимита4.
+
+Режим доступен только с `--prefill-kv-run`,
+`--prefill-kv-probe`, всеми CPU моделями и
+`--prefill-kv-steps 1..4`. Одновременный
+`--prefill-seed-last-prompt` и `--prefill-kv-token` запрещён.
+Остальные скрипты Stage6.5/6.6/6.7 сохраняют поведение.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+bash scripts/test_prefill_first_token.sh
+```
+
+Отдельный лог:
+`~/gemma4_qnn_test/cpu_prefill_first_token_stage6_8.log`.
+При успехе ожидаются пока **не подтверждённые Q8B** строки:
+
+```text
+PREFILL_LAST_PROMPT_SEED: prompt_tokens=17 replay_position=16 replay_token=4368 kv_rows_from_prefill=16 first_generated_token_from_LM_Head=1
+PREFILL_LAST_PROMPT_KV_COMPARE: tensors=30 compared_bytes=9216 mismatching_bytes=... exact_tensors=... bit_exact=... position=16 numerical_equivalence_not_assumed=1
+PREFILL_FIRST_TOKEN_FROM_PROMPT: token_id=... prompt_tokens=17 replayed_last_prompt_position=16 quantized_greedy=1 independent_reference_claim=0
+PREFILL_LINK_KV_FEEDBACK_OK: executed_step=1 position=16 cache_tensors=30 inserted_bytes=9216 layout=K_strided,V_contiguous
+PREFILL_LINK_NEXT_INPUTS_READY: step=2 position=17 token=<first_generated_token> kv_from_feedback_ram=30 nonkv_from_cpu=8 saved_decode_inputs_used=0
+PREFILL_FIRST_TOKEN_STAGE6_8_OK: last_prompt_id=4368 replay_pos=16 first_generated_id=... next_decode_pos=17 saved_decode_inputs_used=0
+```
+
+**Ограничения:** до окончательной автономной CLI генерации
+ещё нужны tokenizer (text → реальные токены и обратно),
+новый Prefill для произвольного prompt (не сохранённого 17-token
+образца), правильная позиция/маски для произвольной длины,
+EOS handling и полноценный sampler. Текущий linked first-token
+тест вычисляет только реальный кандидат для **этого** prompt
+и сравнивает K/V численно. Не выдавать новый ID за готовый
+читаемый текст без декодирования SentencePiece/tokenizer.
