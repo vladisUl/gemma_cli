@@ -1,0 +1,27 @@
+# CMake
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+
+# Compiled files
+*.o
+*.so
+*.a
+*.out
+
+# QNN models and generated data
+*.bin
+*.raw
+*.litertlm
+*.tflite
+*.onnx
+*.onnx_data
+
+# SDK copies and logs
+sdk*/
+*.log
+
+# Python
+__pycache__/
+.venv/
