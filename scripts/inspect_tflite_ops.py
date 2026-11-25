@@ -13,16 +13,17 @@ import sys
 
 
 NAMES = {
-    0: "ADD", 6: "DEQUANTIZE", 7: "EMBEDDING_LOOKUP",
+    0: "ADD", 2: "CONCATENATION", 6: "DEQUANTIZE", 7: "EMBEDDING_LOOKUP",
     9: "FULLY_CONNECTED", 18: "MUL", 22: "RESHAPE",
     23: "RESIZE_BILINEAR", 36: "GATHER", 53: "CAST",
-    84: "ONE_HOT", 114: "QUANTIZE", 150: "GELU",
-    32: "CUSTOM",
+    58: "LESS", 62: "GREATER_EQUAL", 84: "LOGICAL_OR",
+    86: "LOGICAL_AND", 114: "QUANTIZE", 123: "SELECT_V2",
+    150: "GELU", 32: "CUSTOM",
 }
 TYPES = {
     0: "FLOAT32", 1: "FLOAT16", 2: "INT32", 3: "UINT8",
     4: "INT64", 6: "BOOL", 7: "INT16", 9: "INT8", 10: "FLOAT64",
-    15: "UINT32", 16: "UINT16", 17: "INT4",
+    15: "UINT32", 16: "UINT16", 17: "INT4", 18: "BFLOAT16", 19: "INT2", 20: "UINT4",
 }
 
 
@@ -180,7 +181,7 @@ def inspect(path):
 
             for signature in fb.table_vector(model, 7):
                 key = fb.string(signature, 2)
-                graph = fb.scalar(signature, 3, "I", 0)
+                graph = fb.scalar(signature, 4, "I", 0)
                 input_names = [fb.string(t, 0) for t in fb.table_vector(signature, 0)]
                 output_names = [fb.string(t, 0) for t in fb.table_vector(signature, 1)]
                 print(f"TFLITE_SIGNATURE: key={key} subgraph={graph} "

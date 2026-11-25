@@ -78,6 +78,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 5.6 (выявлена блокировка):** оригинальная CPU Section0 требует `EMBEDDING_LOOKUP v4`, не зарегистрированный в системной TFLite 2.14.1. Сборка C++ успешна; Stage 5.5 не затронут. Добавлен [scripts/inspect_tflite_ops.py](scripts/inspect_tflite_ops.py) для просмотра версий операторов и INT4/квантизации без сторонних пакетов. CPU embedder-тест принимает `GEMMA4_TFLITE_LIB` для отдельной совместимой ARM64 библиотеки. Не заменять системный runtime.
 
+**Stage 5.7 (экспериментальный код, не проверен на Q8B):** обе исходные модели используют `EMBEDDING_LOOKUP v4`: Section0 — **INT2**, Section2 — 35 таблиц **INT4**, всё с 262144 row-scales. Добавлен [src/packed_embedder.cpp](src/packed_embedder.cpp), прямой `mmap`/unpack/dequantize/MUL/CONCATENATION без новых TFLite библиотек, и [scripts/test_packed_embedder.sh](scripts/test_packed_embedder.sh). Сначала тест совместимости на реальных моделях, затем обязательная побайтовая сверка с QNN embeddings.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.

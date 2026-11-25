@@ -527,3 +527,66 @@ GEMMA4_TFLITE_LIB=/path/to/compatible/aarch64/libtensorflowlite_c.so \
 
 Документация сборки TensorFlow Lite ARM64 C API:
 https://github.com/tensorflow/tensorflow/blob/master/tensorflow/lite/g3doc/guide/build_arm.md .
+
+## Stage 5.7 — экспериментальный C++ INT2/INT4 embedding lookup (без TFLite runtime)
+
+Инспекция исходных моделей подтвердила:
+
+- **Section0:** одна матрица [262144,1536], тип **INT2 = TensorType 19**
+  (`TYPE_19` в старой версии инспектора), 100663296 байт упакованных
+  весов и 262144 шкал. Нужны `EMBEDDING_LOOKUP v4` и финальный `MUL`.
+- **Section2:** 35 таблиц [262144,256] типа **INT4 = TensorType 17**,
+  каждая содержит 33554432 байта весов и 262144 шкал.
+  Используются 35 × `EMBEDDING_LOOKUP v4` и `CONCATENATION`.
+- Исходные `decode_embedder`/`decode_per_layer_embedder` имеют выходы
+  FLOAT32 6144 и 35840 байт соответственно.
+
+Источник алгоритма распаковки —
+`tensorflow/lite/kernels/embedding_lookup.cc` версии v2.21.0.
+Алгоритм использует little-endian упакованные signed INT2/INT4
+и умножение выбранного кода на шкалу **конкретной строки токена**.
+
+Для самостоятельного CLI добавлен экспериментальный C++17
+`gemma4-packed-embed`: отображает оригинальный TFLite FlatBuffer в память
+через `mmap(MAP_PRIVATE, PROT_READ)`, читает одну строку указанного токена
+из каждой таблицы и рассчитывает FLOAT32. Обрабатывает MUL Section0
+по скалярной константе непосредственно из оригинального FlatBuffer
+и CONCATENATION Section2 по порядку входов TFLite-графа.
+Программа проверяет типы, число операторов, shapes, размеры весов,
+количество row-scales и zero-point. Запрашивает токен только
+в диапазоне 0..262143. Не выполняет общую TFLite-модель;
+поддерживает исключительно обнаруженные Decode-топологии.
+
+Результат пока **не проверен на реальных файлах Q8B**. Первоначальный
+smoke-test проверяет только корректность загрузки/разбора/размеров.
+Для подтверждения побайтовой эквивалентности предусмотрен
+`--reference SAVED_FLOAT32.raw` (только когда установлен реальный ID
+токена из соответствующего сохранённого шага QNN).
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+bash scripts/test_packed_embedder.sh 2>&1 | tee ~/gemma4_packed_embed0.log
+```
+
+Если Section0 пройдёт, Section2 запускается отдельно:
+
+```bash
+GEMMA4_PACKED_SECTION=2 bash scripts/test_packed_embedder.sh \
+  2>&1 | tee ~/gemma4_packed_embed2.log
+```
+
+В конце ожидается `PACKED_TEST_OK: section=0 output_bytes=6144`
+или `PACKED_TEST_OK: section=2 output_bytes=35840`.
+Это **не** является доказательством правильности модели до байтовой
+сверки с настоящими embeddings. Только после строгой сверки
+эти функции будут добавлены в единый CPU→NPU процесс.
+
+Инспектор `inspect_tflite_ops.py` также исправлен:
+`TYPE_19` теперь распознаётся как INT2, четыре опкода получили
+официальные имена (`GREATER_EQUAL`, `LESS`, `LOGICAL_AND`,
+`SELECT_V2`), `BUILTIN_2` заменён на `CONCATENATION`, и
+`SignatureDef.subgraph_index` читается из правильного поля 4
+(поле 3 — устаревший `deprecated_tag`).
