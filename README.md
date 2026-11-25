@@ -142,6 +142,10 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 7.0 (код, ожидает Q8B):** [scripts/probe_tokenizer_stage7.py](scripts/probe_tokenizer_stage7.py) — read-only stdlib Python проверка реального `~/gemma4_qnn_test/tokenizer.json` (BPE, 262144 vocab) и `derived_prefill_128_token_ids_i32.raw`, полного оригинального prompt и результата Stage6.18. Публикует `TOKENIZER_STAGE7_NORMALIZER/PRE_TOKENIZER/POST_PROCESSOR/DECODER/MODEL` для реализации точного text→IDs, **не притворяясь готовым BPE кодировщиком**. Не требует Python-пакета `tokenizers`. Запуск: `python3 scripts/probe_tokenizer_stage7.py`. Следующий шаг — реализация tokenizer и замена подготовленного prompt на произвольный текст.
 
+**Stage 7.0 (Q8B подтверждён):** всё CTest 7/7, `TOKENIZER_STAGE7_GOLDEN_OK`. Оригинальный `tokenizer.json`: BPE (262144 словарных ID), 514639 merges (JSON list of 2 strings), normalizer Replace ASCII spaces→`▁`, pre-tokenizer Split ASCII spaces/MergedWithPrevious, decoder Sequence(Replace `▁`→space,ByteFallback,Fuse). Имеющийся prompt из 17 ID и девятитокенный ответ до EOS106 совпадают с эталоном.
+
+**Stage 7.1 (код, ждёт Q8B):** [scripts/gemma4_bpe.py](scripts/gemma4_bpe.py) — stdlib-only кодировщик текста на основании того же BPE JSON, включая Unicode→byte fallback и merge priorities. Прежде чем принять произвольный текст, он требует точного совпадения 9 ID `Привет! Сколько будет 2+2?` и исходных 17 ID. Пример: `python3 scripts/gemma4_bpe.py --text 'Привет! Сколько будет 2+2?'`. Создание нового 512-byte Prefill ID RAW возможно только с `--output-new-raw путь` и эксклюзивным `xb` (никакой перезаписи эталонов). Добавлен быстрый unit-test [tests/test_bpe_stage7_unit.py](tests/test_bpe_stage7_unit.py). Ещё нет прямого подключения динамических RAW к QNN, поскольку текущий исполнитель строго сверяет Prefill inputs с оригинальным эталоном.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.

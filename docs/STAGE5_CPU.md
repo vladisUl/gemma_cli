@@ -2274,3 +2274,64 @@ python3 scripts/probe_tokenizer_stage7.py
 `TOKENIZER_STAGE7_DECODER`,
 `TOKENIZER_STAGE7_GOLDEN_OK`.
 Модель и все бинарные файлы остаются неизменными.
+
+
+## Stage 7.0 — результат Q8B
+
+7/7 CTest прошли. `TOKENIZER_STAGE7_GOLDEN_OK`.
+Подтверждены: `model.type=BPE`, vocab 262144, 514639
+`merges` в JSON-форме пар строк, `byte_fallback=true`,
+`fuse_unk=true`, нормализатор `Replace(" ", "▁")`,
+претокенизатор `Split(" ", MergedWithPrevious, invert=false)`,
+декодер `Sequence(Replace("▁"," "), ByteFallback,Fuse)`,
+`TemplateProcessing` без автоматического BOS.
+Были проверены все 17 ID исходного prompt, LF107 и
+9 IDs ответа `2 + 2 будет **4**.` с EOS106.
+
+## Stage 7.1 — отдельный BPE-кодировщик (код, ждёт Q8B)
+
+Новая `scripts/gemma4_bpe.py`: pure Python stdlib без
+зависимости `tokenizers`, read-only для tokenizer.json и
+исходного 512-byte RAW. Загрузка Unicode BPE vocabulary и
+списка merges: (left_id,right_id)→(rank,new_id), включая
+правило, что при повторных merge pair последний rank
+заменяет предыдущий, как в Rust tokenizers.
+Unicode codepoints, а при отсутствии символа в vocab — byte fallback
+`<0xHH>`. Пробел заменяется на U+2581 перед Split; после
+нормализации буквальных ASCII spaces нет, поэтому Split не
+делит обычный текст. Последовательно применяется пара с
+наименьшим рангом; O(n²) прототип для коротких prompt,
+не производительная реализация tokenizer API.
+
+Строгий `BPE_STAGE7_1_GOLDEN_OK` требует, чтобы
+`Привет! Сколько будет 2+2?` кодировалось точно как
+`[116130,236888,217598,16632,236743,236778,236862,236778,236881]`
+(9 ID), исходные 17 из сохранённого RAW совпали,
+а полученный canonical chat prompt был равен тем же
+17 ID с завершающим LF107 (18 ID). Ошибка остановит скрипт
+до записи новых данных.
+
+Построение chat template уже по проверенным отдельным IDs:
+`[2,105,2364,107]+BPE(user_text)+[106,107,105,4368,107]`.
+Текстовые user requests, содержащие literal AddedVocabulary tokens,
+пока отвергаются (не делаем ложных заявлений о полном HF tokenizer).
+По опции `--output-new-raw` можно создать новый padded
+512-byte файл для 128-token QNN Prefill через open(`xb`),
+строго не перезаписывая существующие файлы. Скрипт не
+исполняет динамический QNN сам по себе: Stage 7.2 должен
+добавить специальный режим native QNN runner без сравнения
+новых Prefill входов с историческими sample references.
+
+Запуск на Q8B:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+python3 scripts/gemma4_bpe.py --text 'Привет! Сколько будет 2+2?'
+python3 scripts/gemma4_bpe.py --text 'Сколько будет 3 + 5?'
+```
+
+Требуется сначала подтверждение `BPE_STAGE7_1_GOLDEN_OK`;
+без него новый tokenizer использовать для инференса нельзя.

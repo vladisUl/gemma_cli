@@ -93,6 +93,13 @@ if(BUILD_TESTING)
       COMMAND "${Python3_EXECUTABLE}"
               "${CMAKE_CURRENT_SOURCE_DIR}/scripts/probe_tokenizer_stage7.py"
               --help)
+    add_test(NAME bpe_stage7_unit
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_bpe_stage7_unit.py")
+    add_test(NAME bpe_stage7_help
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gemma4_bpe.py"
+              --help)
     add_test(NAME prefill_padding_unit
       COMMAND "${Python3_EXECUTABLE}"
               "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_prefill_padding_unit.py")
