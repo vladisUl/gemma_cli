@@ -455,6 +455,7 @@ struct Options {
     bool prefill_bos_only_compare = false;
     bool prefill_first_input_compare = false;
     bool decode_only_prompt = false;
+    bool compare_kv_histories = false;
     bool prefill_tie_policy_set = false;
     bool prefill_allow_tie_lowest = false;
     bool prefill_kv_diagnose = false;
@@ -616,6 +617,8 @@ void usage(const char* executable) {
         << "  --prefill-seed-first-prompt: one-step independent Decode(pos0)\n"
         << "     using the first verified prompt ID and zero initial KV; compare\n"
         << "     its KV slices to Prefill row0 (diagnostic only).\n"
+        << "  --compare-kv-histories: Stage 6.15 same Decode(pos16/token4368)\n"
+        << "     different KV prefixes, same CPU non-KV and same LM Head.\n"
         << "  --decode-only-prompt: Stage 6.14, consume 17 verified tokens\n"
         << "     using Decode only, feed 30 KV caches, run final LM Head.\n"
         << "  --prefill-first-input-compare: Stage 6.13 compare 8 first-token\n"
@@ -662,6 +665,10 @@ Options parse_options(int argc, char** argv) {
         }
         if (arg == "--prefill-seed-first-prompt") {
             options.prefill_seed_first_prompt = true;
+            continue;
+        }
+        if (arg == "--compare-kv-histories") {
+            options.compare_kv_histories = true;
             continue;
         }
         if (arg == "--decode-only-prompt") {
@@ -917,6 +924,9 @@ Options parse_options(int argc, char** argv) {
             throw std::runtime_error(
                 "--decode-only-prompt requires Stage 6.13 first-input diagnostic "
                 "and one Decode step");
+        if (options.compare_kv_histories && !options.decode_only_prompt)
+            throw std::runtime_error(
+                "--compare-kv-histories requires --decode-only-prompt");
         if (!options.kv_next_list.empty() && !options.kv_feedback)
             throw std::runtime_error("--kv-next-list requires --kv-feedback-pos or --kv-auto-pos");
         if (options.kv_auto_pos && options.kv_next_list.empty())
@@ -941,7 +951,8 @@ Options parse_options(int argc, char** argv) {
         options.prefill_kv_token_set || options.prefill_kv_steps_set ||
         options.prefill_seed_last_prompt || options.prefill_seed_first_prompt ||
         options.prefill_bos_only_compare || options.prefill_first_input_compare ||
-        options.decode_only_prompt || options.prefill_tie_policy_set ||
+        options.decode_only_prompt || options.compare_kv_histories ||
+        options.prefill_tie_policy_set ||
         options.prefill_kv_diagnose || options.chain_decode_head ||
         options.kv_feedback || options.kv_run_next ||
         !options.kv_next_list.empty() || !options.kv_next_reference_dir.empty() ||
@@ -1996,6 +2007,7 @@ void probe_prefill_kv_bridge(
 // offsets must be compatible (enforced in the mapping probe). It does not
 // compare linked Decode outputs to the independent saved Decode references.
 #include "stage6_12_bos_only.inc"
+#include "stage6_15_kv_histories.inc"
 #include "stage6_14_decode_only.inc"
 
 void execute_prefill_linked_decode(

@@ -226,6 +226,9 @@ void run_stage6_14_decode_only(
              <<" tied_max_tokens="<<tied.size()
              <<" candidate_ids="<<candidates.str()
              <<" int8_logits_only=1 no_fp32_ranking_claim=1\n"<<std::flush;
+    if(options.compare_kv_histories)
+        run_stage6_15_compare_kv_histories(runtime,prefill,decode,head,
+            hidden_index,links,scratch,prompt);
     std::cout<<"DECODE_ONLY_STAGE6_14_OK: steps=17"
              <<" all_nonKV_from_CPU=1 all_KV_from_Decode_only=1"
              <<" prefill_KV_read_only=1 ready_for_next_generation_step=1"
