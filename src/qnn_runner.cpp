@@ -1678,6 +1678,16 @@ void probe_prefill_kv_bridge(
         if(!name || std::string(name).find("prefill_128_kv_cache_")!=0)
             continue;
         ++prefill_input_kv;
+        if(linked_caches) {
+            const auto& tensor=prefill.inputs[i];
+            const auto& quant=tensor_quant(tensor);
+            if(tensor_dtype(tensor)!=QNN_DATATYPE_SFIXED_POINT_8 ||
+               quant.quantizationEncoding!=QNN_QUANTIZATION_ENCODING_SCALE_OFFSET ||
+               quant.scaleOffsetEncoding.offset!=0)
+                throw std::runtime_error(
+                    "PREFILL_LINK_INITIAL_CACHE_ZERO_QUANT_UNSUPPORTED: "+
+                    std::string(name)+" (raw zero must represent signed-int8 zero)");
+        }
         const auto& bytes=prefill.input_buffers.at(i);
         prefill_input_bytes+=bytes.size();
         prefill_input_nonzero+=static_cast<size_t>(std::count_if(
