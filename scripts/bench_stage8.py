@@ -261,6 +261,8 @@ def print_summary(golden, runs, summary, folder):
          "npu_prefill_effective_tok_s", "ток/с"),
         ("Prefill NPU условных 128 позиций/с",
          "npu_prefill_fixed_block_tok_s", "поз/с"),
+        ("Prefill CPU+NPU эффективных токенов/с",
+         "cpu_plus_npu_prefill_effective_tok_s", "ток/с"),
         ("TTFT от входа в QNN jobs до ID1", "qnn_first_token_ms", "мс"),
         ("Первый Decode шаг целиком", "decode_first_step_ms", "мс"),
         ("Все шаги Decode, CPU+NPU+feedback", "decode_steps_wall_ms", "мс"),
@@ -268,6 +270,8 @@ def print_summary(golden, runs, summary, folder):
         ("LM Head graphExecute (NPU, сумма)", "lm_head_npu_graph_ms", "мс"),
         ("Генерация текстовых токенов/с", "generation_text_tok_s", "ток/с"),
         ("Decode шагов/с, включая EOS", "decode_steps_per_s", "шаг/с"),
+        ("NPU Decode+Head шагов/с (только graphExecute)",
+         "npu_decode_and_head_steps_per_s", "шаг/с"),
         ("Decode шагов/с после первого", "decode_steps_after_first_per_s", "шаг/с"),
         ("Один запрос, включая BPE+QNN+decoder", "user_request_wall_ms", "мс"),
     ]
