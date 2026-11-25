@@ -1435,3 +1435,94 @@ Stage 6.6 устанавливает возможность связанного
 но ещё **не обеспечивает семантически корректную генерацию текста**:
 для неё потребуются реальный first-next token, tokenizer,
 выбор/сэмплинг ID и дальнейшие Decode-шаги без saved refs.
+
+## Stage 6.6 — настоящий связанный Prefill → Decode → LM Head подтверждён на Q8B
+
+Пользователь прислал успешный конец лога `test_prefill_decode_link.sh`:
+
+```text
+PREFILL_LINK_INPUTS_READY: kv_from_prefill_ram=30 nonkv_from_cpu=8 position=17 input_token=568 saved_decode_inputs_used=0 fresh_prefill_initial_kv_zero=1
+PREFILL_LINK_DECODE_OK: graph=qnn_partition_0 outputs=31 position=17 input_token=568 execute_ms=69.2985 independent_decode_reference_comparison=0
+CHAIN_DECODE_HEAD_OK: ... logits_bytes=262144 head_execute_ms=12.2503 int8_argmax_id=236778 max_logit_q=111 argmax_ties=1
+PREFILL_LINK_HEAD_OK: logits_bytes=262144 linked_prefill_kv=1 no_saved_decode_reference_claim=1
+CPU_FULL_PREFILL_DECODE_OK: Prefill-128 eight CPU inputs, 3 QNN graphs 62 outputs, two Decode steps and LM Head byte-identical
+PREFILL_LINK_STAGE6_6_OK: Prefill 30 KV blocks (17 rows) -> real Decode(pos17, token568) -> real LM Head, no independent reference claim
+PREFILL_LINK_WRAPPER_OK: Stage 6.6 completed with linked NPU execution
+```
+
+**Доказано:** 30 K/V кэшей из настоящих Prefill output buffers переданы
+в настоящий Decode QNN с позиционированием 17 и вновь вычисленными
+8 non-KV; его hidden output использован непосредственно в LM Head.
+У Stage 6.6 **нет независимого QNN эталона** для связанного вывода,
+поэтому correctness подтверждена как связность и успешное исполнение,
+а не идентичность отдельно сохранённому другому Decode sample.
+Изначальные 28 Prefill K/V и их quantized zero прошли guard.
+Токен 568 был явным probe, **не получен из самого Prefill**.
+После него QNN LM Head вернул уникальный INT8 argmax ID **236778**.
+
+## Stage 6.7 — два и более последовательных Prefill-linked Decode
+
+**Код добавлен, Q8B ещё не проверял.** Опциональный параметр
+`--prefill-kv-steps N` (`1..4`, по умолчанию 1) доступен только
+совместно с `--prefill-kv-run`. Stage 6.6 остаётся по умолчанию
+одним linked Decode. Предел 4 — защита от неограниченного вывода
+на стадии эксперимента.
+
+Алгоритм при `N=2`:
+
+1. Исполняется старый строго проверенный трёхконтекстный QNN
+   baseline и подтверждённый Stage 6.6 linked Decode
+   **pos17, probe token568**, затем linked LM Head.
+2. Из его реальных 262144 INT8 logits выбирается
+   единственный max `236778` (если несколько совпадающих
+   максимумов — отказ, а не произвольное продолжение).
+3. Все 30 настоящих выходных Decode K/V slices
+   записываются через `update_kv_slot` в scratch cache на
+   **позицию 17** (K strided / V contiguous, 9216 байт);
+   каждый записанный байт проверяется.
+4. Для **позиции 18** и токена `236778` заново вычисляются
+   Section0 INT2, Section2 INT4 embeddings и шесть
+   Section1 Decode RoPE/mask inputs — всего восемь tensors.
+5. Перед исполнением QNN заново привязываются все 38
+   RAM pointers к QNN tensor descriptors. Запускаются
+   второй QNN Decode и затем LM Head на его hidden output.
+6. Для `N=3..4` цикл повторяется, используя
+   argmax logits предыдущего linked шага и его KV output.
+   Не считывается **ни один** saved Decode input для этих
+   связных шагов; 30 KV сохраняют Prefill+feedback state.
+
+**Тест на Q8B:**
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+bash scripts/test_prefill_decode_multistep.sh
+```
+
+Вывод: `~/gemma4_qnn_test/cpu_prefill_multistep_stage6_7.log`.
+Ожидаемые (**ещё не подтверждены Q8B**) строки:
+
+```text
+PREFILL_LINK_GREEDY_NEXT: executed_step=1 token_id=236778 max_logit_q=111 argmax_ties=1 quantized_int8_argmax=1
+PREFILL_LINK_KV_FEEDBACK_OK: executed_step=1 position=17 cache_tensors=30 inserted_bytes=9216 layout=K_strided,V_contiguous
+PREFILL_LINK_NEXT_INPUTS_READY: step=2 position=18 token=236778 kv_from_feedback_ram=30 nonkv_from_cpu=8 saved_decode_inputs_used=0
+PREFILL_LINK_NEXT_DECODE_OK: step=2 position=18 input_token=236778 outputs=31 ... reference_comparison=0
+PREFILL_LINK_NEXT_HEAD_OK: step=2 logits_bytes=262144 linked_KV_feedback=1 independent_reference_comparison=0
+PREFILL_LINK_MULTI_STEP_OK: steps=2 first_position=17 last_position=18 first_token=568 all_KV_from_prefill_or_feedback_RAM=1 all_nonKV_from_CPU=1 independent_reference_claim=0
+PREFILL_LINK_MULTISTEP_STAGE6_7_OK: 2 Prefill-linked Decode steps with KV feedback and INT8 argmax, no saved Decode inputs
+PREFILL_MULTISTEP_WRAPPER_OK: Stage 6.7 linked two Decode passes completed
+```
+
+Добавлена unit-проверка `tests/kv_cache_test.cpp` для последовательной
+записи двух K/V feedback slots без повреждения исходных Prefill
+позиций и будущих нулевых слотов.
+
+**Ограничение неизменно:** первый token `568` не является
+next token, вычисленным из Prefill — это пробный ID.
+Новые argmax после него подтверждают возможность связанного
+вычисления, **но не корректную выдачу текста по исходному prompt**.
+Tokenizer, финальный Prefill hidden-state/first token и sampler
+ещё не связаны. INT8 greedy с неоднозначным максимумом
+отклоняется специально; это не production sampling.
