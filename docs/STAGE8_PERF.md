@@ -559,3 +559,23 @@ For additional DSP error context, inspect *unfiltered* lines:
 When a batch fails with the skel-side DMA error, the driver and
 QNN backend log lines before the final error are likely more
 actionable than the common code 1100.
+
+### Stage 8.2.1 partial-MEMHANDLE diagnostic result, 2026-11-25
+
+On Q8B, 18/18 CTest passed and the unchanged RAW 2+2 golden
+passed. `--mode probe --probe-steps 2 --kv-count 1` failed
+`QnnGraph_execute: QNN error 1003` before success validation.
+Code 1003 is `QNN_COMMON_ERROR_SYSTEM`, not proof that the
+backend rejected mixed RAW/MEMHANDLE inputs. Prior all-30
+MEMHANDLE probe had QNN 1100 and explicit DSP-side DMA failure.
+
+New observed failing log:
+`/home/radxa/gemma4_qnn_test/bench_stage8_2_20261125_200355_48f51e3q/probe_memhandle.log`
+
+The actual backend lines from the **one-MEMHANDLE** run have
+not been supplied yet. Check them before attributing 1003 to
+a specific fd, DMA mapping, RPC timeout, or graph-input mixed
+mode. The Python runner now emits the last 24 lines of any
+failed QNN process on stderr, in addition to the full log path.
+This diagnostics-only change does not alter graph execution,
+QNN memory descriptors or the original model.

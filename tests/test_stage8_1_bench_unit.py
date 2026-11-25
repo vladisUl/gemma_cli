@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from bench_stage8_1 import (  # noqa: E402
     BenchError, FIXED_TOKEN, KV_FEEDBACK_BYTES,
-    calculate_medians, parse_fixed_log
+    calculate_medians, parse_fixed_log, failed_run_log_excerpt
 )
 
 
@@ -49,6 +49,17 @@ def fixture():
 
 
 class Stage81Unit(unittest.TestCase):
+    def test_failed_log_excerpt_includes_backend_error(self):
+        log="\n".join([f"noise_{i}" for i in range(40)] +
+            ["STAGE82_MEM_REGISTERED: tensors=1",
+             "<E> DspTransport error",
+             "QNN_RUN_ERROR: QnnGraph_execute: QNN error 1003"])
+        excerpt=failed_run_log_excerpt(log,4)
+        self.assertIn("STAGE82_MEM_REGISTERED: tensors=1",excerpt)
+        self.assertIn("<E> DspTransport error",excerpt)
+        self.assertIn("QNN error 1003",excerpt)
+        self.assertNotIn("noise_39",excerpt)
+
     def test_exact_replay_with_all_kv_writes(self):
         result = parse_fixed_log(fixture(), 3)
         self.assertEqual(result["steps"], 3)

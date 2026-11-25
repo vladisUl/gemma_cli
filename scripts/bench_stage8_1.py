@@ -176,6 +176,18 @@ def parse_fixed_log(log, requested_steps):
     }
 
 
+def failed_run_log_excerpt(log_text, limit=24):
+    """Return bounded trailing backend diagnostics; keep the complete log on disk."""
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    lines = log_text.splitlines()
+    error_pos = next((i for i in range(len(lines) - 1, -1, -1)
+                      if "QNN_RUN_ERROR:" in lines[i]), len(lines) - 1)
+    excerpt = lines[max(0, error_pos - limit + 1):error_pos + 1]
+    # The C++ runner logs its diagnostics on stdout/stderr together.
+    return "\n".join(excerpt)
+
+
 def run_fixed(work, runner, target, label, prompt, steps,
               extra_runner_args=()):
     raw = target / (label + ".raw")
@@ -219,11 +231,12 @@ def run_fixed(work, runner, target, label, prompt, steps,
                                 check=False)
     finish = time.perf_counter()
     if status.returncode:
-        lines = logfile.read_text(errors="replace").splitlines()
-        error = next((s for s in reversed(lines) if "QNN_RUN_ERROR:" in s), "")
+        log_text = logfile.read_text(errors="replace")
+        excerpt = failed_run_log_excerpt(log_text)
         raise BenchError(
-            f"QNN failed ({label}, exit {status.returncode}) {error} "
-            f"diagnostics={logfile}"
+            f"QNN failed ({label}, exit {status.returncode}) "
+            f"diagnostics={logfile}\n"
+            f"LAST_QNN_LOG_LINES (up to 24):\n{excerpt}"
         )
     metrics = parse_fixed_log(
         logfile.read_text(errors="replace"), steps)
