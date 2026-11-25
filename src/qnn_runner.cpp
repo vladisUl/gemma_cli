@@ -6,6 +6,7 @@
 
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
@@ -656,9 +657,12 @@ void run_multi(const Options& options, const GraphView& graph,
 
     const fs::path outdir(options.outputs_dir);
     fs::create_directories(outdir);
-    if (!options.inputs_dir.empty() && fs::equivalent(outdir, fs::path(options.inputs_dir)))
+    if (!options.inputs_dir.empty() &&
+        fs::is_directory(options.inputs_dir) &&
+        fs::equivalent(outdir, fs::path(options.inputs_dir)))
         throw std::runtime_error("--outputs-dir must differ from --inputs-dir");
     if (!options.reference_dir.empty() &&
+        fs::is_directory(options.reference_dir) &&
         fs::equivalent(outdir, fs::path(options.reference_dir)))
         throw std::runtime_error("--outputs-dir must differ from --reference-dir");
 
