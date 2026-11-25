@@ -37,6 +37,20 @@ case "${GEMMA4_PREFILL_KV_PROBE:-0}" in
     1) PREFILL_KV_OPTIONS+=(--prefill-kv-probe) ;;
     *) echo "CPU_FULL_PREFILL_ERROR: GEMMA4_PREFILL_KV_PROBE must be 0 or 1" >&2; exit 2 ;;
 esac
+case "${GEMMA4_PREFILL_KV_RUN:-0}" in
+    0) ;;
+    1)
+      if [[ "${GEMMA4_PREFILL_KV_PROBE:-0}" != 1 ]]; then
+        echo "CPU_FULL_PREFILL_ERROR: link run requires KV probe=1" >&2; exit 2
+      fi
+      PREFILL_KV_OPTIONS+=(--prefill-kv-run --prefill-kv-token 568)
+      ;;
+    *) echo "CPU_FULL_PREFILL_ERROR: GEMMA4_PREFILL_KV_RUN must be 0 or 1" >&2; exit 2 ;;
+esac
+LOG=cpu_full_prefill_decode.log
+if [[ "${GEMMA4_PREFILL_KV_RUN:-0}" == 1 ]]; then
+  LOG=cpu_prefill_link_stage6_6.log
+fi
 "$ROOT/build/gemma4-qnn-run" \
     --system "$PWD/sdk247/libQnnSystem.so" \
     --backend "$PWD/sdk247/libQnnHtp.so" \
@@ -58,8 +72,8 @@ esac
     --cpu-embed-next-token 568 \
     --kv-next-reference-dir auto_result_decode_4/Result_0 \
     --kv-next-head-reference-dir auto_result_head_4/Result_0 \
-    2>&1 | tee cpu_full_prefill_decode.log
-LOG=cpu_full_prefill_decode.log
+    2>&1 | tee "$LOG"
+
 for marker in \
     "CPU_PREFILL_ALL_NONKV_QNN_REPLACED: tensors=8" \
     "ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors" \
@@ -72,3 +86,12 @@ for marker in \
 done
 [[ "$(grep -c 'CPU_PREFILL_INPUT_MATCH:' "$LOG")" == 8 ]] || { echo "CPU_FULL_PREFILL_DECODE_EXPECTED_8_INPUT_MATCHES" >&2; exit 1; }
 echo "CPU_FULL_PREFILL_DECODE_OK: Prefill-128 eight CPU inputs, 3 QNN graphs 62 outputs, two Decode steps and LM Head byte-identical"
+if [[ "${GEMMA4_PREFILL_KV_RUN:-0}" == 1 ]]; then
+  for marker in \
+      "PREFILL_LINK_INPUTS_READY: kv_from_prefill_ram=30 nonkv_from_cpu=8 position=17 input_token=568 saved_decode_inputs_used=0" \
+      "PREFILL_LINK_DECODE_OK: graph=qnn_partition_0 outputs=31 position=17 input_token=568" \
+      "PREFILL_LINK_HEAD_OK: logits_bytes=262144 linked_prefill_kv=1 no_saved_decode_reference_claim=1"; do
+    grep -Fq "$marker" "$LOG" || { echo "PREFILL_LINK_STAGE6_6_MISSING: $marker" >&2; exit 1; }
+  done
+  echo "PREFILL_LINK_STAGE6_6_OK: Prefill 30 KV blocks (17 rows) -> real Decode(pos17, token568) -> real LM Head, no independent reference claim"
+fi
