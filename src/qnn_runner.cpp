@@ -5,6 +5,7 @@
 #include <QNN/System/QnnSystemInterface.h>
 #include "kv_cache.h"
 #include "cpu_aux.h"
+#include "packed_embedder.h"
 
 #include <dlfcn.h>
 
@@ -430,6 +431,7 @@ struct Options {
     std::string input_list, inputs_dir, outputs_dir, reference_dir, jobs, kv_next_list;
     std::string kv_next_reference_dir, kv_next_head_reference_dir;
     std::string cpu_aux_model;
+    std::string cpu_embed_section0, cpu_embed_section2;
     bool inspect = false;
     bool check_inputs = false;
     bool chain_decode_head = false;
@@ -440,11 +442,15 @@ struct Options {
     bool cpu_aux_token_set = false;
     bool cpu_aux_next_pos_set = false;
     bool cpu_aux_next_token_set = false;
+    bool cpu_embed_token_set = false;
+    bool cpu_embed_next_token_set = false;
     uint32_t kv_feedback_pos = 0;
     int32_t cpu_aux_pos = 0;
     int32_t cpu_aux_token = 0;
     int32_t cpu_aux_next_pos = 0;
     int32_t cpu_aux_next_token = 0;
+    int32_t cpu_embed_token = 0;
+    int32_t cpu_embed_next_token = 0;
     uint32_t repeat = 1;
 };
 
@@ -574,6 +580,9 @@ void usage(const char* executable) {
         << "     requires exact match to saved inputs before NPU execution.\n"
         << "  With --kv-run-next, --cpu-aux-next-pos N --cpu-aux-next-token ID\n"
         << "     replaces six next Decode AUX inputs via CPU in RAM.\n"
+        << "  --cpu-embed-section0 FILE --cpu-embed-section2 FILE --cpu-embed-token ID\n"
+        << "     replaces two FLOAT32 Decode embeddings with packed INT2/INT4 CPU results.\n"
+        << "  Add --cpu-embed-next-token ID with --kv-run-next for the second Decode.\n"
         << "No implicit tensor conversions or synthetic zero inputs.\n";
 }
 
@@ -666,6 +675,22 @@ Options parse_options(int argc, char** argv) {
             options.cpu_aux_next_token=static_cast<int32_t>(token);
             options.cpu_aux_next_token_set=true;
         }
+        else if (arg == "--cpu-embed-section0") options.cpu_embed_section0 = value;
+        else if (arg == "--cpu-embed-section2") options.cpu_embed_section2 = value;
+        else if (arg == "--cpu-embed-token" || arg == "--cpu-embed-next-token") {
+            bool& set = arg == "--cpu-embed-token" ?
+                options.cpu_embed_token_set : options.cpu_embed_next_token_set;
+            int32_t& target = arg == "--cpu-embed-token" ?
+                options.cpu_embed_token : options.cpu_embed_next_token;
+            if (set || value.empty() || value.front() == '-')
+                throw std::runtime_error(arg + " expects a token ID 0..262143");
+            size_t consumed = 0;
+            const auto number = std::stoul(value, &consumed);
+            if (consumed != value.size() || number >= 262144)
+                throw std::runtime_error(arg + " must be 0..262143");
+            target = static_cast<int32_t>(number);
+            set = true;
+        }
         else if (arg == "--kv-feedback-pos") {
             if (options.kv_feedback)
                 throw std::runtime_error("Choose --kv-auto-pos OR --kv-feedback-pos");
@@ -704,6 +729,17 @@ Options parse_options(int argc, char** argv) {
              !options.cpu_aux_token_set || !options.kv_run_next))
             throw std::runtime_error(
                 "CPU AUX next step requires --kv-run-next and first-step --cpu-aux-model/pos/token");
+        const bool any_embed = !options.cpu_embed_section0.empty() ||
+            !options.cpu_embed_section2.empty() || options.cpu_embed_token_set;
+        const bool full_embed = !options.cpu_embed_section0.empty() &&
+            !options.cpu_embed_section2.empty() && options.cpu_embed_token_set;
+        if (any_embed && !full_embed)
+            throw std::runtime_error(
+                "CPU embeddings require --cpu-embed-section0, "
+                "--cpu-embed-section2, and --cpu-embed-token");
+        if (options.cpu_embed_next_token_set && (!full_embed || !options.kv_run_next))
+            throw std::runtime_error(
+                "--cpu-embed-next-token requires both embedding models, first token and --kv-run-next");
         if (!options.kv_next_list.empty() && !options.kv_feedback)
             throw std::runtime_error("--kv-next-list requires --kv-feedback-pos or --kv-auto-pos");
         if (options.kv_auto_pos && options.kv_next_list.empty())
@@ -729,7 +765,10 @@ Options parse_options(int argc, char** argv) {
         !options.kv_next_head_reference_dir.empty() ||
         !options.cpu_aux_model.empty() || options.cpu_aux_pos_set ||
         options.cpu_aux_token_set || options.cpu_aux_next_pos_set ||
-        options.cpu_aux_next_token_set)
+        options.cpu_aux_next_token_set ||
+        !options.cpu_embed_section0.empty() ||
+        !options.cpu_embed_section2.empty() ||
+        options.cpu_embed_token_set || options.cpu_embed_next_token_set)
         throw std::runtime_error("Chained/KV/CPU AUX options require --jobs");
     if (options.binary.empty() || options.system.empty())
         throw std::runtime_error("--binary and --system are required");
@@ -1214,6 +1253,9 @@ void apply_cpu_aux_decode(ReplayJob& decode,
                           int32_t position, int32_t token_id,
                           const std::string& scope);
 
+void apply_cpu_embeddings_decode(ReplayJob& decode, const Options& options,
+                                 int32_t token_id, const std::string& scope);
+
 void execute_next_decode(QnnRuntime& runtime,
                          ReplayJob& decode,
                          const std::vector<KvLink>& kv_links,
@@ -1247,6 +1289,12 @@ void execute_next_decode(QnnRuntime& runtime,
                              options.cpu_aux_next_pos,
                              options.cpu_aux_next_token, "next");
     }
+    if (options.cpu_embed_next_token_set) {
+        // Preserve the original saved next-step embeddings solely as a
+        // byte-exact reference. QNN receives freshly computed RAM buffers.
+        apply_cpu_embeddings_decode(decode, options,
+                                    options.cpu_embed_next_token, "next");
+    }
     // Rebind ALL 38 input pointers, including the 30 updated K/V buffers,
     // in case replacing any non-KV vector caused its allocation to move.
     for (size_t i = 0; i < decode.inputs.size(); ++i)
@@ -1257,6 +1305,8 @@ void execute_next_decode(QnnRuntime& runtime,
     std::cout << "DECODE_NEXT_INPUTS_READY: kv_from_RAM=" << kv_links.size()
               << " non_kv_from_saved_next=" << changed_non_kv
               << " cpu_aux_replaced=" << (options.cpu_aux_next_pos_set ? 6 : 0)
+              << " cpu_embeddings_replaced="
+              << (options.cpu_embed_next_token_set ? 2 : 0)
               << "\n" << std::flush;
     const auto start = std::chrono::steady_clock::now();
     runtime.execute(decode.handle, decode.inputs, decode.outputs);
@@ -1347,6 +1397,72 @@ void apply_cpu_aux_decode(ReplayJob& decode,
 void apply_cpu_aux_first_decode(ReplayJob& decode, const Options& options) {
     apply_cpu_aux_decode(decode, options.cpu_aux_model,
                          options.cpu_aux_pos, options.cpu_aux_token, "first");
+}
+
+// Stage 5.9: recompute both FLOAT32 embedding inputs directly in RAM.
+// The source weights are original read-only packed Section0 INT2 / Section2
+// INT4 TFLite files, not converted/approximated weights. Fail closed on
+// any mismatch with the original saved Decode input bytes.
+void apply_cpu_embeddings_decode(ReplayJob& decode, const Options& options,
+                                 int32_t token_id, const std::string& scope) {
+    if (decode.graph_name != "qnn_partition_0" || decode.inputs.size() != 38 ||
+        decode.input_buffers.size() != 38)
+        throw std::runtime_error("CPU_EMBED_REQUIRES_DECODE_38_INPUTS");
+    struct Spec {
+        const char* name;
+        int section;
+        size_t bytes;
+        const std::string* model;
+    };
+    const std::array<Spec,2> specs{{
+        {"decode_embeddings_0", 0, 6144, &options.cpu_embed_section0},
+        {"decode_per_layer_embeddings_0", 2, 35840, &options.cpu_embed_section2},
+    }};
+    std::set<size_t> used;
+    size_t bytes_total=0;
+    for (const auto& spec:specs) {
+        size_t index=decode.inputs.size();
+        for (size_t i=0;i<decode.inputs.size();++i) {
+            const char* name=tensor_name(decode.inputs[i]);
+            if(name && spec.name==std::string(name)) {
+                if(index!=decode.inputs.size())
+                    throw std::runtime_error("CPU_EMBED_AMBIGUOUS_QNN_INPUT");
+                index=i;
+            }
+        }
+        if(index==decode.inputs.size() || !used.insert(index).second)
+            throw std::runtime_error(std::string("CPU_EMBED_INPUT_MISSING: ")+spec.name);
+        if(tensor_dtype(decode.inputs[index])!=QNN_DATATYPE_FLOAT_32 ||
+           tensor_nbytes(decode.inputs[index])!=spec.bytes ||
+           decode.input_buffers[index].size()!=spec.bytes)
+            throw std::runtime_error(std::string("CPU_EMBED_INPUT_METADATA_MISMATCH: ")+spec.name);
+        auto computed=gemma4::compute_packed_embedding(
+            *spec.model, spec.section, token_id);
+        if(computed.size()!=spec.bytes)
+            throw std::runtime_error(std::string("CPU_EMBED_OUTPUT_SIZE_MISMATCH: ")+spec.name);
+        const auto& reference=decode.input_buffers[index];
+        const auto mismatch=std::mismatch(
+            computed.begin(),computed.end(),reference.begin());
+        if(mismatch.first!=computed.end())
+            throw std::runtime_error(
+                std::string("CPU_EMBED_REFERENCE_MISMATCH: ")+spec.name+
+                " scope="+scope+" token="+std::to_string(token_id)+
+                " first_byte="+std::to_string(
+                    static_cast<size_t>(mismatch.first-computed.begin())));
+        bytes_total+=computed.size();
+        decode.input_buffers[index]=std::move(computed);
+        bind_raw(decode.inputs[index],decode.input_buffers[index]);
+        std::cout<<"CPU_EMBED_INPUT_MATCH: "<<spec.name
+                 <<" qnn_index="<<index
+                 <<" bytes="<<spec.bytes
+                 <<" token="<<token_id
+                 <<" scope="<<scope<<"\n"<<std::flush;
+    }
+    if(used.size()!=2 || bytes_total!=41984)
+        throw std::runtime_error("CPU_EMBED_EXPECTED_TWO_INPUTS_41984_BYTES");
+    std::cout<<"CPU_EMBED_QNN_REPLACED: scope="<<scope
+             <<" token="<<token_id<<" tensors=2 bytes="<<bytes_total
+             <<" verified_against_saved_decode=1\n"<<std::flush;
 }
 
 int run_replay_jobs(const Options& options) {
@@ -1464,7 +1580,27 @@ int run_replay_jobs(const Options& options) {
             std::cout << "CPU_AUX_SCOPE_NOTE: first Decode AUX from CPU; "
                          "second Decode AUX from "
                       << (options.cpu_aux_next_pos_set ? "CPU Section1" : "saved next list")
-                      << "; second-step embeddings remain saved\n";
+                      << "; second-step embeddings from "
+                      << (options.cpu_embed_next_token_set ? "CPU packed INT2/INT4" : "saved next list")
+                      << "\n";
+    }
+
+    if (!options.cpu_embed_section0.empty()) {
+        if (jobs.front()->graph_name != "qnn_partition_0")
+            throw std::runtime_error(
+                "--cpu-embed-section0 requires a Decode-first jobs manifest");
+        // If AUX or KV linking has already selected the Decode job, reuse it.
+        if (!decode) {
+            for (auto& job : jobs) {
+                if (job->graph_name != "qnn_partition_0") continue;
+                if (decode) throw std::runtime_error(
+                    "Duplicate Decode job for CPU embeddings");
+                decode = job.get();
+            }
+        }
+        if (!decode) throw std::runtime_error("CPU_EMBED_MISSING_DECODE_JOB");
+        apply_cpu_embeddings_decode(*decode, options,
+                                    options.cpu_embed_token, "first");
     }
 
     QnnRuntime runtime(options.backend);
