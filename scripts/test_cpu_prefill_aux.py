@@ -155,6 +155,72 @@ def compare_bytes(cpu_file, reference, expected_size, signature, name):
         )
 
 
+def padding_start(tokens):
+    """Only a contiguous zero suffix is a valid padding inference here."""
+    first = next((i for i, token in enumerate(tokens) if token == 0), TOKENS)
+    if any(token != 0 for token in tokens[first:]):
+        raise ValueError(
+            "PREFILL_PADDING_NOT_CONTIGUOUS: cannot identify a zero-only suffix"
+        )
+    print(f"PREFILL_PADDING_BOUNDARY: first_pad={first} "
+          f"padding_rows={TOKENS-first}", flush=True)
+    return first
+
+
+def apply_query_padding(cpu_file, reference, expected_size, first_pad, alias):
+    """Restrict Section1's causal mask for padded query rows.
+
+    Original Section1 prefill_mask_128 produces a lower-triangular causal
+    allow-mask (signed INT8 127). The saved QNN sample excludes padded
+    query rows with signed INT8 -128 (raw byte 0x80). Derive the positions
+    only from verified INT32 padding IDs, not from the reference contents.
+    Reject any unexpected difference before applying the transformation.
+    """
+    row_width = 4096 + TOKENS
+    if expected_size != TOKENS * row_width:
+        raise ValueError("PREFILL_PADDING_SHAPE_UNSUPPORTED")
+    actual = bytearray(cpu_file.read_bytes())
+    expected = reference.read_bytes()
+    if len(actual) != expected_size or len(expected) != expected_size:
+        raise ValueError("PREFILL_PADDING_INPUT_SIZE_MISMATCH")
+    expected_changes = sum(row + 1 for row in range(first_pad, TOKENS))
+    difference_count = sum(a != b for a, b in zip(actual, expected))
+    print(f"PREFILL_MASK_PADDING_UNPATCHED: name={alias} "
+          f"mismatching_bytes={difference_count} "
+          f"expected_padding_triangle={expected_changes}", flush=True)
+    if difference_count != expected_changes:
+        raise ValueError(
+            f"PREFILL_PADDING_UNEXPECTED_DIFF_COUNT: {alias} "
+            f"actual={difference_count} expected={expected_changes}"
+        )
+    # Every original difference must be exactly the predicted padded
+    # causal-allow element (0x7F), which QNN expected to be masked (0x80).
+    # Changing even one other byte, including any KV column, is forbidden.
+    changed = 0
+    for row in range(first_pad, TOKENS):
+        base = row * row_width + 4096
+        for col in range(row + 1):
+            i = base + col
+            if actual[i] != 127 or expected[i] != 128:
+                raise ValueError(
+                    f"PREFILL_PADDING_UNEXPECTED_VALUE: {alias} "
+                    f"row={row} col={col} "
+                    f"cpu={actual[i]} reference={expected[i]}"
+                )
+            actual[i] = 128
+            changed += 1
+    if actual != expected:
+        first = next(i for i,(a,b) in enumerate(zip(actual,expected)) if a!=b)
+        raise ValueError(
+            f"PREFILL_PADDING_UNEXPECTED_OTHER_DIFF: {alias} "
+            f"byte={first} row={first//row_width} col={first%row_width}"
+        )
+    cpu_file.write_bytes(actual)  # Temporary CPU output only, never reference.
+    print(f"PREFILL_MASK_PADDING_APPLIED: name={alias} "
+          f"rows={TOKENS-first_pad} rewritten_bytes={changed} "
+          "from_i8=127 to_i8=-128 reference_match=1", flush=True)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--work", type=pathlib.Path,
@@ -182,6 +248,7 @@ def main():
         raise ValueError("Recovered token IDs out of vocabulary range")
     if args.pos_start < 0 or args.time_step < 0:
         raise ValueError("Negative prefill positions/time_step are invalid")
+    first_pad = padding_start(tokens)
     metadata = signature_info(model)
     references = manifest_references(work, args.list)
     with tempfile.TemporaryDirectory(prefix="prefill_aux_verified_", dir=work) as tmp:
@@ -207,7 +274,10 @@ def main():
                 if dtype != 9 or elements != size:
                     raise ValueError(f"TFLite {signature}/{alias} not INT8/{size} bytes")
                 reference, _, _ = references[(signature, alias)]
-                cmd.extend(["--expect", f"{alias}={reference}"])
+                # TFLite's raw causal mask intentionally does not mask query
+                # padding; postprocess it below before strict comparison.
+                if signature != "prefill_mask_128":
+                    cmd.extend(["--expect", f"{alias}={reference}"])
             print(f"PREFILL_AUX_CPU_INVOKE_BEGIN: signature={signature} "
                   f"pos_start={args.pos_start} time_step={args.time_step}",
                   flush=True)
@@ -215,6 +285,8 @@ def main():
             for alias, (index, qnn_name, size) in expected_outputs.items():
                 saved, _, _ = references[(signature, alias)]
                 cpu = output_dir / (alias + ".raw")
+                if signature == "prefill_mask_128":
+                    apply_query_padding(cpu, saved, size, first_pad, alias)
                 compare_bytes(cpu, saved, size, signature, alias)
                 byte_total += size
                 print(f"PREFILL_AUX_INPUT_MATCH: signature={signature} "
