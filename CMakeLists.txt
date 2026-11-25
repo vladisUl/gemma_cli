@@ -53,3 +53,10 @@ target_compile_options(gemma4-cpu-run PRIVATE -Wall -Wextra -Wpedantic)
 if(BUILD_TESTING)
   add_test(NAME cpu_runner_help COMMAND gemma4-cpu-run --help)
 endif()
+
+# Stage 5.4: in-process Section1 CPU AUX bridge, TFLite via dlopen.
+add_library(gemma4-cpu-aux STATIC src/cpu_aux.cpp)
+target_include_directories(gemma4-cpu-aux PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(gemma4-cpu-aux PRIVATE dl)
+target_compile_options(gemma4-cpu-aux PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(gemma4-qnn-run PRIVATE gemma4-cpu-aux)
