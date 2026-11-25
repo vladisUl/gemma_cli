@@ -453,6 +453,7 @@ struct Options {
     bool prefill_seed_last_prompt = false;
     bool prefill_tie_policy_set = false;
     bool prefill_allow_tie_lowest = false;
+    bool prefill_kv_diagnose = false;
     uint32_t kv_feedback_pos = 0;
     int32_t cpu_aux_pos = 0;
     int32_t cpu_aux_token = 0;
@@ -608,6 +609,9 @@ void usage(const char* executable) {
         << "     final real prompt token at pos16 with Prefill KV rows 0..15,\n"
         << "     then computes the FIRST next token with linked LM Head.\n"
         << "     Experimental: outputs are NOT compared to independent saved Decode.\n"
+        << "  --prefill-kv-diagnose: read-only per-layer/row/layer-mapping INT8\n"
+        << "     differences of last prompt Prefill KV vs Decode KV slices.\n"
+        << "     Requires --prefill-seed-last-prompt; does NOT change any data.\n"
         << "  --cpu-prefill-tokens TOKENS_I32.raw --cpu-prefill-section0 MODEL0.tflite\n"
         << "  --cpu-prefill-section2 MODEL2.tflite --cpu-prefill-aux-model MODEL1.tflite\n"
         << "     computes all eight Prefill-128 non-KV inputs from CPU in RAM.\n"
@@ -641,6 +645,10 @@ Options parse_options(int argc, char** argv) {
         }
         if (arg == "--prefill-seed-last-prompt") {
             options.prefill_seed_last_prompt = true;
+            continue;
+        }
+        if (arg == "--prefill-kv-diagnose") {
+            options.prefill_kv_diagnose = true;
             continue;
         }
         if (arg == "--kv-run-next") {
@@ -848,6 +856,11 @@ Options parse_options(int argc, char** argv) {
         if (options.prefill_tie_policy_set && !options.prefill_kv_run)
             throw std::runtime_error(
                 "--prefill-tie-policy only valid with --prefill-kv-run");
+        if (options.prefill_kv_diagnose &&
+            (!options.prefill_kv_run || !options.prefill_seed_last_prompt))
+            throw std::runtime_error(
+                "--prefill-kv-diagnose requires --prefill-kv-run "
+                "and --prefill-seed-last-prompt");
         if (!options.kv_next_list.empty() && !options.kv_feedback)
             throw std::runtime_error("--kv-next-list requires --kv-feedback-pos or --kv-auto-pos");
         if (options.kv_auto_pos && options.kv_next_list.empty())
@@ -871,7 +884,7 @@ Options parse_options(int argc, char** argv) {
     if (options.prefill_kv_probe || options.prefill_kv_run ||
         options.prefill_kv_token_set || options.prefill_kv_steps_set ||
         options.prefill_seed_last_prompt || options.prefill_tie_policy_set ||
-        options.chain_decode_head ||
+        options.prefill_kv_diagnose || options.chain_decode_head ||
         options.kv_feedback || options.kv_run_next ||
         !options.kv_next_list.empty() || !options.kv_next_reference_dir.empty() ||
         !options.kv_next_head_reference_dir.empty() ||
@@ -2036,6 +2049,8 @@ void execute_prefill_linked_decode(
         // between distinct QNN kernels. Record differences honestly.
         constexpr size_t kPrefillRows=128;
         size_t total=0, different=0, exact_tensors=0;
+        size_t diagnostic_best_row_16=0, diagnostic_best_source_expected=0;
+        size_t diagnostic_exact_alternate_row=0, diagnostic_exact_alternate_source=0;
         std::set<size_t> seen_source;
         for(size_t n=0;n<kv.size();++n) {
             const auto& link=kv[n];
@@ -2076,6 +2091,122 @@ void execute_prefill_linked_decode(
                      <<" kind="<<(link.key?"K":"V")
                      <<" bytes="<<link.channels
                      <<" mismatching_bytes="<<mismatch<<"\n"<<std::flush;
+            if(options.prefill_kv_diagnose) {
+                // Diagnose, but NEVER correct, last-token Prefill/Decode KV
+                // incompatibility. Find whether a shifted Prefill time row
+                // or a differently named layer yields a closer match.
+                // Candidates must preserve K vs V layout, channel count,
+                // dtype and identical QNN scale/offset quantization.
+                const auto signed_q=[](uint8_t b) -> int {
+                    return b<128?static_cast<int>(b):static_cast<int>(b)-256;
+                };
+                size_t abs1=0,abs2=0,abs_large=0,src_zero=0,dst_zero=0;
+                size_t abs_sum=0,abs_max=0;
+                for(size_t c=0;c<link.channels;++c) {
+                    const size_t off=link.key?
+                        c*kPrefillRows+first_position:
+                        first_position*link.channels+c;
+                    const int x=signed_q(actual[c]),y=signed_q(source[off]);
+                    const size_t d=static_cast<size_t>(std::abs(x-y));
+                    abs_sum+=d;
+                    abs_max=std::max(abs_max,d);
+                    if(d==1)++abs1;
+                    else if(d==2)++abs2;
+                    else if(d>2)++abs_large;
+                    if(y==0)++src_zero;
+                    if(x==0)++dst_zero;
+                }
+                const auto count_row_diff=[&](const std::vector<uint8_t>& block,
+                                              size_t row) -> size_t {
+                    size_t count=0;
+                    for(size_t c=0;c<link.channels;++c) {
+                        const size_t off=link.key?
+                            c*kPrefillRows+row:row*link.channels+c;
+                        count+=static_cast<size_t>(actual[c]!=block[off]);
+                    }
+                    return count;
+                };
+                size_t best_row=kPrefillRows;
+                size_t best_row_diff=link.channels+1;
+                for(size_t row=0;row<kPrefillRows;++row) {
+                    const size_t d=count_row_diff(source,row);
+                    if(d<best_row_diff) {
+                        best_row_diff=d;
+                        best_row=row;
+                    }
+                }
+                if(best_row==first_position)++diagnostic_best_row_16;
+                if(best_row_diff==0)++diagnostic_exact_alternate_row;
+                const auto& expected_quant=tensor_quant(decode.outputs.at(link.output_index));
+                std::string best_source_name="(none)";
+                size_t best_source_diff=link.channels+1;
+                size_t compatible=0;
+                for(size_t candidate=0;candidate<prefill.outputs.size();++candidate) {
+                    const auto& tensor=prefill.outputs[candidate];
+                    if(tensor_dtype(tensor)!=QNN_DATATYPE_SFIXED_POINT_8 ||
+                       tensor_rank(tensor)!=4)continue;
+                    const auto* d=tensor_dims(tensor);
+                    if(d[0]!=1 || d[1]!=1 ||
+                       (link.key?(d[2]!=link.channels || d[3]!=kPrefillRows):
+                                 (d[2]!=kPrefillRows || d[3]!=link.channels)))
+                        continue;
+                    const auto& quant=tensor_quant(tensor);
+                    if(quant.quantizationEncoding!=QNN_QUANTIZATION_ENCODING_SCALE_OFFSET ||
+                       expected_quant.quantizationEncoding!=QNN_QUANTIZATION_ENCODING_SCALE_OFFSET ||
+                       quant.scaleOffsetEncoding.scale!=expected_quant.scaleOffsetEncoding.scale ||
+                       quant.scaleOffsetEncoding.offset!=expected_quant.scaleOffsetEncoding.offset)
+                        continue;
+                    const auto& block=prefill.output_buffers[candidate];
+                    if(block.size()!=source.size())
+                        throw std::runtime_error("PREFILL_KV_DIAG_CANDIDATE_SIZE_INVALID");
+                    ++compatible;
+                    const size_t dcount=count_row_diff(block,first_position);
+                    if(dcount<best_source_diff) {
+                        best_source_diff=dcount;
+                        const char* nm=tensor_name(tensor);
+                        best_source_name=nm?nm:"(unnamed)";
+                    }
+                }
+                if(best_source_name==source_name)++diagnostic_best_source_expected;
+                if(best_source_diff==0)++diagnostic_exact_alternate_source;
+                if(compatible==0 || best_source_diff>link.channels ||
+                   best_row>=kPrefillRows)
+                    throw std::runtime_error("PREFILL_KV_DIAG_NO_VALID_SOURCE");
+                std::cout<<"PREFILL_KV_DIAG_TENSOR: mapped_output="<<source_name
+                         <<" decode_cache="<<link.name
+                         <<" kind="<<(link.key?"K":"V")
+                         <<" channels="<<link.channels
+                         <<" expected_row="<<first_position
+                         <<" mismatched_bytes="<<mismatch
+                         <<" abs_delta1="<<abs1
+                         <<" abs_delta2="<<abs2
+                         <<" abs_delta_gt2="<<abs_large
+                         <<" sum_abs_delta="<<abs_sum
+                         <<" max_abs_delta="<<abs_max
+                         <<" src_signed_zero="<<src_zero
+                         <<" decode_signed_zero="<<dst_zero
+                         <<" best_same_tensor_row="<<best_row
+                         <<" best_same_tensor_row_mismatches="<<best_row_diff
+                         <<" compatible_layer_candidates="<<compatible
+                         <<" best_compatible_source="<<best_source_name
+                         <<" best_compatible_source_mismatches="<<best_source_diff
+                         <<" read_only=1\n"<<std::flush;
+            }
+        }
+        if(options.prefill_kv_diagnose) {
+            std::cout<<"PREFILL_KV_DIAG_SUMMARY: tensors="<<kv.size()
+                     <<" compared_bytes="<<total
+                     <<" mismatched_bytes="<<different
+                     <<" best_same_tensor_row_is_expected="
+                     <<diagnostic_best_row_16
+                     <<" best_compatible_layer_is_expected="
+                     <<diagnostic_best_source_expected
+                     <<" exact_some_same_tensor_row="
+                     <<diagnostic_exact_alternate_row
+                     <<" exact_some_compatible_layer="
+                     <<diagnostic_exact_alternate_source
+                     <<" no_relabel_or_patch_applied=1"
+                     <<" diagnostic_only=1\n"<<std::flush;
         }
         std::cout<<"PREFILL_LAST_PROMPT_KV_COMPARE: tensors=30"
                  <<" compared_bytes="<<total
