@@ -579,3 +579,61 @@ mode. The Python runner now emits the last 24 lines of any
 failed QNN process on stderr, in addition to the full log path.
 This diagnostics-only change does not alter graph execution,
 QNN memory descriptors or the original model.
+
+### STAGE82_SSR_BLOCKED_2026_11_25 — DSP subsystem restart in partial MEMHANDLE
+
+On Radxa Q8B, with all 18 CTest cases passing and the unchanged
+RAW golden 2+2 passing, `--mode probe --probe-steps 2 --kv-count 1`
+returned `QnnGraph_execute: QNN error 1003`. The user's COMPLETE
+last 35 lines from
+
+`/home/radxa/gemma4_qnn_test/bench_stage8_2_20261125_200355_48f51e3q/probe_memhandle.log`
+
+include:
+
+```text
+<E> DspTransport call failed, error 0x00000007
+<E> Failed to connect to the skel for devConfig {0,0,0}
+<E> SSR detected on device config {0,0,0}. Thread will handle cleanup for all impacted sessions
+<E> Transport.teardownLocked: qnn_transport_teardown failed 0x00000027
+<E> fastrpc memory failed to unmap ... error: 0x6b [many FDs]
+<E> Failed to free context with err 1007
+QNN_RUN_ERROR: QnnGraph_execute: QNN error 1003
+```
+
+**Important correction:** code 1003 is a downstream SYSTEM error;
+the significant finding is **SSR reported by FastRPC** and inability
+to connect to the DSP skel. Repeated failures to unmap multiple FDs
+(including model-sized buffers) are consistent with session teardown
+after loss of transport; they are NOT direct evidence that the full
+KV buffers were copied or that those mappings leaked before the fault.
+
+The preceding 30-MEMHANDLE test failed first graphExecute with
+`Dma execution failed on the skel side` (1100). The one-MEMHANDLE
+trace now shows SSR in the broader transport error path, but the
+original triggering fault (memory mapping, DSP exception, or other)
+has NOT been established. Mixed RAW/MEMHANDLE acceptance remains
+unproven either way. These are **failed experiments**; zero-copy
+and throughput improvements have NOT been demonstrated.
+
+Safety/reproducibility: **suspend all MEMHANDLE trials**, including
+`--kv-count 1/2/4/15/30` and 256-step A/B, until collecting kernel
+FastRPC, remoteproc and DSP fault logs. Do not force reset remoteproc
+or alter crash-recovery sysfs settings merely from this report.
+Read-only triage (run on Q8B, preferably before reboot):
+
+```bash
+sudo journalctl -k -b --no-pager | grep -Ei 'fastrpc|cdsp|remoteproc|ssr|restart|smmu|iommu|fault|crash|hexagon|qnn' | tail -n 140
+for x in /sys/class/remoteproc/remoteproc*; do
+  [ -d "$x" ] || continue
+  for field in name state recovery; do
+    [ -r "$x/$field" ] && printf '%s %s: %s\n' "$x" "$field" "$(cat "$x/$field")"
+  done
+done
+```
+
+If the remoteproc/DSP is still crashed or its transport cannot recover,
+preserve diagnostics before a normal reboot. Only after verifying
+stability consider the established RAW path, not another MEMHANDLE
+trial. Qualcomm FastRPC daemon documentation explains SSR/PDR
+re-attachment and diagnostic logging.
