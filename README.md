@@ -76,6 +76,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 5.5 (проверен на Q8B):** два последовательных Decode используют 6 CPU AUX-тензоров на каждом шаге, KV-feedback обновляет все 30 кэшей в RAM. Повторный Decode дал 31/31 точных выходов, повторный LM Head — все 262144 байта логитов в точности. Следующий блокер: **обычные и per-layer embeddings**. Подготовлен [scripts/test_cpu_embedder.sh](scripts/test_cpu_embedder.sh) для проверки исходных Section0/Section2 по отдельности, после однократного переноса моделей на Q8B.
 
+**Stage 5.6 (выявлена блокировка):** оригинальная CPU Section0 требует `EMBEDDING_LOOKUP v4`, не зарегистрированный в системной TFLite 2.14.1. Сборка C++ успешна; Stage 5.5 не затронут. Добавлен [scripts/inspect_tflite_ops.py](scripts/inspect_tflite_ops.py) для просмотра версий операторов и INT4/квантизации без сторонних пакетов. CPU embedder-тест принимает `GEMMA4_TFLITE_LIB` для отдельной совместимой ARM64 библиотеки. Не заменять системный runtime.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.

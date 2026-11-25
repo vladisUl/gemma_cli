@@ -6,6 +6,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="${GEMMA4_TEST_ROOT:-$HOME/gemma4_qnn_test}"
 SECTION="${GEMMA4_EMBEDDER_SECTION:-0}"
 TOKEN="${GEMMA4_EMBEDDER_TOKEN:-2}"
+TFLITE_LIB="${GEMMA4_TFLITE_LIB:-/usr/lib/aarch64-linux-gnu/libtensorflow-lite.so.2.14.1}"
 if [[ "$SECTION" != "0" && "$SECTION" != "2" ]]; then
   echo "CPU_EMBED_TEST_ERROR: GEMMA4_EMBEDDER_SECTION must be 0 or 2" >&2
   exit 2
@@ -33,11 +34,11 @@ if [[ ! -x "$ROOT/build/gemma4-cpu-run" ]]; then
 fi
 mkdir -p "$WORK"
 OUT="$(mktemp -d "$WORK/cpu_embed_section${SECTION}.XXXXXX")"
-echo "CPU_EMBED_TEST_START: section=$SECTION token_probe=$TOKEN"
+echo "CPU_EMBED_TEST_START: section=$SECTION token_probe=$TOKEN runtime=$TFLITE_LIB"
 echo "CPU_EMBED_TEST_NOTE: token is a probe; do not compare to QNN saved Decode unless token ID is known"
 echo "CPU_EMBED_TEST_OUTPUT_DIR: $OUT"
 "$ROOT/build/gemma4-cpu-run" \
-    --model "$MODEL" --signature "$SIGNATURE" \
+    --lib "$TFLITE_LIB" --model "$MODEL" --signature "$SIGNATURE" \
     --i32 "token_ids=$TOKEN" --output-dir "$OUT"
 RESULT="$OUT/embeddings.raw"
 if [[ ! -f "$RESULT" ]]; then

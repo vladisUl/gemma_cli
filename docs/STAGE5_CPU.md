@@ -458,3 +458,72 @@ GEMMA4_EMBEDDER_SECTION=2 bash scripts/test_cpu_embedder.sh \
 Пока ожидаем только `CPU_EMBED_TEST_OK: section=0 output_bytes=6144` и
 `CPU_EMBED_TEST_OK: section=2 output_bytes=35840`; ни один из этих тестов
 ещё не выполнялся на Q8B.
+
+## Stage 5.6 — ошибка несовместимости TFLite и разбор модели
+
+Первый запуск **Section0 на Radxa Q8B завершился на этапе создания CPU-интерпретатора**:
+
+```text
+CPU_EMBED_TEST_START: section=0 token_probe=2
+ERROR: Didn't find op for builtin opcode 'EMBEDDING_LOOKUP' version '4'.
+ERROR: Registration failed.
+CPU_TFLITE_VERSION: 2.14.1
+CPU_RUN_ERROR: CPU_INTERPRETER_CREATE_FAILED
+```
+
+Это не ошибка QNN и не результат вычисления embeddings. Код C++ собрался
+успешно; Section1 (mask/RoPE) и Stage 5.5 **остаются подтверждёнными**.
+Старый runtime 2.14.1 не поддерживает запрошенную версию builtin opcode.
+В истории релизов TensorFlow Lite поддержка INT4 и поканального квантования
+для EmbeddingLookup описана в релизе 2.18.0:
+https://github.com/tensorflow/tensorflow/releases/tag/v2.18.0 .
+Это сильная причина тестировать более свежий runtime, но окончательную
+совместимость с **обеими** Section0 и Section2 докажет только реальный запуск.
+
+**Запрещённый shortcut:** не редактировать TFLite FlatBuffer
+для принудительной замены версии op4 на op3 — INT4/поканальная
+квантизация может менять семантику, выходы будут недостоверными.
+Нельзя подменять системную libtensorflow-lite.so.2.14.1;
+её использует проверенный CPU Section1. Нужную новую библиотеку
+надо разместить отдельно (например, под ~/gemma4_qnn_test/cpu_runtime/).
+
+### Безопасный инвентаризационный тест без TFLite/Python-пакетов
+
+В репозитории добавлен `scripts/inspect_tflite_ops.py` на Python stdlib.
+Он использует **read-only mmap** и не копирует даже 1.4 GB Section2
+целиком в оперативную память. Выводит opcode/версии, сигнатуры,
+форматы/размеры таблиц embeddings и тип квантизации.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+python3 scripts/inspect_tflite_ops.py \
+  ~/gemma4_qnn_test/cpu_models/Section0_TFLiteModel_tf_lite_embedder.tflite \
+  ~/gemma4_qnn_test/cpu_models/Section2_TFLiteModel_tf_lite_per_layer_embedder.tflite \
+  2>&1 | tee ~/gemma4_embedder_opcodes.log
+```
+
+Если второй файл отсутствует, скрипт завершится ошибкой после отчёта
+о первом. Тогда запустить только для Section0. Выводы
+`TFLITE_OPCODE`, `TFLITE_EMBED_INPUT`, `TFLITE_SIGNATURE`
+покажут, можно ли ограничиться новой версией LiteRT
+или нужна также специализированная поддержка нестандартных типов.
+
+### Подключение нового ARM64 runtime отдельно от системного
+
+Скрипт `test_cpu_embedder.sh` теперь принимает переменную
+`GEMMA4_TFLITE_LIB=/absolute/path/to/new/libtensorflowlite_c.so`.
+Она передаётся в существующий `gemma4-cpu-run --lib` (dlopen/dlsym),
+системная TFLite 2.14.1 не заменяется. Новый файл должен быть именно
+**Linux aarch64 C API shared library** с символами
+`TfLiteInterpreterCreate`, `TfLiteInterpreterGetSignatureRunner` и
+`TfLiteSignatureRunnerInvoke`. Обычная Python `.so` не гарантирует C API.
+При появлении такой библиотеки:
+
+```bash
+GEMMA4_TFLITE_LIB=/path/to/compatible/aarch64/libtensorflowlite_c.so \
+  bash scripts/test_cpu_embedder.sh
+```
+
+Документация сборки TensorFlow Lite ARM64 C API:
+https://github.com/tensorflow/tensorflow/blob/master/tensorflow/lite/g3doc/guide/build_arm.md .
