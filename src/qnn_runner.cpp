@@ -426,6 +426,7 @@ struct Options {
     std::string input_list, inputs_dir, outputs_dir, reference_dir, jobs;
     bool inspect = false;
     bool check_inputs = false;
+    bool chain_decode_head = false;
     uint32_t repeat = 1;
 };
 
@@ -543,6 +544,7 @@ void usage(const char* executable) {
         << "Persistent multi-context replay (one backend/device, all contexts kept loaded):\n"
         << "  " << executable << " --system LIB --backend LIB --jobs JOBS.txt\n"
         << "  JOBS.txt lines: BINARY GRAPH INPUT_LIST REFERENCE_RESULT_0 (no spaces in paths).\n"
+        << "  Add --chain-decode-head to execute LM Head again, directly using Decode hidden-state RAM.\n"
         << "No implicit tensor conversions or synthetic zero inputs.\n";
 }
 
@@ -556,6 +558,10 @@ Options parse_options(int argc, char** argv) {
         }
         if (arg == "--check-inputs") {
             options.check_inputs = true;
+            continue;
+        }
+        if (arg == "--chain-decode-head") {
+            options.chain_decode_head = true;
             continue;
         }
         if (arg == "--help" || arg == "-h") {
@@ -599,6 +605,8 @@ Options parse_options(int argc, char** argv) {
             throw std::runtime_error("--jobs cannot be combined with single-graph options");
         return options;
     }
+    if (options.chain_decode_head)
+        throw std::runtime_error("--chain-decode-head requires --jobs");
     if (options.binary.empty() || options.system.empty())
         throw std::runtime_error("--binary and --system are required");
     if (!options.inspect) {
@@ -827,10 +835,130 @@ void prepare_replay_job(ReplayJob& job, const std::string& system_library) {
               << " binary_bytes=" << job.binary.size() << "\n" << std::flush;
 }
 
+// Match Decode's final INT8 hidden state to LM Head input using *actual*
+// QNN metadata; index/name guesses are not valid for all AOT exports.
+size_t find_decode_head_link(const ReplayJob& decode, const ReplayJob& head) {
+    if (decode.graph_name != "qnn_partition_0" ||
+        head.graph_name != "qnn_partition_1")
+        throw std::runtime_error("Chaining requires qnn_partition_0 and qnn_partition_1");
+    if (head.inputs.size() != 1 || head.outputs.size() != 1)
+        throw std::runtime_error("Chaining requires a one-input/one-output LM Head");
+    const auto& target = head.inputs[0];
+    if (tensor_dtype(target) != QNN_DATATYPE_SFIXED_POINT_8 ||
+        tensor_nbytes(target) != 1536)
+        throw std::runtime_error("Unexpected LM Head hidden-state signature");
+    const auto& target_quant = tensor_quant(target);
+    if (target_quant.quantizationEncoding != QNN_QUANTIZATION_ENCODING_SCALE_OFFSET)
+        throw std::runtime_error("LM Head requires per-tensor scale/offset metadata");
+
+    size_t result = decode.outputs.size();
+    for (size_t i = 0; i < decode.outputs.size(); ++i) {
+        const auto& candidate = decode.outputs[i];
+        if (tensor_dtype(candidate) != tensor_dtype(target) ||
+            tensor_rank(candidate) != tensor_rank(target) ||
+            tensor_nbytes(candidate) != tensor_nbytes(target))
+            continue;
+        bool dims_match = true;
+        for (uint32_t d = 0; d < tensor_rank(target); ++d) {
+            if (tensor_dims(candidate)[d] != tensor_dims(target)[d]) {
+                dims_match = false;
+                break;
+            }
+        }
+        if (!dims_match) continue;
+        const auto& quant = tensor_quant(candidate);
+        if (quant.quantizationEncoding != QNN_QUANTIZATION_ENCODING_SCALE_OFFSET)
+            continue;
+        if (quant.scaleOffsetEncoding.scale != target_quant.scaleOffsetEncoding.scale ||
+            quant.scaleOffsetEncoding.offset != target_quant.scaleOffsetEncoding.offset)
+            continue;
+        if (result != decode.outputs.size())
+            throw std::runtime_error("Ambiguous Decode hidden-state output: multiple metadata matches");
+        result = i;
+    }
+    if (result == decode.outputs.size())
+        throw std::runtime_error("No Decode output matches LM Head input shape/dtype/quantization");
+    return result;
+}
+
+void execute_chained_decode_head(QnnRuntime& runtime,
+                                 ReplayJob& decode,
+                                 ReplayJob& head,
+                                 size_t decode_output_index) {
+    auto& hidden = decode.output_buffers.at(decode_output_index);
+    if (hidden.size() != tensor_nbytes(head.inputs[0]))
+        throw std::runtime_error("Chained hidden-state size changed");
+    // Pass the existing Decode output buffer directly as the LM Head input.
+    // QNN graphExecute is synchronous; do not free or overwrite 'hidden' yet.
+    std::vector<Qnn_Tensor_t> linked_inputs = head.inputs;
+    bind_raw(linked_inputs[0], hidden);
+    const auto start = std::chrono::steady_clock::now();
+    runtime.execute(head.handle, linked_inputs, head.outputs);
+    const auto stop = std::chrono::steady_clock::now();
+
+    const auto& logits = head.output_buffers.at(0);
+    if (tensor_dtype(head.outputs[0]) != QNN_DATATYPE_SFIXED_POINT_8 ||
+        logits.size() != 262144)
+        throw std::runtime_error("Unexpected LM Head output: expected 262144 signed INT8 logits");
+
+    // Diagnostic ONLY: integer argmax is not a production sampler.
+    // Several token IDs can share the highest value after INT8 quantization.
+    int max_value = -129;
+    size_t first_max = 0, ties = 0;
+    for (size_t i = 0; i < logits.size(); ++i) {
+        const int q = logits[i] < 128 ? static_cast<int>(logits[i])
+                                      : static_cast<int>(logits[i]) - 256;
+        if (q > max_value) {
+            max_value = q;
+            first_max = i;
+            ties = 1;
+        } else if (q == max_value) {
+            ++ties;
+        }
+    }
+
+    std::cout << "CHAIN_DECODE_HEAD_OK: output_name="
+              << (tensor_name(decode.outputs[decode_output_index]) ?
+                  tensor_name(decode.outputs[decode_output_index]) : "(unnamed)")
+              << " hidden_bytes=" << hidden.size()
+              << " logits_bytes=" << logits.size()
+              << " head_execute_ms="
+              << std::chrono::duration<double, std::milli>(stop - start).count()
+              << " int8_argmax_id=" << first_max
+              << " max_logit_q=" << max_value
+              << " argmax_ties=" << ties << "\n" << std::flush;
+    std::cout << "CHAIN_NOTE: logits are from the saved Decode sample, NOT the "
+                 "independent LM Head reference sample; do not compare them as "
+                 "if both samples were identical.\n";
+}
+
 int run_replay_jobs(const Options& options) {
     auto jobs = parse_replay_jobs(options.jobs);
     // Check all files, all tensor sizes and graph metadata BEFORE NPU init.
     for (auto& job : jobs) prepare_replay_job(*job, options.system);
+
+    ReplayJob* decode = nullptr;
+    ReplayJob* head = nullptr;
+    size_t hidden_output_index = 0;
+    if (options.chain_decode_head) {
+        for (auto& job : jobs) {
+            if (job->graph_name == "qnn_partition_0") {
+                if (decode) throw std::runtime_error("Duplicate Decode job in --jobs");
+                decode = job.get();
+            } else if (job->graph_name == "qnn_partition_1") {
+                if (head) throw std::runtime_error("Duplicate LM Head job in --jobs");
+                head = job.get();
+            }
+        }
+        if (!decode || !head)
+            throw std::runtime_error("--chain-decode-head requires Decode + LM Head jobs");
+        hidden_output_index = find_decode_head_link(*decode, *head);
+        std::cout << "CHAIN_METADATA_OK: decode_output_index=" << hidden_output_index
+                  << " hidden_bytes=" << tensor_nbytes(decode->outputs[hidden_output_index])
+                  << " head_input_bytes=" << tensor_nbytes(head->inputs[0])
+                  << "\n" << std::flush;
+    }
+
     QnnRuntime runtime(options.backend);
     // Critical property: load ALL contexts before executing ANY graph.
     for (auto& job : jobs) {
@@ -862,6 +990,11 @@ int run_replay_jobs(const Options& options) {
     }
     std::cout << "ALL_JOBS_REFERENCES_MATCH: " << jobs.size()
               << " graphs " << total_outputs << " output tensors\n";
+    // Execute the linked graph *after* checking all saved individual baselines.
+    // The saved Head reference belongs to a different Decode step; do not
+    // incorrectly compare it to the newly chained Head output.
+    if (options.chain_decode_head)
+        execute_chained_decode_head(runtime, *decode, *head, hidden_output_index);
     return 0;
 }
 

@@ -185,3 +185,52 @@ bash ../gemma4-cli-stage1/scripts/test_persistent_order.sh decode prefill head
 Успех: `PERSISTENT_ORDER_VERIFIED: decode_prefill_head graphs=3 outputs=62`. При отказе FastRPC/QNN сохранить `persistent_decode_prefill_head.log` и прислать первые строки ошибки, а не повторять сразу после возможного DSP SSR. Этот тест проверяет **одновременное размещение и воспроизводимость вычислений**, а не связанный цикл генерации.
 
 Обратите внимание: существующие `--jobs` / graphExecute работали с реальными входами; новый скрипт только собирает варианты manifest. Результат одновременной загрузки ещё не подтверждён.
+
+## Stage 4.1 — прямое связывание Decode → LM Head без файлов
+
+После успешного теста трёх одновременно загруженных графов на Q8B (2026-11-25):
+
+```text
+QNN_CONTEXT_READY: qnn_partition_0 load_ms=334.76
+QNN_CONTEXT_READY: qnn_partition_2 load_ms=147.26
+QNN_CONTEXT_READY: qnn_partition_1 load_ms=75.2312
+PERSISTENT_CONTEXTS_READY: 3 graphs; one backend/device; all contexts alive
+PERSISTENT_GRAPH_OK: qnn_partition_0 outputs=31 execute_ms=68.4304
+PERSISTENT_GRAPH_OK: qnn_partition_2 outputs=30 execute_ms=54.3325
+PERSISTENT_GRAPH_OK: qnn_partition_1 outputs=1 execute_ms=10.9321
+ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors
+PERSISTENT_ORDER_VERIFIED: decode_prefill_head graphs=3 outputs=62
+```
+
+Три контекста могут сосуществовать на Hexagon v68 **в указанном порядке**. Следующий шаг — связать вычисления без `.raw` на границе графов.
+
+Добавлен необязательный флаг `--chain-decode-head` к режиму `--jobs`. Он:
+
+1. Загружает все контексты в порядке manifest, валидирует все сохранённые входы и побайтово сверяет все 62 независимых результата.
+2. Находит 1536-байтный выход Decode, совпадающий с входом LM Head по `shape`, `dtype` и квантованию (`scale/offset`), **не по номеру выхода**.
+3. Повторно вызывает `QnnGraph_execute` для LM Head, передавая `Decode.output_buffers[i].data()` в качестве входа. Не пишет и не читает промежуточный hidden state с диска.
+4. Выводит `CHAIN_DECODE_HEAD_OK` с числом логитов и диагностическим INT8 argmax (при ничьей фиксирует число одинаковых максимумов).
+
+**Важно:** проверенные отдельные Decode и LM Head относятся к разным сохранённым шагам генерации. Следовательно, новая выходная последовательность логитов НЕ должна автоматически сравниваться с ранее сохранённым `real_result_head_17`: это был бы неверный эталон. Успех `CHAIN_DECODE_HEAD_OK` пока означает корректное исполнение связки и совместимость метаданных, а не точность полного текстового ответа.
+
+На Q8B:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+
+cd ~/gemma4_qnn_test
+export LD_LIBRARY_PATH="$PWD/sdk247"
+export ADSP_LIBRARY_PATH="$PWD/sdk247"
+set -o pipefail
+../gemma4-cli-stage1/build/gemma4-qnn-run \
+  --system "$PWD/sdk247/libQnnSystem.so" \
+  --backend "$PWD/sdk247/libQnnHtp.so" \
+  --jobs persistent_jobs_all3.txt \
+  --chain-decode-head 2>&1 | tee chain_decode_head.log
+```
+
+Ожидаются уже проверенные строки `ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors`, а затем `CHAIN_DECODE_HEAD_OK: ... hidden_bytes=1536 logits_bytes=262144`. Этот режим **не генерирует текст** и пока не обновляет KV-cache между шагами; для этого потребуется CPU LiteRT и токенизатор на Radxa.
+
