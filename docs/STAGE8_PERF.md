@@ -257,3 +257,65 @@ LiteRT-LM measures normal decode from 256 Prefill tokens. Therefore
 Stage 8.1 is NOT yet a matched 256/256/1024 comparison.
 Future Stage 8.2 would require a correct, validated 256-token
 Prefill and a matching QNN Decode AOT with 1024 KV capacity.
+
+### Stage 8.1 measured results — 2026-11-25, Dragon Q8B
+
+Hardware run passed **16/16 CTest**, the original nine-token
+2+2 golden regression (EOS106), and all three Stage 8.1 runs.
+Each individual run executed **exactly 256 synthetic Decode+Head
+iterations and 256 updates to all 30 KV slices**. Each started
+from a fresh QNN process; none reloaded contexts between its
+256 Decode steps. No extra warmup was inserted.
+
+Original board-side report (not uploaded to this repository):
+
+`/home/radxa/gemma4_qnn_test/bench_stage8_1_20261125_191731_0m4rz4hn/summary.json`
+
+| Run | Fixed Decode steps | KV updates | Step/s (CPU+QNN+KV) | NPU graph-only step/s | QNN process wall (s) |
+|---|---:|---:|---:|---:|---:|
+| 1 | 256 | 256 | 11.756 | 13.201 | 23.152 |
+| 2 | 256 | 256 | 10.409 | 11.544 | 25.995 |
+| 3 | 256 | 256 | 10.297 | 11.363 | 26.202 |
+| **Median** | **256** | **256** | **10.409** | **11.544** | **25.995** |
+
+Reported median phase measurements:
+
+| Phase | Milliseconds |
+|---|---:|
+| BPE (Python + tokenizer JSON) | 1027.484 |
+| QNN metadata / buffers | 455.837 |
+| Initialize QNN backend + three contexts | 719.180 |
+| CPU Prefill | 36.584 |
+| NPU Prefill-128 | 61.357 |
+| Prefill → Decode RAM KV transfer | 1.838 |
+| CPU non-KV preparation per Decode step | 8.012 |
+| **NPU Decode graphExecute per step** | **72.903** |
+| **NPU LM Head graphExecute per step** | **13.650** |
+| CPU KV slot-feedback per step | 0.128 |
+| All 256 Decode steps (median) | 24593.645 |
+| First Decode step | 96.533 |
+| Steps after first | 10.414 steps/s |
+
+Median across the three independent runs showed a decrease from
+11.756 to 10.297 step/s (~12.4%). Causes are **not established**:
+measure DSP/HTP clocks and temperatures, and inspect step latency by
+position before attributing the effect to throttling or growing KV.
+
+Although the CPU-side writing of 30 KV slices costs only ~0.128 ms,
+that does **not** establish that QNN/HTP avoids full-cache transfers or
+synchronization inside its Decode graphExecute (measured ~72.9 ms).
+KV cache is reused and never recomputed from prompt at each step,
+but the full 4096-position buffers are bound to Decode as QNN RAW
+tensor inputs. The rate is dominated by blocking Decode and Head
+calls, not by Python BPE or host KV slot updates.
+
+Compared numerically with LiteRT-LM 0.19.1 E2B YNNPACK at
+27.689 decoded tok/s, the Stage 8.1 synthetic loop's 10.409
+Decode+Head+KV steps/s is ~2.66x lower. **Do not call this a matched
+apples-to-apples benchmark:** QNN has 13 real Prefill tokens, a
+Prefill-128 graph, a 4096-token cache capacity, and fixed repeated
+token ID 236778. LiteRT-LM uses 256 Prefill tokens, 256 normal Decode
+tokens, 1024 KV capacity, eight CPU threads, MTP disabled. The next
+performance investigation should first check per-step latency across
+positions and HTP clock/thermal behavior; true 256/256/1024 requires
+different validated QNN contexts.
