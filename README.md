@@ -70,6 +70,10 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 5.4 (код добавлен, тест на Q8B впереди):** `--cpu-aux-model ... --cpu-aux-pos 3 --cpu-aux-token 2` выполняет `Section1` в том же процессе, напрямую заменяет шесть входов QNN Decode на CPU-выходы в RAM (только после строгой сверки с сохранёнными входами), затем повторяет проверку всех 62 выходных QNN-тензоров. См. [docs/STAGE5_CPU.md](docs/STAGE5_CPU.md).
 
+**Stage 5.4 (проверен на Q8B):** 6 AUX тензоров (9730 байт) рассчитаны в том же C++ процессе через CPU TFLite Section1, сверены с входами QNN Decode и поданы напрямую в RAM; все 62 выхода трёх QNN-графов совпали побайтово с эталонами.
+
+**Stage 5.5 (код в GitHub, проверка Q8B впереди):** при `--kv-run-next` новые `--cpu-aux-next-pos 4 --cpu-aux-next-token 2` позволяют заменить **ещё шесть AUX-входов второго Decode** вычислениями CPU Section1; 30 K/V-кэшей второго шага берутся из обратной связи в RAM. Готовый тест — [scripts/test_cpu_aux_two_step.sh](scripts/test_cpu_aux_two_step.sh).
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.

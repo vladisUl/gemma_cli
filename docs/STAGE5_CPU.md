@@ -258,7 +258,7 @@ CPU_AUX_ALL_MATCH: kind=mask tensors=2 bytes=8194
 CPU_MASK_STEP3_VERIFIED: outputs byte-identical to saved QNN inputs
 ```
 
-## Stage 5.4 — CPU Section1 → QNN Decode без промежуточных .raw (новый код)
+## Stage 5.4 — CPU Section1 → QNN Decode без промежуточных .raw (проверено на Q8B)
 
 **Stage 5.3 подтверждён пользователем:** оба выхода `decode_mask`
 побайтово совпали с сохранёнными входами QNN Decode шага 3.
@@ -300,7 +300,7 @@ set -o pipefail
   2>&1 | tee cpu_aux_qnn_decode.log
 ```
 
-Ожидаем (пока на Q8B не проверено):
+Получено на Q8B (побайтовая сверка прошла):
 
 ```text
 CPU_AUX_SIGNATURE_OK: decode_rope outputs=4
@@ -320,3 +320,66 @@ ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors
 восемь не-KV входов из следующего сохранённого списка; прямое
 питание от CPU AUX для следующего шага — отдельное развитие.
 Модель Section0 и Section2 не участвуют в этом тесте.
+
+### Stage 5.4 — подтверждённый результат пользователя
+
+На Q8B успешно прошёл полный `gemma4-qnn-run --jobs --cpu-aux-model`:
+
+```text
+CPU_AUX_VERSION: 2.14.1 position=3 token_id=2
+CPU_AUX_SIGNATURE_OK: decode_rope outputs=4
+CPU_AUX_SIGNATURE_OK: decode_mask outputs=2
+CPU_AUX_QNN_REPLACED: tensors=6 bytes=9730 from=Section1_TFLite_2.14 verified_against_saved_decode=1
+PERSISTENT_CONTEXTS_READY: 3 graphs; one backend/device; all contexts alive
+PERSISTENT_GRAPH_OK: qnn_partition_0 outputs=31 execute_ms=77.3643
+PERSISTENT_GRAPH_OK: qnn_partition_2 outputs=30 execute_ms=60.9959
+PERSISTENT_GRAPH_OK: qnn_partition_1 outputs=1 execute_ms=11.0824
+ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors
+```
+
+Это подтверждает, что шесть входных AUX-тензоров **фактически заменены**
+вычислениями CPU Section1 в оперативной памяти и поданы в QNN Decode;
+все выходы графов остались побайтово равны эталонам.
+
+## Stage 5.5 — CPU AUX для обоих последовательных Decode (новый код)
+
+Существующий Stage 4.4 проверил: шаг 3 → 30 обновлений KV-cache в RAM →
+шаг 4 → LM Head(4), с побайтовым совпадением всех 31 выходов Decode(4)
+и 262144 байт LM Head(4). Stage 5.4 проверил подачу CPU AUX на первом шаге.
+
+Stage 5.5 объединяет оба достижения:
+
+- Первый Decode получает 6 масок/RoPE из TFLite Section1 (pos=3, token=2).
+- KV-feedback обновляет все 30 полных кэшей в RAM для второго шага.
+- На втором шаге из сохранённого списка сначала читаются 8 не-KV входов;
+  **шесть AUX-тензоров из них затем заменяются CPU TFLite результатами**
+  (pos=4, token=2) и сверяются побайтово с сохранённой выборкой шага 4.
+- Два FLOAT32 embeddings второго шага всё ещё берутся из файлов.
+- После замены второе исполнение Decode и LM Head должно совпасть с
+  оригинальными QNN-эталонами шага 4.
+
+Для удобства добавлен тестовый скрипт:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+bash scripts/test_cpu_aux_two_step.sh
+```
+
+Вывод сохраняется в `~/gemma4_qnn_test/cpu_aux_two_step.log`.
+Тест ещё не запущен на Q8B. Ожидаемые итоги:
+
+```text
+CPU_AUX_NEXT_QNN_REPLACED: tensors=6 bytes=9730 cpu_pos=4 cpu_token=2
+KV_NEXT_CACHE_MATCH: 30 cache tensors byte-identical
+DECODE_NEXT_REFERENCE_MATCH: 31 output tensors byte-identical
+DECODE_NEXT_HEAD_REFERENCE_MATCH: 262144 logits bytes identical
+CPU_AUX_TWO_STEP_EXIT_OK: all requested comparisons completed
+```
+
+Если `CPU_AUX_REFERENCE_MISMATCH` возникнет **до второго NPU Decode**,
+это означает, что выбранные CPU pos/token не воспроизводят сохранённый
+тестовый шаг 4. Не обходить сверку. Пробный token=2 гарантирует только
+непустое значение, не идентифицирует оригинальный токен.
