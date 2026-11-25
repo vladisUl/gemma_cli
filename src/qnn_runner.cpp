@@ -427,7 +427,7 @@ struct QnnRuntime {
 struct Options {
     std::string binary, backend, system, graph, input, output, reference;
     std::string input_list, inputs_dir, outputs_dir, reference_dir, jobs, kv_next_list;
-    std::string kv_next_reference_dir;
+    std::string kv_next_reference_dir, kv_next_head_reference_dir;
     bool inspect = false;
     bool check_inputs = false;
     bool chain_decode_head = false;
@@ -558,6 +558,7 @@ void usage(const char* executable) {
         << "  Or --kv-auto-pos with --kv-next-list to infer the changed KV slot.\n"
         << "  Add --kv-run-next to execute Decode again with updated KV and next-step non-KV inputs.\n"
         << "  Optional --kv-next-reference-dir Result_0 checks all 31 next Decode outputs.\n"
+        << "  Optional --kv-next-head-reference-dir Result_0 checks next LM Head logits.\n"
         << "No implicit tensor conversions or synthetic zero inputs.\n";
 }
 
@@ -608,6 +609,7 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--jobs") options.jobs = value;
         else if (arg == "--kv-next-list") options.kv_next_list = value;
         else if (arg == "--kv-next-reference-dir") options.kv_next_reference_dir = value;
+        else if (arg == "--kv-next-head-reference-dir") options.kv_next_head_reference_dir = value;
         else if (arg == "--kv-feedback-pos") {
             if (options.kv_feedback)
                 throw std::runtime_error("Choose --kv-auto-pos OR --kv-feedback-pos");
@@ -642,6 +644,9 @@ Options parse_options(int argc, char** argv) {
             throw std::runtime_error("--kv-run-next requires --kv-auto-pos or --kv-feedback-pos, and --kv-next-list");
         if (!options.kv_next_reference_dir.empty() && !options.kv_run_next)
             throw std::runtime_error("--kv-next-reference-dir requires --kv-run-next");
+        if (!options.kv_next_head_reference_dir.empty() &&
+            (!options.kv_run_next || !options.chain_decode_head))
+            throw std::runtime_error("--kv-next-head-reference-dir requires --kv-run-next and --chain-decode-head");
         if (!options.binary.empty() || !options.graph.empty() ||
             !options.input.empty() || !options.output.empty() ||
             !options.reference.empty() || !options.input_list.empty() ||
@@ -652,7 +657,8 @@ Options parse_options(int argc, char** argv) {
         return options;
     }
     if (options.chain_decode_head || options.kv_feedback || options.kv_run_next ||
-        !options.kv_next_list.empty() || !options.kv_next_reference_dir.empty())
+        !options.kv_next_list.empty() || !options.kv_next_reference_dir.empty() ||
+        !options.kv_next_head_reference_dir.empty())
         throw std::runtime_error("Chained/KV options require --jobs");
     if (options.binary.empty() || options.system.empty())
         throw std::runtime_error("--binary and --system are required");
@@ -1222,6 +1228,20 @@ int run_replay_jobs(const Options& options) {
     std::vector<KvLink> kv_links;
     std::vector<fs::path> next_cache_files;
     std::vector<fs::path> next_decode_references;
+    fs::path next_head_reference;
+    if (!options.kv_next_head_reference_dir.empty()) {
+        if (!head || head->outputs.size() != 1)
+            throw std::runtime_error("Next LM Head reference requires a valid LM Head job");
+        const fs::path dir(options.kv_next_head_reference_dir);
+        next_head_reference = dir / native_basename(head->outputs[0], 0);
+        if (!fs::is_regular_file(next_head_reference) ||
+            fs::file_size(next_head_reference) !=
+                tensor_nbytes(head->outputs[0]))
+            throw std::runtime_error("Invalid next LM Head reference: " +
+                                     next_head_reference.string());
+        std::cout << "DECODE_NEXT_HEAD_REFERENCE_READY: "
+                  << next_head_reference.string() << "\n" << std::flush;
+    }
     if (options.kv_feedback) {
         if (jobs.front()->graph_name != "qnn_partition_0")
             throw std::runtime_error("--kv-feedback-pos requires a Decode-first manifest");
@@ -1322,6 +1342,14 @@ int run_replay_jobs(const Options& options) {
                 std::cout << "DECODE_NEXT_HEAD_EXECUTE_OK: logits="
                           << head->output_buffers[0].size()
                           << "\n" << std::flush;
+                if (!next_head_reference.empty()) {
+                    compare_reference(head->output_buffers[0],
+                                      next_head_reference.string());
+                    std::cout << "DECODE_NEXT_HEAD_REFERENCE_MATCH: "
+                              << head->output_buffers[0].size()
+                              << " logits bytes identical"
+                              << "\n" << std::flush;
+                }
             }
         }
     }

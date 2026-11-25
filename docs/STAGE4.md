@@ -396,3 +396,55 @@ find . -maxdepth 4 -type d -name 'Result_0' -print | sort
 После проверки, что каталог относится к `auto_decode_step4_list.txt`, в команду перед `2>&1` добавить `--kv-next-reference-dir ПУТЬ_К_ЭТАЛОНУ_ШАГА_4/Result_0`. При этом ожидается `DECODE_NEXT_REFERENCE_MATCH: 31 output tensors byte-identical`. Не использовать эталон шага 3.
 
 **Граница этапа:** восстанавливаем два сохранённых шага Decode и KV-feedback без файлового обмена между графами, но пока не создаём новые CPU embeddings/masks/RoPE из выбранного токена. Для полноценной генерации потребуются LiteRT/AUX и SentencePiece на ARM64.
+
+### Stage 4.4 — независимая сверка второго Decode и LM Head
+
+Первый запуск на Q8B подтвердил:
+- `KV_AUTO_POS_OK: pos=3 changed_cache_tensors=30`;
+- `KV_NEXT_CACHE_MATCH: 30 cache tensors byte-identical`;
+- `DECODE_NEXT_INPUTS_READY: kv_from_RAM=30 non_kv_from_saved_next=8`;
+- `DECODE_NEXT_EXECUTE_OK: ... outputs=31 execute_ms=78.323`;
+- `DECODE_NEXT_HEAD_EXECUTE_OK: logits=262144`.
+
+Теперь обнаружены каталоги эталонов второго шага:
+`auto_result_decode_4/Result_0` и `auto_result_head_4/Result_0`.
+Они должны относиться к тому же шагу `auto_decode_step4_list.txt`.
+Добавлен флаг `--kv-next-head-reference-dir`, который до загрузки NPU проверяет наличие
+и размер эталона LM Head, а после второго вызова LM Head сравнивает все его байты.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+
+cd ~/gemma4_qnn_test
+export LD_LIBRARY_PATH="$PWD/sdk247"
+export ADSP_LIBRARY_PATH="$PWD/sdk247"
+set -o pipefail
+
+../gemma4-cli-stage1/build/gemma4-qnn-run \
+  --system "$PWD/sdk247/libQnnSystem.so" \
+  --backend "$PWD/sdk247/libQnnHtp.so" \
+  --jobs persistent_jobs_decode_prefill_head.txt \
+  --chain-decode-head \
+  --kv-auto-pos \
+  --kv-next-list auto_decode_step4_list.txt \
+  --kv-run-next \
+  --kv-next-reference-dir auto_result_decode_4/Result_0 \
+  --kv-next-head-reference-dir auto_result_head_4/Result_0 \
+  2>&1 | tee decode_two_step_verified.log
+```
+
+Критерий полного успеха:
+
+```text
+KV_NEXT_CACHE_MATCH: 30 cache tensors byte-identical
+DECODE_NEXT_REFERENCE_MATCH: 31 output tensors byte-identical
+DECODE_NEXT_HEAD_REFERENCE_MATCH: 262144 logits bytes identical
+```
+
+Первый этап (`ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors`) также
+обязан остаться успешным. Если новая сверка не пройдёт, не изменять исходные
+`.raw` и не считать несоответствие доказательством ошибки кэша без изучения
+источника эталонов. QAIRT-инференс на Q8B для нового режима пока не выполнен.
