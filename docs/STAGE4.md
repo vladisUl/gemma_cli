@@ -342,3 +342,57 @@ set -o pipefail
 Не запускать это сравнение с двумя случайными шагами или результатами другой последовательности: при несовпадении оно сообщит `KV_AUTO_POS_MISMATCH` либо `KV_NEXT_MISMATCH`. Входные .raw/.bin на диске не изменяются.
 
 CPU CTest `kv_cache_slot_layout` теперь проверяет не только правильную раскладку и границы, но и определение изменённого слота, включая отказ при изменении двух позиций. Сборка и тест на Q8B ещё требуются.
+
+## Stage 4.4 — второй Decode в одном QNN-контексте
+
+**На Q8B Stage 4.3 подтверждён:** по реальным `auto_decode_step3_list.txt` → `auto_decode_step4_list.txt` программа вычислила `KV_AUTO_POS_OK: pos=3 changed_cache_tensors=30`, выполнила `KV_FEEDBACK_OK: inserted_bytes=9216` и получила `KV_NEXT_CACHE_MATCH: 30 cache tensors byte-identical`. Это полная побайтовая проверка обновления KV-cache между двумя сохранёнными шагами.
+
+Новый необязательный флаг `--kv-run-next` после этой проверки повторно выполняет **тот же Decode graph handle**, не выгружая QNN-контексты:
+
+- 30 входных K/V-cache — из RAM после нашего обновления, **не** из сохранённых файлов шага 4;
+- остальные 8 входов (embeddings, per-layer embeddings, RoPE, masks) — из сохранённого `auto_decode_step4_list.txt`;
+- при `--chain-decode-head` после второго Decode повторно выполняется LM Head на его новом 1536-байтовом hidden state;
+- необязательный `--kv-next-reference-dir Result_0` включает побайтовую сверку всех 31 выходных тензоров второго Decode с **его собственным** эталоном.
+
+Скриптов и моделей не меняем. Запуск на Q8B:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+
+cd ~/gemma4_qnn_test
+export LD_LIBRARY_PATH="$PWD/sdk247"
+export ADSP_LIBRARY_PATH="$PWD/sdk247"
+set -o pipefail
+
+../gemma4-cli-stage1/build/gemma4-qnn-run \
+  --system "$PWD/sdk247/libQnnSystem.so" \
+  --backend "$PWD/sdk247/libQnnHtp.so" \
+  --jobs persistent_jobs_decode_prefill_head.txt \
+  --chain-decode-head \
+  --kv-auto-pos --kv-next-list auto_decode_step4_list.txt \
+  --kv-run-next 2>&1 | tee decode_two_step.log
+```
+
+Новые ожидаемые строки (на Q8B **ещё не проверены**):
+
+```text
+KV_NEXT_CACHE_MATCH: 30 cache tensors byte-identical
+DECODE_NEXT_INPUTS_READY: kv_from_RAM=30 non_kv_from_saved_next=8
+DECODE_NEXT_EXECUTE_OK: graph=qnn_partition_0 outputs=31 ...
+DECODE_NEXT_NOTE: no next-step graph reference was supplied ...
+DECODE_NEXT_HEAD_EXECUTE_OK: logits=262144
+```
+
+Если сохранился эталон графа **именно Decode шага 4**, найти его:
+
+```bash
+cd ~/gemma4_qnn_test
+find . -maxdepth 4 -type d -name 'Result_0' -print | sort
+```
+
+После проверки, что каталог относится к `auto_decode_step4_list.txt`, в команду перед `2>&1` добавить `--kv-next-reference-dir ПУТЬ_К_ЭТАЛОНУ_ШАГА_4/Result_0`. При этом ожидается `DECODE_NEXT_REFERENCE_MATCH: 31 output tensors byte-identical`. Не использовать эталон шага 3.
+
+**Граница этапа:** восстанавливаем два сохранённых шага Decode и KV-feedback без файлового обмена между графами, но пока не создаём новые CPU embeddings/masks/RoPE из выбранного токена. Для полноценной генерации потребуются LiteRT/AUX и SentencePiece на ARM64.
