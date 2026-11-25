@@ -140,3 +140,28 @@ PREFILL_VERIFIED: 30/30 outputs byte-identical
 Файлы результатов сохраняются в `~/gemma4_qnn_test/direct_result_prefill_128/Result_0/`, лог — в `~/gemma4_qnn_test/prefill_reference_test.log`. При несовпадении хотя бы одного байта скрипт завершается ошибкой, не выдавая `PREFILL_VERIFIED`.
 
 Если сохранённого входного списка или эталона нет, сначала найдите их; **не создавайте нулевые входы и не сравнивайте с другим шагом**. Скрипт не меняет три QNN-бинарника.
+
+
+### Транспортная ошибка QNN 14001 при тесте Prefill (2026-11-25)
+
+При первом запуске `scripts/test_prefill.sh` проверены **36/36 входов** (строка `INPUTS_VALIDATED`), однако до выполнения `QnnGraph_execute` тест не дошёл: `deviceCreate: QNN error 14001`, `QNN_TRANSPORT_CONFIG crc32 failed`, `Failed to load skel, error: 1002`. **Результаты Prefill этим тестом ещё не подтверждены**; это ошибка транспорта DSP, а не несовпадение выходных тензоров.
+
+Скрипт теперь запускается в изолированном окружении библиотек `sdk247`:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cd ~/gemma4_qnn_test
+bash ../gemma4-cli-stage1/scripts/test_prefill.sh \\
+  ./prefill_real_input_list.txt ./result_prefill_real_prompt/Result_0
+```
+
+На этот раз и stdout, и stderr записываются в `prefill_reference_test.log`. Если ошибка `14001` повторится, проверить отдельно инициализацию QNN HTP (без загрузки контекста):
+
+```bash
+cd ~/gemma4_qnn_test
+LD_LIBRARY_PATH="$PWD/sdk247" ADSP_LIBRARY_PATH="$PWD/sdk247" \\
+  ../gemma4-cli-stage1/build/gemma4-qnn-probe "$PWD/sdk247/libQnnHtp.so"
+```
+
+Если и `gemma4-qnn-probe` завершится ошибкой транспорта, сначала нужно разбираться с DSP/Skel/QAIRT и состоянием устройства, не меняя модель и её входы. Если probe успешен, но Prefill по-прежнему падает, потребуются полные логи QNN и анализ загрузки контекста.

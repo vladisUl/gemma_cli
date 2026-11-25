@@ -51,8 +51,15 @@ else
   fail "Need an existing input list or input directory: $INPUT_SOURCE"
 fi
 
-export LD_LIBRARY_PATH="$PWD/sdk247${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export ADSP_LIBRARY_PATH="$PWD/sdk247${ADSP_LIBRARY_PATH:+:$ADSP_LIBRARY_PATH}"
+# Run against one known QAIRT version. Do not inherit Qwen/other QAIRT libs:
+# a mismatched DSP skel/stub can fail at deviceCreate before graph execution.
+for required in libQnnHtp.so libQnnSystem.so libQnnHtpV68Stub.so libQnnHtpV68Skel.so; do
+  [[ -f "sdk247/$required" ]] || fail "Required QAIRT 2.47 library missing: sdk247/$required"
+done
+export LD_LIBRARY_PATH="$PWD/sdk247"
+export ADSP_LIBRARY_PATH="$PWD/sdk247"
+printf 'QAIRT_LD_LIBRARY_PATH: %s\nQAIRT_ADSP_LIBRARY_PATH: %s\n' \
+  "$LD_LIBRARY_PATH" "$ADSP_LIBRARY_PATH"
 
 COMMON=(
   --system "$PWD/sdk247/libQnnSystem.so"
@@ -69,9 +76,25 @@ printf 'MODEL_DIR: %s\nINPUT_SOURCE: %s\nREFERENCE_DIR: %s\nOUTPUT_DIR: %s\n' \
 "$RUNNER" "${COMMON[@]}" --check-inputs
 
 # QNN execute and strict comparison against all 30 original output files.
+# Include stderr in the log; otherwise DSP transport failures are lost.
+# Preserve the runner status even though its output passes through tee.
+set +e
 "$RUNNER" "${COMMON[@]}" \
   --backend "$PWD/sdk247/libQnnHtp.so" \
-  --reference-dir "$REFERENCE_DIR" | tee "$LOG"
+  --reference-dir "$REFERENCE_DIR" 2>&1 | tee "$LOG"
+runner_status=${PIPESTATUS[0]}
+set -e
+
+if (( runner_status != 0 )); then
+  if grep -Eq 'QNN error 14001|QNN_TRANSPORT_CONFIG|Failed to load skel|Transport layer setup failed' "$LOG"; then
+    printf '%s\n' \
+      'HTP_TRANSPORT_ERROR: failed before successful QNN graph execution.' \
+      'Verify matching QAIRT 2.47 libQnnHtp.so / V68 Stub / V68 Skel and DSP state.' \
+      'Diagnostic: see the DSP error lines in the log above.' >&2
+  fi
+  printf 'PREFILL_TEST_FAILED: runner_exit=%s log=%s\n' "$runner_status" "$PWD/$LOG" >&2
+  exit "$runner_status"
+fi
 
 grep -Fxq 'ALL_REFERENCES_MATCH: 30 output tensors' "$LOG" ||
   fail "Expected 30 matching Prefill outputs. See $PWD/$LOG"
