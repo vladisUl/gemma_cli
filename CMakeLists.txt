@@ -75,3 +75,11 @@ target_compile_definitions(gemma4-packed-embed-core PRIVATE GEMMA4_PACKED_EMBED_
 target_include_directories(gemma4-packed-embed-core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_options(gemma4-packed-embed-core PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(gemma4-qnn-run PRIVATE gemma4-packed-embed-core)
+
+# Stage 6.2: standalone Prefill-128 packed embeddings byte-for-byte test.
+add_executable(gemma4-packed-prefill src/packed_prefill.cpp)
+target_link_libraries(gemma4-packed-prefill PRIVATE gemma4-packed-embed-core)
+target_compile_options(gemma4-packed-prefill PRIVATE -Wall -Wextra -Wpedantic)
+if(BUILD_TESTING)
+  add_test(NAME packed_prefill_help COMMAND gemma4-packed-prefill --help)
+endif()

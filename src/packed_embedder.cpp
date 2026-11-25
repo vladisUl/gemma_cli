@@ -358,6 +358,45 @@ std::vector<uint8_t> compute_packed_embedding(
               << "\n" << std::flush;
     return bytes;
 }
+// Prefill output tensors use token-major row order:
+// Section0: [1,128,1536], Section2: [1,128,35,256].
+// The original single-token extractor is reused for each distinct token,
+// keeping one read-only mmap for the entire model and caching repeated IDs.
+std::vector<uint8_t> compute_packed_prefill_embeddings(
+        const std::string& model_file, int section,
+        const std::vector<int32_t>& token_ids) {
+    if (token_ids.size() != 128)
+        throw std::runtime_error("PACKED_PREFILL_ERROR: expected 128 token IDs");
+    for (auto token : token_ids)
+        if (token < 0 || token >= 262144)
+            throw std::runtime_error("PACKED_PREFILL_ERROR: invalid token ID");
+    if (section != 0 && section != 2)
+        throw std::runtime_error("PACKED_PREFILL_ERROR: section must be 0 or 2");
+    Model model(model_file, section, token_ids.front());
+    const size_t row_floats = section == 0 ? 1536 : 35*256;
+    const size_t row_bytes = row_floats * sizeof(float);
+    std::vector<uint8_t> result(token_ids.size() * row_bytes);
+    std::map<int32_t, std::vector<float>> cache;
+    for (size_t i=0;i<token_ids.size();++i) {
+        const int32_t token = token_ids[i];
+        auto entry=cache.find(token);
+        if(entry==cache.end()) {
+            model.token=token;
+            auto fresh=model.run();
+            if(fresh.size()!=row_floats)
+                throw std::runtime_error("PACKED_PREFILL_ERROR: unexpected row length");
+            entry=cache.emplace(token,std::move(fresh)).first;
+        }
+        std::memcpy(result.data()+i*row_bytes,
+                    entry->second.data(),row_bytes);
+    }
+    std::cout<<"PACKED_PREFILL_RAM_READY: section="<<section
+             <<" positions="<<token_ids.size()
+             <<" unique_tokens="<<cache.size()
+             <<" bytes="<<result.size()
+             <<" mmap_count=1\n"<<std::flush;
+    return result;
+}
 } // namespace gemma4
 
 #ifndef GEMMA4_PACKED_EMBED_LIBRARY
