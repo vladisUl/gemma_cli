@@ -53,6 +53,58 @@ int main() {
     try { (void)gemma4::find_changed_kv_slot(v0,v1,3,4,KvLayout::Value); }
     catch(const std::invalid_argument&) {thrown=true;}
     require(thrown,"V must reject differences at two distinct slots");
+    // 6-slot / 3-channel cache, with 4 exported Prefill rows.
+    // Only 2 non-padding positions are copied at global positions 1 and 2.
+    const std::vector<uint8_t> prefill_k{
+        10,11,12,13, 20,21,22,23, 30,31,32,33
+    }; // channel-major 3x4
+    std::vector<uint8_t> block_k(3*6, 99);
+    gemma4::update_kv_block(block_k,prefill_k,3,6,1,4,2,KvLayout::Key);
+    require(block_k==std::vector<uint8_t>({
+        99,10,11,99,99,99,
+        99,20,21,99,99,99,
+        99,30,31,99,99,99}),"Prefill K block channel-major placement");
+
+    const std::vector<uint8_t> prefill_v{
+        10,20,30, 11,21,31, 12,22,32, 13,23,33
+    }; // row-major 4x3
+    std::vector<uint8_t> block_v(3*6, 99);
+    gemma4::update_kv_block(block_v,prefill_v,3,6,1,4,2,KvLayout::Value);
+    require(block_v==std::vector<uint8_t>({
+        99,99,99, 10,20,30, 11,21,31,
+        99,99,99, 99,99,99, 99,99,99}),"Prefill V block contiguous placement");
+
+    // Distinguish a Prefill block from repeated Decode slots.
+    std::vector<uint8_t> assembled_k(3*6,0);
+    std::vector<uint8_t> assembled_v(3*6,0);
+    gemma4::update_kv_block(assembled_k,prefill_k,3,6,0,4,2,KvLayout::Key);
+    gemma4::update_kv_block(assembled_v,prefill_v,3,6,0,4,2,KvLayout::Value);
+    for(size_t r=0;r<2;++r) {
+        std::vector<uint8_t> ks(3),vs(3);
+        for(size_t c=0;c<3;++c) {
+            ks[c]=prefill_k[c*4+r];
+            vs[c]=prefill_v[r*3+c];
+        }
+        std::vector<uint8_t> one_k(3*6,0),one_v(3*6,0);
+        gemma4::update_kv_slot(one_k,ks,3,6,r,KvLayout::Key);
+        gemma4::update_kv_slot(one_v,vs,3,6,r,KvLayout::Value);
+        for(size_t c=0;c<3;++c) {
+            require(one_k[c*6+r]==assembled_k[c*6+r],"K block matches slot primitive");
+            require(one_v[r*3+c]==assembled_v[r*3+c],"V block matches slot primitive");
+        }
+    }
+    thrown=false;
+    try {gemma4::update_kv_block(block_k,prefill_k,3,6,5,4,2,KvLayout::Key);}
+    catch(const std::invalid_argument&){thrown=true;}
+    require(thrown,"Block insertion may not pass cache capacity");
+    thrown=false;
+    try {gemma4::update_kv_block(block_v,prefill_v,3,6,0,4,5,KvLayout::Value);}
+    catch(const std::invalid_argument&){thrown=true;}
+    require(thrown,"Block insertion may not include unprovided rows");
+    thrown=false;
+    try {gemma4::update_kv_block(block_k,{1,2,3},3,6,0,4,2,KvLayout::Key);}
+    catch(const std::invalid_argument&){thrown=true;}
+    require(thrown,"Wrong Prefill K block length must be rejected");
     std::cout << "KV_CACHE_UNIT_TEST_OK: K/V layouts, bounds, inferred slot\n";
     return 0;
 }
