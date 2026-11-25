@@ -71,6 +71,57 @@ find . -maxdepth 3 -type d -name 'Result_0' -print | sort
 
 **Критический тест Stage 4:** в логе должны появиться **три** строки `QNN_CONTEXT_READY`, затем `PERSISTENT_CONTEXTS_READY: 3 graphs`, затем три `PERSISTENT_GRAPH_OK` и финальная `ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors` (30 Prefill + 31 Decode + 1 LM Head).
 
+
+## Проверка всех трёх контекстов (следующий тест)
+
+**Одиночный persistent Prefill прошёл на Q8B (2026-11-25):**
+
+```text
+PERSISTENT_GRAPH_OK: qnn_partition_2 outputs=30 execute_ms=54.8585
+ALL_JOBS_REFERENCES_MATCH: 1 graphs 30 output tensors
+Exit code: 0
+```
+
+Следующий тест через [`scripts/test_persistent_three.sh`](../scripts/test_persistent_three.sh) собирает три строки `--jobs` из сохранённых данных, проверяет существование и размеры эталонов **до NPU init**, а затем загружает все три QNN-контекста в один процесс.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+# C++ уже собран в предыдущем тесте; повторная сборка не нужна.
+
+cd ~/gemma4_qnn_test
+bash ../gemma4-cli-stage1/scripts/test_persistent_three.sh
+```
+
+По умолчанию используются именно ранее документированные пары:
+
+- Prefill: `prefill_real_input_list.txt` + `result_prefill_real_prompt/Result_0`.
+- Decode: `auto_decode_step3_list.txt` + `auto_result_decode_3/Result_0`.
+- LM Head: скрытое состояние из `real_result_decode_17/Result_0` (1536 байт) + `real_result_head_17/Result_0` (262144 байта logits).
+
+Если Decode 31/31 у вас выполнялся с **другим** списком и эталоном, укажите **оба** соответствующих пути, например:
+
+```bash
+DECODE_LIST=мой_проверенный_decode_input_list.txt \
+DECODE_REF=каталог_того_же_decode/Result_0 \
+bash ../gemma4-cli-stage1/scripts/test_persistent_three.sh
+```
+
+Аналогично можно переопределить `HEAD_INPUT` и `HEAD_REF`; не смешивайте разные шаги генерации. Скрипт не подменяет отсутствующие данные фиктивными; при неполном комплекте выведет `PERSISTENT_THREE_ERROR` до загрузки NPU.
+
+При успехе:
+
+```text
+PERSISTENT_CONTEXTS_READY: 3 graphs; one backend/device; all contexts alive
+PERSISTENT_GRAPH_OK: qnn_partition_2 outputs=30 ...
+PERSISTENT_GRAPH_OK: qnn_partition_0 outputs=31 ...
+PERSISTENT_GRAPH_OK: qnn_partition_1 outputs=1 ...
+ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors
+PERSISTENT_THREE_VERIFIED: 3 graphs, 62 output tensors byte-identical
+```
+
+Если fail уже при загрузке контекстов — покажите первые `QNN_CONTEXT_READY` и `QNN_RUN_ERROR`, а также `free -h`; возможно ограничение памяти HTP. Полный лог сохраняется в `persistent_three.log`.
+
 ## Ограничения и диагностика
 
 - Три контекста могут не поместиться в ресурсы CPU/DSP при одновременной загрузке. Если загрузка одного из них даст QNN error, зафиксировать первую ошибку и состояние памяти `free -h`.
