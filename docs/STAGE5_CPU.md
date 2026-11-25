@@ -129,3 +129,64 @@ Section1 (85480 bytes), Section2 (1394630752 bytes) must be found on the
 development machine and copied to Q8B once. Their byte lengths are from
 the earlier model report; validate copies and avoid touching the three QNN
 context binaries.
+
+## Stage 5.1 — CPU TFLite signature runner (code ready, model needed)
+
+Q8B passed the complete native ABI check:
+
+```text
+CPU_C_ABI_VERSION: 2.14.1
+CPU_C_ABI_READY: required=27 missing=0 signature_runner_available=1
+```
+
+Added `gemma4-cpu-run`: a C++17 standalone TFLite signature runner that
+loads the installed CPU library via `dlopen/dlsym` (no developer headers).
+It uses the actual TFLite named signature API, checks tensor dtype/shapes and
+byte sizes and supports scalar INT32 inputs or exact-sized RAW input files.
+Output can optionally be byte-compared to an explicitly chosen reference.
+
+Build and verify CLI on Q8B (model files need not be present yet):
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+./build/gemma4-cpu-run --help
+```
+
+Once `Section1_TFLiteModel_tf_lite_aux.tflite` is present on Q8B at
+`~/gemma4_qnn_test/cpu_models/`:
+
+```bash
+cd ~/gemma4_qnn_test
+../gemma4-cli-stage1/build/gemma4-cpu-run \
+  --model cpu_models/Section1_TFLiteModel_tf_lite_aux.tflite --list
+
+../gemma4-cli-stage1/build/gemma4-cpu-run \
+  --model cpu_models/Section1_TFLiteModel_tf_lite_aux.tflite \
+  --signature decode_rope --i32 input_pos=3 \
+  --output-dir cpu_rope_pos3
+```
+
+For `decode_mask`, both inputs are scalar-sized INT32, but they must be
+derived from the **correct actual token and step** to reproduce a saved
+reference. Example only (not yet verified against a saved QNN input):
+
+```bash
+../gemma4-cli-stage1/build/gemma4-cpu-run \
+  --model cpu_models/Section1_TFLiteModel_tf_lite_aux.tflite \
+  --signature decode_mask --i32 input_tokens=2 --i32 time_step=3 \
+  --output-dir cpu_mask_example
+```
+
+If the required input dtype is not INT32, or dimensions cannot be allocated,
+the program fails; it never silently converts or supplies zeros. Output paths
+are never overwritten. To check saved data, use `--expect OUTPUT_NAME=FILE.raw`
+for each named TFLite signature output.
+
+We must still **locate/copy Section1 from the development machine**.
+TFLite 2.14.1 successfully exporting its C API does not guarantee that
+the particular source model's op versions are supported; the first
+real model load is a separate test.
+

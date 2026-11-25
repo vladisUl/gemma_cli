@@ -45,3 +45,11 @@ endif()
 add_executable(gemma4-cpu-abi src/cpu_abi_probe.cpp)
 target_link_libraries(gemma4-cpu-abi PRIVATE dl)
 target_compile_options(gemma4-cpu-abi PRIVATE -Wall -Wextra -Wpedantic)
+
+# Stage 5: named CPU TFLite signature runner using validated native C ABI.
+add_executable(gemma4-cpu-run src/cpu_runner.cpp)
+target_link_libraries(gemma4-cpu-run PRIVATE dl)
+target_compile_options(gemma4-cpu-run PRIVATE -Wall -Wextra -Wpedantic)
+if(BUILD_TESTING)
+  add_test(NAME cpu_runner_help COMMAND gemma4-cpu-run --help)
+endif()
