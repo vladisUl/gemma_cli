@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
