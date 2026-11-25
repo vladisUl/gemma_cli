@@ -451,6 +451,8 @@ struct Options {
     bool prefill_kv_token_set = false;
     bool prefill_kv_steps_set = false;
     bool prefill_seed_last_prompt = false;
+    bool prefill_tie_policy_set = false;
+    bool prefill_allow_tie_lowest = false;
     uint32_t kv_feedback_pos = 0;
     int32_t cpu_aux_pos = 0;
     int32_t cpu_aux_token = 0;
@@ -600,6 +602,8 @@ void usage(const char* executable) {
         << "  Optional --prefill-kv-steps N (1..4): 2+ linked Decode steps using\n"
         << "     previous Decode output KV feedback and prior LM Head INT8 argmax.\n"
         << "     Probe token is NOT derived from Prefill logits; no tokenizer.\n"
+        << "  --prefill-tie-policy stop|lowest-id (default stop): print all tied\n"
+        << "     INT8 max IDs; lowest-id allows an EXPERIMENTAL tie-break only.\n"
         << "  --prefill-seed-last-prompt instead of --prefill-kv-token: replays the\n"
         << "     final real prompt token at pos16 with Prefill KV rows 0..15,\n"
         << "     then computes the FIRST next token with linked LM Head.\n"
@@ -685,6 +689,14 @@ Options parse_options(int argc, char** argv) {
                 throw std::runtime_error("--prefill-kv-token out of range");
             options.prefill_kv_token=static_cast<int32_t>(id);
             options.prefill_kv_token_set=true;
+        }
+        else if (arg == "--prefill-tie-policy") {
+            if(options.prefill_tie_policy_set ||
+               (value!="stop" && value!="lowest-id"))
+                throw std::runtime_error(
+                    "--prefill-tie-policy must be stop or lowest-id exactly once");
+            options.prefill_tie_policy_set=true;
+            options.prefill_allow_tie_lowest=(value=="lowest-id");
         }
         else if (arg == "--prefill-kv-steps") {
             if(options.prefill_kv_steps_set || value.empty() || value.front()=='-')
@@ -833,6 +845,9 @@ Options parse_options(int argc, char** argv) {
         if (options.prefill_seed_last_prompt && !options.prefill_kv_run)
             throw std::runtime_error(
                 "--prefill-seed-last-prompt only valid with --prefill-kv-run");
+        if (options.prefill_tie_policy_set && !options.prefill_kv_run)
+            throw std::runtime_error(
+                "--prefill-tie-policy only valid with --prefill-kv-run");
         if (!options.kv_next_list.empty() && !options.kv_feedback)
             throw std::runtime_error("--kv-next-list requires --kv-feedback-pos or --kv-auto-pos");
         if (options.kv_auto_pos && options.kv_next_list.empty())
@@ -855,7 +870,8 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.prefill_kv_probe || options.prefill_kv_run ||
         options.prefill_kv_token_set || options.prefill_kv_steps_set ||
-        options.prefill_seed_last_prompt || options.chain_decode_head ||
+        options.prefill_seed_last_prompt || options.prefill_tie_policy_set ||
+        options.chain_decode_head ||
         options.kv_feedback || options.kv_run_next ||
         !options.kv_next_list.empty() || !options.kv_next_reference_dir.empty() ||
         !options.kv_next_head_reference_dir.empty() ||
@@ -2079,14 +2095,43 @@ void execute_prefill_linked_decode(
                 ties=1;
             } else if(q==best) ++ties;
         }
+        // The QNN LM Head emits only quantized INT8 logits, not FLOAT32.
+        // Expose every ID sharing the maximum instead of pretending that
+        // the first ID was uniquely better. The scan keeps low-ID ordering.
+        std::vector<int32_t> tied_ids;
+        tied_ids.reserve(ties);
+        for(size_t i=0;i<logits.size();++i) {
+            const int q=logits[i]<128?static_cast<int>(logits[i]):
+                                          static_cast<int>(logits[i])-256;
+            if(q==best)tied_ids.push_back(static_cast<int32_t>(i));
+        }
+        if(tied_ids.size()!=ties || tied_ids.empty() || tied_ids.front()!=id)
+            throw std::runtime_error("PREFILL_LINK_TIE_DIAGNOSTIC_INCONSISTENT");
+        std::ostringstream ids;
+        for(size_t i=0;i<tied_ids.size();++i)
+            ids<<(i?",":"")<<tied_ids[i];
+        std::cout<<"PREFILL_LINK_GREEDY_CANDIDATES: executed_step="
+                 <<executed_step<<" max_logit_q="<<best
+                 <<" ties="<<ties
+                 <<" candidate_token_ids="<<ids.str()<<"\n"<<std::flush;
+        if(ties!=1) {
+            if(!options.prefill_allow_tie_lowest)
+                throw std::runtime_error(
+                    "PREFILL_LINK_GREEDY_AMBIGUOUS_INT8_TIE: "
+                    "use --prefill-tie-policy lowest-id only for experiments; "
+                    "a quantized tie does not determine the true FP32 winner");
+            std::cout<<"PREFILL_LINK_TIE_RESOLUTION: executed_step="
+                     <<executed_step
+                     <<" policy=lowest-id chosen_token_id="<<id
+                     <<" tied_ids="<<ids.str()
+                     <<" experimental_arbitrary_tiebreak=1"
+                     <<" no_FP32_ordering_claim=1\n"<<std::flush;
+        }
         std::cout<<"PREFILL_LINK_GREEDY_NEXT: executed_step="<<executed_step
                  <<" token_id="<<id<<" max_logit_q="<<best
                  <<" argmax_ties="<<ties
+                 <<" tie_policy="<<(ties==1?"unique":"lowest-id-experimental")
                  <<" quantized_int8_argmax=1\n"<<std::flush;
-        if(ties!=1)
-            throw std::runtime_error(
-                "PREFILL_LINK_GREEDY_AMBIGUOUS_INT8_TIE: "
-                "cannot select a unique token from quantized logits");
         return id;
     };
     if(options.prefill_kv_steps<1 || options.prefill_kv_steps>4)
@@ -2190,6 +2235,7 @@ void execute_prefill_linked_decode(
              <<" last_position="<<(first_position+options.prefill_kv_steps-1)
              <<" first_token="<<first_token
              <<" last_prompt_replayed="<<(options.prefill_seed_last_prompt?1:0)
+             <<" int8_tie_policy="<<(options.prefill_allow_tie_lowest?"lowest-id-experimental":"stop")
              <<" all_KV_from_prefill_or_feedback_RAM=1"
              <<" all_nonKV_from_CPU=1"
              <<" independent_reference_claim=0\n"<<std::flush;
