@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -129,6 +130,75 @@ void run_signature(
     std::cout << "CPU_AUX_SIGNATURE_OK: " << signature
               << " outputs=" << outputs.size() << "\n" << std::flush;
 }
+
+using RawInputs=std::vector<std::pair<std::string,std::vector<uint8_t>>>;
+
+std::vector<uint8_t> int32bytes(const std::vector<int32_t>& ints) {
+    std::vector<uint8_t> raw(ints.size()*sizeof(int32_t));
+    std::memcpy(raw.data(),ints.data(),raw.size());
+    return raw;
+}
+
+void run_prefill_signature(
+    const Api& api,void* interpreter,const char* key,
+    const RawInputs& inputs,const OutputList& outputs,
+    std::vector<gemma4::CpuAuxTensor>& result) {
+    Obj runner=ownership(api.get_signature(interpreter,key),
+                         api.delete_signature,key);
+    if(api.allocate(runner.get())!=0)
+        throw std::runtime_error(std::string("CPU_PREFILL_ALLOCATE_FAILED: ")+key);
+    for(const auto& item:inputs) {
+        void* tensor=api.get_input(runner.get(),item.first.c_str());
+        if(!tensor || api.tensor_type(tensor)!=2 ||
+           api.tensor_bytes(tensor)!=item.second.size())
+            throw std::runtime_error("CPU_PREFILL_INT32_INPUT_MISMATCH: "+item.first);
+        if(api.copy_input(tensor,item.second.data(),item.second.size())!=0)
+            throw std::runtime_error("CPU_PREFILL_INPUT_COPY_FAILED: "+item.first);
+    }
+    if(api.invoke(runner.get())!=0)
+        throw std::runtime_error(std::string("CPU_PREFILL_INVOKE_FAILED: ")+key);
+    for(const auto& spec:outputs) {
+        const void* tensor=api.get_output(runner.get(),spec.cpu_name);
+        if(!tensor || api.tensor_type(tensor)!=9 ||
+           api.tensor_bytes(tensor)!=spec.expected_bytes)
+            throw std::runtime_error(std::string("CPU_PREFILL_INT8_OUTPUT_MISMATCH: ")+spec.cpu_name);
+        gemma4::CpuAuxTensor output;
+        output.qnn_name=spec.qnn_name;
+        output.bytes.resize(spec.expected_bytes);
+        if(api.copy_output(tensor,output.bytes.data(),output.bytes.size())!=0)
+            throw std::runtime_error(std::string("CPU_PREFILL_OUTPUT_COPY_FAILED: ")+spec.cpu_name);
+        std::cout<<"CPU_PREFILL_AUX_OUTPUT_READY: "<<spec.cpu_name
+                 <<" qnn="<<output.qnn_name
+                 <<" bytes="<<output.bytes.size()<<"\n"<<std::flush;
+        result.push_back(std::move(output));
+    }
+    std::cout<<"CPU_PREFILL_AUX_SIGNATURE_OK: "<<key
+             <<" outputs="<<outputs.size()<<"\n"<<std::flush;
+}
+
+void apply_prefill_padding(gemma4::CpuAuxTensor& output,size_t first_pad) {
+    constexpr size_t kRows=128,kCache=4096,kCols=kCache+kRows;
+    if(output.bytes.size()!=kRows*kCols)
+        throw std::runtime_error("CPU_PREFILL_PADDING_OUTPUT_SIZE_MISMATCH");
+    size_t count=0;
+    for(size_t r=first_pad;r<kRows;++r) {
+        const size_t base=r*kCols+kCache;
+        for(size_t c=0;c<=r;++c) {
+            if(output.bytes[base+c]!=127)
+                throw std::runtime_error("CPU_PREFILL_PADDING_UNEXPECTED_CAUSAL_BYTE: "+
+                    output.qnn_name+" row="+std::to_string(r)+
+                    " column="+std::to_string(c));
+            output.bytes[base+c]=128;
+            ++count;
+        }
+    }
+    if(count!=kRows*(kRows+1)/2-first_pad*(first_pad+1)/2)
+        throw std::runtime_error("CPU_PREFILL_PADDING_TRIANGLE_COUNT_MISMATCH");
+    std::cout<<"CPU_PREFILL_PADDING_APPLIED: "<<output.qnn_name
+             <<" first_pad="<<first_pad<<" rewritten_bytes="<<count
+             <<" signed_int8=-128\n"<<std::flush;
+}
+
 } // namespace
 
 namespace gemma4 {
@@ -173,4 +243,62 @@ std::vector<CpuAuxTensor> run_decode_aux(
     if (result.size()!=6) throw std::runtime_error("CPU_AUX_OUTPUT_COUNT_INVALID");
     return result;
 }
+
+std::vector<CpuAuxTensor> run_prefill_aux(
+    const std::string& model_file,const std::vector<int32_t>& tokens,
+    const std::string& cpu_library) {
+    constexpr int32_t kN=128;
+    if(!std::filesystem::is_regular_file(model_file))
+        throw std::runtime_error("CPU_PREFILL_MODEL_NOT_FOUND: "+model_file);
+    if(tokens.size()!=kN)
+        throw std::runtime_error("CPU_PREFILL_REQUIRES_128_TOKEN_IDS");
+    size_t first_pad=tokens.size();
+    for(size_t i=0;i<tokens.size();++i) {
+        if(tokens[i]<0||tokens[i]>=262144)
+            throw std::runtime_error("CPU_PREFILL_TOKEN_OUT_OF_RANGE");
+        if(tokens[i]==0 && first_pad==tokens.size())first_pad=i;
+        if(tokens[i]!=0 && first_pad!=tokens.size())
+            throw std::runtime_error("CPU_PREFILL_NONCONTIGUOUS_ZERO_PADDING");
+    }
+    std::vector<int32_t> positions(kN);
+    for(int32_t i=0;i<kN;++i)positions[i]=i;
+    const std::vector<int32_t> time_step{0};
+    Library library(cpu_library);
+    Api api(library);
+    std::cout<<"CPU_PREFILL_AUX_VERSION: "<<api.version()
+             <<" pos_start=0 time_step=0 first_pad="<<first_pad
+             <<"\n"<<std::flush;
+    Obj model=ownership(api.create_model(model_file.c_str()),
+                        api.delete_model,"Prefill Section1 model");
+    Obj opts=ownership(api.create_options(),api.delete_options,
+                       "Prefill interpreter options");
+    api.set_threads(opts.get(),1);
+    Obj interpreter=ownership(api.create_interpreter(model.get(),opts.get()),
+                              api.delete_interpreter,"Prefill interpreter");
+
+    std::vector<CpuAuxTensor> result;
+    result.reserve(6);
+    run_prefill_signature(api,interpreter.get(),"prefill_rope_128",
+        {{"input_pos",int32bytes(positions)}},
+        {{"pos_emb_cos","prefill_128_pos_emb_cos_0",65536},
+         {"pos_emb_sin","prefill_128_pos_emb_sin_0",65536},
+         {"pos_emb_local_sin","prefill_128_pos_emb_local_sin_0",32768},
+         {"pos_emb_local_cos","prefill_128_pos_emb_local_cos_0",32768}},
+        result);
+    run_prefill_signature(api,interpreter.get(),"prefill_mask_128",
+        {{"input_tokens",int32bytes(tokens)},
+         {"time_step",int32bytes(time_step)}},
+        {{"mask_local","prefill_128_mask_local_0",540672},
+         {"mask_global","prefill_128_mask_global_0",540672}},
+        result);
+    if(result.size()!=6)
+        throw std::runtime_error("CPU_PREFILL_EXPECTED_SIX_OUTPUTS");
+    // The original Section1 signature only applies a causal mask.
+    // Saved Prefill QNN inputs additionally mask all padded query rows.
+    // Apply that padding rule from the token suffix, not from saved RAW data.
+    apply_prefill_padding(result[4],first_pad);
+    apply_prefill_padding(result[5],first_pad);
+    return result;
+}
+
 }
