@@ -1397,8 +1397,7 @@ int run_replay_jobs(const Options& options) {
         apply_cpu_aux_first_decode(*decode, options);
         if (options.kv_run_next)
             std::cout << "CPU_AUX_SCOPE_NOTE: CPU replaces AUX only for first Decode; "
-                         "second Decode non-KV inputs still come from next saved list
-";
+                         "second Decode non-KV inputs still come from next saved list\n";
     }
 
     QnnRuntime runtime(options.backend);
