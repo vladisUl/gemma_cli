@@ -97,3 +97,10 @@ grep -Fq 'no_relabel_or_patch_applied=1 diagnostic_only=1' "$LOG" || {
 }
 echo "PREFILL_KV_FIRST_ROW_STAGE6_11_OK: 30 zero-history Decode(pos0,token2) KV slices compared against Prefill row0 without rewriting caches or reference files"
 grep -E '^(PREFILL_FIRST_PROMPT_KV_COMPARE:|PREFILL_KV_DIAG_SUMMARY:)' "$LOG"
+if [[ -f "$WORK/cpu_prefill_kv_diagnostic_stage6_10.log" ]]; then
+  python3 "$ROOT/scripts/compare_prefill_kv_diagnostics.py" \
+    --first "$WORK/$LOG" \
+    --last "$WORK/cpu_prefill_kv_diagnostic_stage6_10.log"
+else
+  echo "PREFILL_KV_POSITION_COMPARE_NOTE: previous Stage6.10 diagnostic log not present"
+fi
