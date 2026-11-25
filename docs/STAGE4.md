@@ -159,15 +159,29 @@ PERSISTENT_ORDER_VERIFIED: decode_head graphs=2 outputs=32
 
 Результат доказывает, что Decode и LM Head могут сосуществовать на Q8B. Но **не доказывает**, что одновременно поместятся также и веса Prefill. Не интерпретировать один замер времени как устойчивый benchmark.
 
-**Следующий отдельный эксперимент:** проверить проблемную пару в обратном порядке — `Decode → Prefill`, без LM Head:
+**Успешный эксперимент (2026-11-25):** Decode → Prefill, оба контекста в одном процессе; все 61 выход идентичен эталонам:
+
+```text
+QNN_CONTEXT_READY: qnn_partition_0 load_ms=355.276
+QNN_CONTEXT_READY: qnn_partition_2 load_ms=160.368
+PERSISTENT_CONTEXTS_READY: 2 graphs; one backend/device; all contexts alive
+PERSISTENT_GRAPH_OK: qnn_partition_0 outputs=31 execute_ms=75.384
+PERSISTENT_GRAPH_OK: qnn_partition_2 outputs=30 execute_ms=54.8381
+ALL_JOBS_REFERENCES_MATCH: 2 graphs 61 output tensors
+PERSISTENT_ORDER_VERIFIED: decode_prefill graphs=2 outputs=61
+```
+
+В отличие от ранее неудачного порядка `Prefill → Decode`, обратный порядок **прошёл**. Это согласуется с зависимостью выделения/отображения DSP-памяти от последовательности загрузки, но не устанавливает точную причину или предел памяти.
+
+**Следующий эксперимент — три контекста:** Decode → Prefill → LM Head в одном процессе с неизменными проверенными входами.
 
 ```bash
 cd ~/gemma4-cli-stage1
 git pull --ff-only origin main
 cd ~/gemma4_qnn_test
-bash ../gemma4-cli-stage1/scripts/test_persistent_order.sh decode prefill
+bash ../gemma4-cli-stage1/scripts/test_persistent_order.sh decode prefill head
 ```
 
-При успехе ожидается `PERSISTENT_ORDER_VERIFIED: decode_prefill graphs=2 outputs=61`, что укажет на важность порядка размещения контекстов. Если вновь возникает FastRPC mapping error, не запускать автоматические повторы и сохранить `persistent_decode_prefill.log`; возможен общий лимит DSP mapping, который не измеряется через `free -h`.
+Успех: `PERSISTENT_ORDER_VERIFIED: decode_prefill_head graphs=3 outputs=62`. При отказе FastRPC/QNN сохранить `persistent_decode_prefill_head.log` и прислать первые строки ошибки, а не повторять сразу после возможного DSP SSR. Этот тест проверяет **одновременное размещение и воспроизводимость вычислений**, а не связанный цикл генерации.
 
 Обратите внимание: существующие `--jobs` / graphExecute работали с реальными входами; новый скрипт только собирает варианты manifest. Результат одновременной загрузки ещё не подтверждён.
