@@ -460,6 +460,7 @@ struct Options {
     bool prefill_allow_tie_lowest = false;
     bool prefill_stop_on_eos = false;
     bool dynamic_prefill = false;
+    bool dynamic_benchmark = false;
     bool dynamic_tie_policy_set = false;
     bool dynamic_allow_tie_lowest = false;
     std::string dynamic_prompt_tokens,dynamic_section0,dynamic_section1,dynamic_section2;
@@ -618,6 +619,8 @@ void usage(const char* executable) {
         << "     --dynamic-prompt-tokens FILE --dynamic-section0 MODEL0\n"
         << "     --dynamic-section1 MODEL1 --dynamic-section2 MODEL2\n"
         << "     optional --dynamic-max-tokens N (1..256, default 16).\n"
+        << "  --dynamic-benchmark: Stage 8.0 per-phase steady_clock timings;\n"
+        << "     no additional model executions or warm-up steps.\n"
         << "  --dynamic-tie-policy stop|lowest-id (default stop):\n"
         << "     lowest-id is EXPERIMENTAL, quantized-tie only, no FP32 claim.\n"
         << "  --prefill-stop-on-eos: LF107 continuation; EOS ids 1,106,50 stop.\n"
@@ -666,6 +669,10 @@ Options parse_options(int argc, char** argv) {
         }
         if (arg == "--prefill-kv-probe") {
             options.prefill_kv_probe = true;
+            continue;
+        }
+        if (arg == "--dynamic-benchmark") {
+            options.dynamic_benchmark = true;
             continue;
         }
         if (arg == "--dynamic-prefill") {
@@ -899,6 +906,8 @@ Options parse_options(int argc, char** argv) {
         }
         if(options.dynamic_tie_policy_set)
             throw std::runtime_error("--dynamic-tie-policy requires --dynamic-prefill");
+        if(options.dynamic_benchmark)
+            throw std::runtime_error("--dynamic-benchmark requires --dynamic-prefill");
         if(!options.dynamic_prompt_tokens.empty() ||
            !options.dynamic_section0.empty() ||
            !options.dynamic_section1.empty() ||
@@ -1031,6 +1040,7 @@ Options parse_options(int argc, char** argv) {
         return options;
     }
     if (options.dynamic_prefill || options.dynamic_tie_policy_set ||
+        options.dynamic_benchmark ||
         !options.dynamic_prompt_tokens.empty() ||
         !options.dynamic_section0.empty() || !options.dynamic_section1.empty() ||
         !options.dynamic_section2.empty() || options.dynamic_max_tokens!=16 ||
@@ -2615,12 +2625,20 @@ void execute_prefill_linked_decode(
 #include "stage7_2_dynamic.inc"
 
 int run_replay_jobs(const Options& options) {
+    const auto bench8_start=std::chrono::steady_clock::now();
     auto jobs = parse_replay_jobs(options.jobs);
     // Check all files, all tensor sizes and graph metadata BEFORE NPU init.
     for (auto& job : jobs)
         prepare_replay_job(*job, options.system,options.dynamic_prefill);
     if(options.dynamic_prefill) {
-        run_stage7_2_dynamic(jobs,options);
+        if(options.dynamic_benchmark) {
+            const auto bench8_metadata_end=std::chrono::steady_clock::now();
+            const double metadata_ms=std::chrono::duration<double,std::milli>(
+                bench8_metadata_end-bench8_start).count();
+            std::cout<<"BENCH8_METADATA: ms="<<metadata_ms
+                     <<" sample_inputs_read=0 saved_references_read=0\n"<<std::flush;
+        }
+        run_stage7_2_dynamic(jobs,options,bench8_start);
         return 0;
     }
 

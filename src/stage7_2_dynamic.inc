@@ -3,7 +3,8 @@
 // Input-list and Result_0 fields are deliberately NOT OPENED in this mode.
 // At no point are saved QNN sample inputs or references used for inference.
 void run_stage7_2_dynamic(
-    std::vector<std::unique_ptr<ReplayJob>>& jobs,const Options& options) {
+    std::vector<std::unique_ptr<ReplayJob>>& jobs,const Options& options,
+    const std::chrono::steady_clock::time_point& bench8_job_started) {
     if(jobs.size()!=3 || jobs.front()->graph_name!="qnn_partition_0")
         throw std::runtime_error("DYNAMIC_REQUIRES_DECODE_FIRST_THREE_GRAPH_MANIFEST");
     ReplayJob *decode=nullptr,*prefill=nullptr,*head=nullptr;
@@ -57,6 +58,7 @@ void run_stage7_2_dynamic(
              <<" samples_read=0 references_read=0\n"<<std::flush;
 
     // Metadata-validated CPU Prefill inputs and 28 zeroed KV tensors.
+    const auto bench8_cpu_prefill_start=std::chrono::steady_clock::now();
     std::set<size_t> prefill_nonkv;
     auto install_prefill=[&](size_t index,const char* name,
                              Qnn_DataType_t dtype,size_t bytes,
@@ -119,8 +121,10 @@ void run_stage7_2_dynamic(
         bind_raw(prefill->inputs[i],prefill->input_buffers[i]);
     std::cout<<"DYNAMIC_PREFILL_INPUTS_READY: from_CPU=8"
              <<" zero_KV=28 no_saved_QNN_samples=1\n"<<std::flush;
+    const auto bench8_cpu_prefill_done=std::chrono::steady_clock::now();
 
     const auto links=decode_kv_links(*decode);
+    const auto bench8_context_start=std::chrono::steady_clock::now();
     QnnRuntime runtime(options.backend);
     for(auto& j:jobs) {
         const auto start=std::chrono::steady_clock::now();
@@ -130,10 +134,14 @@ void run_stage7_2_dynamic(
         std::cout<<"DYNAMIC_CONTEXT_READY: graph="<<j->graph_name
                  <<" load_ms="<<ms<<"\n"<<std::flush;
     }
+    const auto bench8_context_done=std::chrono::steady_clock::now();
+    const auto bench8_prefill_npu_start=std::chrono::steady_clock::now();
     runtime.execute(prefill->handle,prefill->inputs,prefill->outputs);
+    const auto bench8_prefill_npu_done=std::chrono::steady_clock::now();
     std::cout<<"DYNAMIC_PREFILL_NPU_OK: inputs=36 outputs=30"
              <<" valid_rows="<<seed_pos<<" padding_ignored=1\n"<<std::flush;
 
+    const auto bench8_kv_bridge_start=std::chrono::steady_clock::now();
     size_t prefill_sources=0,cache_bytes=0;
     std::set<size_t> kv_indexes;
     for(size_t index=0;index<links.size();++index) {
@@ -185,6 +193,19 @@ void run_stage7_2_dynamic(
     std::cout<<"DYNAMIC_KV_BRIDGE_OK: from_prefill=30 prefix_rows="<<seed_pos
              <<" cache_bytes="<<cache_bytes
              <<" no_saved_decode_KV=1\n"<<std::flush;
+    const auto bench8_kv_bridge_done=std::chrono::steady_clock::now();
+    if(options.dynamic_benchmark) {
+        const auto ms=[](auto end,auto start)->double {
+            return std::chrono::duration<double,std::milli>(end-start).count();
+        };
+        std::cout<<"BENCH8_PREFILL: real_tokens="<<seed_pos
+                 <<" graph_tokens=128"
+                 <<" cpu_inputs_ms="<<ms(bench8_cpu_prefill_done,bench8_cpu_prefill_start)
+                 <<" runtime_contexts_ms="<<ms(bench8_context_done,bench8_context_start)
+                 <<" npu_execute_ms="<<ms(bench8_prefill_npu_done,bench8_prefill_npu_start)
+                 <<" kv_bridge_ms="<<ms(bench8_kv_bridge_done,bench8_kv_bridge_start)
+                 <<" warmed_up=0\n"<<std::flush;
+    }
 
     // Decode now takes only fresh CPU non-KV inputs and linked RAM KV.
     auto nonkv=[&](const std::string& name,Qnn_DataType_t dtype,
@@ -211,6 +232,7 @@ void run_stage7_2_dynamic(
     size_t position=seed_pos;
     bool eos=false;
     for(uint32_t step=1;step<=options.dynamic_max_tokens;++step) {
+        const auto bench8_step_start=std::chrono::steady_clock::now();
         std::set<size_t> nonkv_indexes;
         nonkv_indexes.insert(nonkv(
             "decode_embeddings_0",QNN_DATATYPE_FLOAT_32,6144,
@@ -231,8 +253,11 @@ void run_stage7_2_dynamic(
             throw std::runtime_error("DYNAMIC_DECODE_INPUTS_INCOMPLETE");
         for(size_t i=0;i<decode->inputs.size();++i)
             bind_raw(decode->inputs[i],decode->input_buffers[i]);
+        const auto bench8_cpu_step_done=std::chrono::steady_clock::now();
         runtime.execute(decode->handle,decode->inputs,decode->outputs);
+        const auto bench8_decode_done=std::chrono::steady_clock::now();
         execute_chained_decode_head(runtime,*decode,*head,hidden,true);
+        const auto bench8_head_done=std::chrono::steady_clock::now();
         executed=step;
         const auto& logits=head->output_buffers.at(0);
         if(logits.size()!=262144 ||
@@ -274,11 +299,36 @@ void run_stage7_2_dynamic(
                  <<" id="<<id<<" max_q="<<best
                  <<" ties="<<ties<<" input_pos="<<position
                  <<" input_token="<<token<<"\n"<<std::flush;
+        const auto bench8_sample_done=std::chrono::steady_clock::now();
+        const auto bench8_report_step=[&](const char* reason,bool with_feedback) {
+            if(!options.dynamic_benchmark)return;
+            const auto finish=std::chrono::steady_clock::now();
+            const auto ms=[](auto end,auto begin)->double {
+                return std::chrono::duration<double,std::milli>(end-begin).count();
+            };
+            std::cout<<"BENCH8_STEP: step="<<step
+                     <<" cpu_nonkv_ms="<<ms(bench8_cpu_step_done,bench8_step_start)
+                     <<" npu_decode_ms="<<ms(bench8_decode_done,bench8_cpu_step_done)
+                     <<" head_call_ms="<<ms(bench8_head_done,bench8_decode_done)
+                     <<" sampling_and_logging_ms="<<ms(bench8_sample_done,bench8_head_done)
+                     <<" kv_feedback_ms="<<(with_feedback?ms(finish,bench8_sample_done):0.0)
+                     <<" step_wall_ms="<<ms(finish,bench8_step_start)
+                     <<" feedback_written="<<(with_feedback?1:0)
+                     <<" stop="<<reason<<"\n"<<std::flush;
+        };
+        if(options.dynamic_benchmark && step==1) {
+            const double to_first=std::chrono::duration<double,std::milli>(
+                bench8_sample_done-bench8_job_started).count();
+            std::cout<<"BENCH8_FIRST_TOKEN: from_job_start_ms="<<to_first
+                     <<" includes_metadata_cpu_and_load=1"
+                     <<" excludes_external_BPE_and_process_start=1\n"<<std::flush;
+        }
         if(ties!=1) {
             if(!options.dynamic_allow_tie_lowest) {
                 std::cout<<"DYNAMIC_STOP_TIE: step="<<step
                          <<" max_q="<<best<<" ties="<<ties
                          <<" no_arbitrary_tiebreak=1\n"<<std::flush;
+                bench8_report_step("tie",false);
                 return;
             }
             ++tie_resolutions;
@@ -292,10 +342,14 @@ void run_stage7_2_dynamic(
             std::cout<<"DYNAMIC_STOP_EOS: step="<<step
                      <<" eos_id="<<id
                      <<" eos_not_submitted_to_decode=1\n"<<std::flush;
+            bench8_report_step("eos",false);
             break;
         }
         ++produced;
-        if(step==options.dynamic_max_tokens)break;
+        if(step==options.dynamic_max_tokens) {
+            bench8_report_step("limit",false);
+            break;
+        }
         if(position+1>=4096)
             throw std::runtime_error("DYNAMIC_KV_CAPACITY_EXCEEDED");
         size_t feedback_bytes=0;
@@ -310,6 +364,7 @@ void run_stage7_2_dynamic(
             throw std::runtime_error("DYNAMIC_KV_FEEDBACK_BAD_BYTES");
         token=id;
         ++position;
+        bench8_report_step("continue",true);
     }
     std::cout<<"DYNAMIC_GENERATION_OK: npu_decode_steps="<<executed
              <<" text_tokens="<<produced
