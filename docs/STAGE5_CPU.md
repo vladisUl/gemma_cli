@@ -893,3 +893,77 @@ CPU Section1, вычислить 128 эмбеддингов Section0/2 одни�
 и строго сравнить все восемь входов Prefill. Первые 28 KV
 входов Prefill останутся отдельным вопросом, как и
 перенос его 30 выходов к начальному состоянию Decode.
+
+## Stage 6.1 — 128 токенов восстановлены на Q8B
+
+Пользователь прислал успешный отчёт `scripts/recover_prefill_tokens.py`:
+
+```text
+PREFILL_TOKENS_SAVED: /home/radxa/gemma4_qnn_test/derived_prefill_128_token_ids_i32.raw bytes=512
+PREFILL_TOKEN_IDS: 2,105,2364,107,116130,236888,217598,16632,236743,236778,236862,236778,236881,106,107,105,4368,0,0,...,0
+PREFILL_TOKENS_VERIFIED: count=128 unique=15 reference_bytes=786432 first=2 last=0
+```
+
+Первые 17 токенов ненулевые, остальные 111 позиций исходного
+образца заполнены нулями. Каждый ID подтверждён 6144 байтами
+исходного Section0 FLOAT32, а не просто близостью значений.
+Для Stage 6.2 используем именно созданный файл с оригинальными IDs
+(128 x int32, little-endian, 512 байт).
+
+## Stage 6.2 — 128 × Section0/Section2 embeddings, CPU только
+
+Экспериментальный код **ещё не испытан на Q8B**. Добавлена библиотечная
+функция `gemma4::compute_packed_prefill_embeddings` в уже проверенный
+`src/packed_embedder.cpp`; она делает ровно один `mmap` большой модели
+за весь Prefill-128, переиспользуя проверенные INT2/INT4 таблицы
+и сохраняя FLOAT32 биты результата для каждого токена.
+Повторные ID кэшируются (в сохранённом примере уникальных — 15).
+Выходные буферы собираются в token-major порядке:
+
+- Section0 FLOAT32 `[1,128,1536]`: 786432 байта;
+- Section2 FLOAT32 `[1,128,35,256]`: 4587520 байт.
+
+Новый CLI `gemma4-packed-prefill` принимает
+`--section {0,2} --model MODEL.tflite --tokens IDS_512.raw`
+`--reference QNN_FLOAT32.raw --output NEW.raw`.
+Обязательно выполняет побайтовое сравнение с сохранённым
+QNN Prefill input **до** записи нового output. При несовпадении
+сообщает первый байт/позицию. Не перезаписывает файлы.
+
+Простой оркестратор `scripts/test_packed_prefill.py` получает
+правильные QNN reference paths из `prefill_real_input_list.txt`:
+
+- input[32] `prefill_128_embeddings_0` (Section0),
+- input[7] `prefill_128_per_layer_embeddings_0` (Section2).
+
+Оригинальные `Section0/Section2` `.tflite` читаются только через
+`mmap(PROT_READ, MAP_PRIVATE)`; ни QNN runtime, ни Section1/LibTFLite
+пока не запускаются. Программа не модифицирует эталоны.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+python3 scripts/test_packed_prefill.py \
+  2>&1 | tee ~/gemma4_prefill_embeddings_stage6_2.log
+```
+
+Ожидаемые **пока не проверенные** строки:
+
+```text
+PACKED_PREFILL_RAM_READY: section=0 positions=128 unique_tokens=15 bytes=786432 mmap_count=1
+PACKED_PREFILL_REFERENCE_MATCH: section=0 bytes=786432 positions=128
+PREFILL_EMBED_INPUT_MATCH: section=0 qnn_index=32 bytes=786432 positions=128
+PACKED_PREFILL_RAM_READY: section=2 positions=128 unique_tokens=15 bytes=4587520 mmap_count=1
+PACKED_PREFILL_REFERENCE_MATCH: section=2 bytes=4587520 positions=128
+PREFILL_EMBED_INPUT_MATCH: section=2 qnn_index=7 bytes=4587520 positions=128
+PREFILL_EMBED_ALL_MATCH: sections=0,2 tensors=2 bytes=5373952 positions=128 byte_identical=1
+```
+
+После этого отдельно подключаем исходные Section1 CPU-сигнатуры
+`prefill_rope_128` и `prefill_mask_128`, сравнивая 6 INT8
+Prefill non-KV входов, и лишь затем можно переводить
+prefill graph QNN на полностью локальные входы.
+Перенос KV Prefill → Decode и tokenizer/generation loop остаётся
+отдельной задачей.

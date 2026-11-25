@@ -90,6 +90,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 6.0 подтверждён на Q8B:** 36 входов Prefill-128 = 28 K/V + 8 non-KV, метаданные всех трёх исходных CPU-моделей доступны. **Stage 6.1 (новый код, ещё не проверен):** [scripts/recover_prefill_tokens.py](scripts/recover_prefill_tokens.py) однократно сканирует INT2 таблицу и проверяет 128 сохранённых Prefill embeddings по 6144 байт каждый, чтобы определить реальные 128 token IDs без догадок и без изменения входных эталонов.
 
+**Stage 6.1 (подтверждён на Q8B):** строго восстановлены все 128 ID Prefill по 6144 байтам Section0 каждого токена: 17 значащих позиций + 111 нулевых позиций заполнения, 15 уникальных ID; создан 512-байтовый `derived_prefill_128_token_ids_i32.raw`. **Stage 6.2 (новый код, ожидает Q8B):** [gemma4-packed-prefill](src/packed_prefill.cpp) получает [1,128,1536] и [1,128,35,256] FLOAT32 из Section0/2 через один mmap каждой модели и кэш 15 уникальных токенов; [scripts/test_packed_prefill.py](scripts/test_packed_prefill.py) строго сравнивает оба массива (всего 5 373 952 байта) с входами Prefill QNN.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.
