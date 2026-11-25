@@ -4,6 +4,7 @@
 #include <QNN/QnnInterface.h>
 #include <QNN/System/QnnSystemInterface.h>
 #include "kv_cache.h"
+#include "cpu_aux.h"
 
 #include <dlfcn.h>
 
@@ -428,13 +429,18 @@ struct Options {
     std::string binary, backend, system, graph, input, output, reference;
     std::string input_list, inputs_dir, outputs_dir, reference_dir, jobs, kv_next_list;
     std::string kv_next_reference_dir, kv_next_head_reference_dir;
+    std::string cpu_aux_model;
     bool inspect = false;
     bool check_inputs = false;
     bool chain_decode_head = false;
     bool kv_feedback = false;
     bool kv_auto_pos = false;
     bool kv_run_next = false;
+    bool cpu_aux_pos_set = false;
+    bool cpu_aux_token_set = false;
     uint32_t kv_feedback_pos = 0;
+    int32_t cpu_aux_pos = 0;
+    int32_t cpu_aux_token = 0;
     uint32_t repeat = 1;
 };
 
@@ -559,6 +565,9 @@ void usage(const char* executable) {
         << "  Add --kv-run-next to execute Decode again with updated KV and next-step non-KV inputs.\n"
         << "  Optional --kv-next-reference-dir Result_0 checks all 31 next Decode outputs.\n"
         << "  Optional --kv-next-head-reference-dir Result_0 checks next LM Head logits.\n"
+        << "  --cpu-aux-model Section1.tflite --cpu-aux-pos N --cpu-aux-token ID\n"
+        << "     replaces six first-Decode INT8 mask/RoPE inputs from CPU LiteRT;\n"
+        << "     requires exact match to saved inputs before NPU execution.\n"
         << "No implicit tensor conversions or synthetic zero inputs.\n";
 }
 
@@ -610,6 +619,27 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--kv-next-list") options.kv_next_list = value;
         else if (arg == "--kv-next-reference-dir") options.kv_next_reference_dir = value;
         else if (arg == "--kv-next-head-reference-dir") options.kv_next_head_reference_dir = value;
+        else if (arg == "--cpu-aux-model") options.cpu_aux_model = value;
+        else if (arg == "--cpu-aux-pos") {
+            if (options.cpu_aux_pos_set || value.empty() || value.front() == '-')
+                throw std::runtime_error("--cpu-aux-pos expects a single integer 0..4095");
+            size_t consumed=0;
+            const auto pos=std::stoul(value,&consumed);
+            if (consumed!=value.size() || pos >= 4096)
+                throw std::runtime_error("--cpu-aux-pos must be 0..4095");
+            options.cpu_aux_pos=static_cast<int32_t>(pos);
+            options.cpu_aux_pos_set=true;
+        }
+        else if (arg == "--cpu-aux-token") {
+            if (options.cpu_aux_token_set || value.empty() || value.front() == '-')
+                throw std::runtime_error("--cpu-aux-token expects a single integer 0..262143");
+            size_t consumed=0;
+            const auto token=std::stoul(value,&consumed);
+            if (consumed!=value.size() || token >= 262144)
+                throw std::runtime_error("--cpu-aux-token must be 0..262143");
+            options.cpu_aux_token=static_cast<int32_t>(token);
+            options.cpu_aux_token_set=true;
+        }
         else if (arg == "--kv-feedback-pos") {
             if (options.kv_feedback)
                 throw std::runtime_error("Choose --kv-auto-pos OR --kv-feedback-pos");
@@ -636,6 +666,10 @@ Options parse_options(int argc, char** argv) {
     if (!options.jobs.empty()) {
         if (options.system.empty() || options.backend.empty())
             throw std::runtime_error("--jobs needs --system and --backend");
+        if (options.cpu_aux_model.empty() != !options.cpu_aux_pos_set ||
+            options.cpu_aux_model.empty() != !options.cpu_aux_token_set)
+            throw std::runtime_error(
+                "CPU AUX requires all of --cpu-aux-model, --cpu-aux-pos and --cpu-aux-token");
         if (!options.kv_next_list.empty() && !options.kv_feedback)
             throw std::runtime_error("--kv-next-list requires --kv-feedback-pos or --kv-auto-pos");
         if (options.kv_auto_pos && options.kv_next_list.empty())
@@ -658,8 +692,10 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.chain_decode_head || options.kv_feedback || options.kv_run_next ||
         !options.kv_next_list.empty() || !options.kv_next_reference_dir.empty() ||
-        !options.kv_next_head_reference_dir.empty())
-        throw std::runtime_error("Chained/KV options require --jobs");
+        !options.kv_next_head_reference_dir.empty() ||
+        !options.cpu_aux_model.empty() || options.cpu_aux_pos_set ||
+        options.cpu_aux_token_set)
+        throw std::runtime_error("Chained/KV/CPU AUX options require --jobs");
     if (options.binary.empty() || options.system.empty())
         throw std::runtime_error("--binary and --system are required");
     if (!options.inspect) {
@@ -1194,6 +1230,60 @@ void execute_next_decode(QnnRuntime& runtime,
               << "\n" << std::flush;
 }
 
+// Before loading any QNN context: replace the six saved AUX inputs with
+// tensors computed by local Linux/ARM64 TFLite Section1. Validate exact bytes
+// against the original QNN Decode input buffers BEFORE replacement, so the
+// pre-existing 31-output graph reference test remains independently meaningful.
+void apply_cpu_aux_first_decode(ReplayJob& decode, const Options& options) {
+    if (decode.graph_name != "qnn_partition_0" ||
+        decode.inputs.size() != 38 || decode.input_buffers.size() != 38)
+        throw std::runtime_error("CPU_AUX_REQUIRES_DECODE_38_INPUTS");
+    auto outputs = gemma4::run_decode_aux(
+        options.cpu_aux_model, options.cpu_aux_pos, options.cpu_aux_token);
+    if (outputs.size() != 6)
+        throw std::runtime_error("CPU_AUX_INVALID_OUTPUT_COUNT");
+    std::set<size_t> indexes;
+    size_t byte_total=0;
+    for (auto& item : outputs) {
+        size_t index=decode.inputs.size();
+        for (size_t j=0;j<decode.inputs.size();++j) {
+            const char* name=tensor_name(decode.inputs[j]);
+            if (name && item.qnn_name == name) {
+                if (index != decode.inputs.size())
+                    throw std::runtime_error("CPU_AUX_DUPLICATE_QNN_TENSOR_NAME");
+                index=j;
+            }
+        }
+        if (index==decode.inputs.size() || !indexes.insert(index).second)
+            throw std::runtime_error("CPU_AUX_QNN_TENSOR_NOT_UNIQUE: "+item.qnn_name);
+        if (tensor_dtype(decode.inputs[index]) != QNN_DATATYPE_SFIXED_POINT_8 ||
+            tensor_nbytes(decode.inputs[index]) != item.bytes.size())
+            throw std::runtime_error("CPU_AUX_QNN_INPUT_TYPE_SIZE_MISMATCH: "+item.qnn_name);
+        const auto& saved=decode.input_buffers[index];
+        const auto mismatch=std::mismatch(item.bytes.begin(),item.bytes.end(),
+                                          saved.begin());
+        if (mismatch.first != item.bytes.end())
+            throw std::runtime_error(
+                "CPU_AUX_REFERENCE_MISMATCH: " + item.qnn_name +
+                " first_byte=" +
+                std::to_string(static_cast<size_t>(mismatch.first-item.bytes.begin())) +
+                " (check token ID and position)");
+        std::cout << "CPU_AUX_INPUT_MATCH: " << item.qnn_name
+                  << " qnn_index=" << index
+                  << " bytes=" << item.bytes.size() << "\n" << std::flush;
+        byte_total += item.bytes.size();
+        // This exact memory allocation becomes the actual QNN input.
+        decode.input_buffers[index]=std::move(item.bytes);
+        bind_raw(decode.inputs[index],decode.input_buffers[index]);
+    }
+    if(indexes.size()!=6 || byte_total!=9730)
+        throw std::runtime_error("CPU_AUX_EXPECTED_6_INPUTS_9730_BYTES");
+    std::cout << "CPU_AUX_QNN_REPLACED: tensors=" << indexes.size()
+              << " bytes=" << byte_total
+              << " from=Section1_TFLite_2.14"
+              << " verified_against_saved_decode=1\n" << std::flush;
+}
+
 int run_replay_jobs(const Options& options) {
     auto jobs = parse_replay_jobs(options.jobs);
     // Check all files, all tensor sizes and graph metadata BEFORE NPU init.
@@ -1291,6 +1381,24 @@ int run_replay_jobs(const Options& options) {
                   << (options.kv_auto_pos ? std::string("auto") :
                       std::to_string(options.kv_feedback_pos))
                   << "\n" << std::flush;
+    }
+
+    if (!options.cpu_aux_model.empty()) {
+        if (jobs.front()->graph_name != "qnn_partition_0")
+            throw std::runtime_error("--cpu-aux-model requires Decode-first jobs manifest");
+        if (!decode) {
+            for (auto& job : jobs) {
+                if (job->graph_name != "qnn_partition_0") continue;
+                if (decode) throw std::runtime_error("Duplicate Decode job for CPU AUX");
+                decode = job.get();
+            }
+        }
+        if (!decode) throw std::runtime_error("CPU_AUX_MISSING_DECODE_JOB");
+        apply_cpu_aux_first_decode(*decode, options);
+        if (options.kv_run_next)
+            std::cout << "CPU_AUX_SCOPE_NOTE: CPU replaces AUX only for first Decode; "
+                         "second Decode non-KV inputs still come from next saved list
+";
     }
 
     QnnRuntime runtime(options.backend);
