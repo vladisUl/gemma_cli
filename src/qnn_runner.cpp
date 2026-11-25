@@ -10,6 +10,9 @@
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <set>
+#include <sstream>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -412,9 +415,110 @@ struct QnnRuntime {
 
 struct Options {
     std::string binary, backend, system, graph, input, output, reference;
+    std::string input_list, inputs_dir, outputs_dir, reference_dir;
     bool inspect = false;
+    bool check_inputs = false;
     uint32_t repeat = 1;
 };
+
+namespace fs = std::filesystem;
+
+// QNN and qnn-net-run use the original tensor name in "..._native.raw".
+std::string native_basename(const Qnn_Tensor_t& tensor, uint32_t index) {
+    const char* name = tensor_name(tensor);
+    if (!name || !*name)
+        return "tensor_" + std::to_string(index) + "_native.raw";
+    std::string sanitized;
+    for (const unsigned char c : std::string(name)) {
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') {
+            sanitized += static_cast<char>(c);
+        } else {
+            sanitized += '_';
+        }
+    }
+    if (sanitized.size() > 210) {
+        // Keep the tensor index to prevent collisions when truncating names.
+        sanitized = sanitized.substr(0, 190) + "_" + std::to_string(index);
+    }
+    return sanitized + "_native.raw";
+}
+
+std::vector<fs::path> parse_qnn_input_list(const std::string& file,
+                                            const GraphView& graph) {
+    std::ifstream stream(file);
+    if (!stream) throw std::runtime_error("Cannot open --input-list: " + file);
+    std::string line, entries;
+    while (std::getline(stream, line)) {
+        const auto begin = line.find_first_not_of(" \t\r");
+        if (begin == std::string::npos || line[begin] == '#') continue;
+        if (!entries.empty())
+            throw std::runtime_error("--input-list has more than one sample/line; "
+                                     "this runner executes exactly one sample");
+        entries = line;
+    }
+    std::istringstream input(entries);
+    std::vector<fs::path> paths;
+    std::string token;
+    while (input >> token) {
+        if (paths.size() >= graph.num_inputs)
+            throw std::runtime_error("--input-list has more paths than graph inputs");
+        // qnn-net-run accepts both 'file.raw' and 'tensor_name:=file.raw'.
+        const auto separator = token.find(":=");
+        if (separator != std::string::npos) {
+            const std::string expected =
+                tensor_name(graph.inputs[paths.size()]) ?
+                tensor_name(graph.inputs[paths.size()]) : "";
+            if (token.substr(0, separator) != expected)
+                throw std::runtime_error("Named input in --input-list is not in QNN "
+                                         "metadata order: " + token.substr(0, separator) +
+                                         " vs " + expected);
+            token = token.substr(separator + 2);
+        }
+        if (token.empty()) throw std::runtime_error("Empty input-list path");
+        // Match qnn-net-run convention: relative input paths are relative to CWD.
+        paths.emplace_back(token);
+    }
+    if (paths.size() != graph.num_inputs)
+        throw std::runtime_error("--input-list has " + std::to_string(paths.size()) +
+                                 " files, graph requires " +
+                                 std::to_string(graph.num_inputs));
+    return paths;
+}
+
+std::vector<fs::path> resolve_inputs_dir(const std::string& dirname,
+                                          const GraphView& graph) {
+    const fs::path dir(dirname);
+    if (!fs::is_directory(dir))
+        throw std::runtime_error("Input directory does not exist: " + dirname);
+    std::vector<fs::path> paths;
+    for (uint32_t i = 0; i < graph.num_inputs; ++i) {
+        const auto native = native_basename(graph.inputs[i], i);
+        std::vector<fs::path> candidates{
+            dir / native,
+            dir / (native.substr(0, native.size() - 11) + ".raw"),
+            dir / ("input_" + std::to_string(i) + ".raw")
+        };
+        std::vector<fs::path> found;
+        for (const auto& candidate : candidates) {
+            if (fs::is_regular_file(candidate) &&
+                std::find(found.begin(), found.end(), candidate) == found.end())
+                found.push_back(candidate);
+        }
+        if (found.size() != 1)
+            throw std::runtime_error("Input[" + std::to_string(i) +
+                                     "] " + (tensor_name(graph.inputs[i]) ?
+                                            tensor_name(graph.inputs[i]) : "(unnamed)") +
+                                     ": expected exactly one .raw file in " + dirname +
+                                     ", found " + std::to_string(found.size()) +
+                                     ". Use --input-list to specify exact paths.");
+        paths.push_back(found[0]);
+    }
+    return paths;
+}
+
+// Defined before run_multi so references are resolved at compile time.
+void compare_reference(const std::vector<uint8_t>& actual, const std::string& file);
 
 void usage(const char* executable) {
     std::cout
@@ -423,7 +527,11 @@ void usage(const char* executable) {
         << "  " << executable << " --binary FILE --system LIB [--graph NAME] --inspect\n"
         << "  " << executable << " --binary FILE --system LIB --backend LIB --graph NAME \\\n"
         << "      --input FILE.raw --output FILE.raw [--reference FILE.raw] [--repeat N]\n"
-        << "One raw input and one raw output per graph for this stage.\n"
+        << "For multi-tensor graphs (e.g. Decode 38/31):\n"
+        << "  " << executable << " --binary FILE --system LIB --backend LIB --graph NAME \\\n"
+        << "      --input-list QNN_INPUT_LIST.txt --outputs-dir DIR [--reference-dir Result_0]\n"
+        << "  or --inputs-dir DIR instead of --input-list FILE\n"
+        << "  Add --check-inputs to validate all input tensors without NPU execution.\n"
         << "No implicit tensor conversions or synthetic zero inputs.\n";
 }
 
@@ -433,6 +541,10 @@ Options parse_options(int argc, char** argv) {
         const std::string arg = argv[i];
         if (arg == "--inspect") {
             options.inspect = true;
+            continue;
+        }
+        if (arg == "--check-inputs") {
+            options.check_inputs = true;
             continue;
         }
         if (arg == "--help" || arg == "-h") {
@@ -448,6 +560,10 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--input") options.input = value;
         else if (arg == "--output") options.output = value;
         else if (arg == "--reference") options.reference = value;
+        else if (arg == "--input-list") options.input_list = value;
+        else if (arg == "--inputs-dir") options.inputs_dir = value;
+        else if (arg == "--outputs-dir") options.outputs_dir = value;
+        else if (arg == "--reference-dir") options.reference_dir = value;
         else if (arg == "--repeat") {
             size_t pos = 0;
             const auto repeat = std::stoul(value, &pos);
@@ -462,12 +578,29 @@ Options parse_options(int argc, char** argv) {
     if (options.binary.empty() || options.system.empty())
         throw std::runtime_error("--binary and --system are required");
     if (!options.inspect) {
-        if (options.backend.empty() || options.graph.empty() ||
-            options.input.empty() || options.output.empty())
-            throw std::runtime_error("Execution needs --backend, --graph, --input and --output");
-        if (options.input == options.output ||
-            (!options.reference.empty() && options.output == options.reference))
-            throw std::runtime_error("Output path must differ from input/reference path");
+        if (options.graph.empty())
+            throw std::runtime_error("Execution needs --graph");
+        const bool multi = !options.input_list.empty() || !options.inputs_dir.empty() ||
+                           !options.outputs_dir.empty() || !options.reference_dir.empty();
+        if (options.backend.empty() && !options.check_inputs)
+            throw std::runtime_error("Execution needs --backend");
+        if (options.check_inputs && !multi)
+            throw std::runtime_error("--check-inputs requires multi-tensor mode");
+        if (multi) {
+            if (options.outputs_dir.empty())
+                throw std::runtime_error("Multi-tensor mode needs --outputs-dir");
+            if (options.input_list.empty() == options.inputs_dir.empty())
+                throw std::runtime_error("Specify exactly one --input-list or --inputs-dir");
+            if (!options.input.empty() || !options.output.empty() ||
+                !options.reference.empty())
+                throw std::runtime_error("Do not mix --input/--output with multi-tensor mode");
+        } else {
+            if (options.input.empty() || options.output.empty())
+                throw std::runtime_error("Execution needs --input and --output");
+            if (options.input == options.output ||
+                (!options.reference.empty() && options.output == options.reference))
+                throw std::runtime_error("Output path must differ from input/reference path");
+        }
     }
     return options;
 }
@@ -488,6 +621,103 @@ void compare_reference(const std::vector<uint8_t>& actual, const std::string& fi
     std::cout << "REFERENCE_MATCH: " << actual.size() << " bytes identical\n";
 }
 
+void run_multi(const Options& options, const GraphView& graph,
+               const std::vector<uint8_t>& binary) {
+    if (!graph.num_inputs || !graph.num_outputs)
+        throw std::runtime_error("Graph has no inputs/outputs");
+    std::vector<fs::path> filenames =
+        !options.input_list.empty() ?
+            parse_qnn_input_list(options.input_list, graph) :
+            resolve_inputs_dir(options.inputs_dir, graph);
+
+    std::vector<std::vector<uint8_t>> input_buffers(graph.num_inputs);
+    std::vector<Qnn_Tensor_t> inputs(graph.inputs, graph.inputs + graph.num_inputs);
+    for (uint32_t i = 0; i < graph.num_inputs; ++i) {
+        const size_t bytes = tensor_nbytes(inputs[i]);
+        input_buffers[i] = read_file(filenames[i].string());
+        if (input_buffers[i].size() != bytes)
+            throw std::runtime_error("INPUT_SIZE_MISMATCH [" + std::to_string(i) +
+                                     "] " + (tensor_name(inputs[i]) ?
+                                            tensor_name(inputs[i]) : "(unnamed)") +
+                                     ": expected " + std::to_string(bytes) +
+                                     " bytes, got " +
+                                     std::to_string(input_buffers[i].size()) +
+                                     " from " + filenames[i].string());
+        bind_raw(inputs[i], input_buffers[i]);
+        std::cout << "INPUT_OK [" << i << "] " << filenames[i]
+                  << " bytes=" << bytes << "\n";
+    }
+
+    if (options.check_inputs) {
+        std::cout << "INPUTS_VALIDATED: " << graph.num_inputs
+                  << " tensors; no NPU execution\n";
+        return;
+    }
+
+    const fs::path outdir(options.outputs_dir);
+    fs::create_directories(outdir);
+    if (!options.inputs_dir.empty() && fs::equivalent(outdir, fs::path(options.inputs_dir)))
+        throw std::runtime_error("--outputs-dir must differ from --inputs-dir");
+    if (!options.reference_dir.empty() &&
+        fs::equivalent(outdir, fs::path(options.reference_dir)))
+        throw std::runtime_error("--outputs-dir must differ from --reference-dir");
+
+    std::vector<std::vector<uint8_t>> output_buffers(graph.num_outputs);
+    std::vector<Qnn_Tensor_t> outputs(graph.outputs, graph.outputs + graph.num_outputs);
+    std::vector<fs::path> output_files;
+    std::set<std::string> output_names;
+    for (uint32_t i = 0; i < graph.num_outputs; ++i) {
+        const size_t bytes = tensor_nbytes(outputs[i]);
+        output_buffers[i].resize(bytes);
+        bind_raw(outputs[i], output_buffers[i]);
+        const auto name = native_basename(outputs[i], i);
+        if (!output_names.insert(name).second)
+            throw std::runtime_error("Duplicate output filename: " + name);
+        output_files.push_back(outdir / name);
+        std::cout << "OUTPUT_READY [" << i << "] " << output_files.back()
+                  << " bytes=" << bytes << "\n";
+    }
+
+    QnnRuntime runtime(options.backend);
+    const auto load_start = std::chrono::steady_clock::now();
+    const Qnn_GraphHandle_t graph_handle = runtime.load(binary, graph.name);
+    const auto exec_start = std::chrono::steady_clock::now();
+    for (uint32_t iter = 0; iter < options.repeat; ++iter)
+        runtime.execute(graph_handle, inputs, outputs);
+    const auto exec_end = std::chrono::steady_clock::now();
+
+    for (uint32_t i = 0; i < graph.num_outputs; ++i)
+        write_file(output_files[i].string(), output_buffers[i]);
+
+    const double load_ms =
+        std::chrono::duration<double, std::milli>(exec_start - load_start).count();
+    const double exec_ms =
+        std::chrono::duration<double, std::milli>(exec_end - exec_start).count();
+    std::cout << std::fixed << std::setprecision(3)
+              << "QNN_MULTI_EXECUTE_OK: " << graph.name
+              << " inputs=" << graph.num_inputs
+              << " outputs=" << graph.num_outputs
+              << " load_ms=" << load_ms
+              << " avg_execute_ms=" << exec_ms / options.repeat
+              << " repeat=" << options.repeat << "\n";
+
+    if (!options.reference_dir.empty()) {
+        const fs::path refdir(options.reference_dir);
+        if (!fs::is_directory(refdir))
+            throw std::runtime_error("Reference directory does not exist: " +
+                                     options.reference_dir);
+        for (uint32_t i = 0; i < graph.num_outputs; ++i) {
+            const auto expected = refdir / output_files[i].filename();
+            std::cout << "REFERENCE [" << i << "] " << expected << "\n";
+            compare_reference(output_buffers[i], expected.string());
+        }
+        std::cout << "ALL_REFERENCES_MATCH: " << graph.num_outputs
+                  << " output tensors\n";
+    }
+}
+
+
+
 int run(const Options& options) {
     // Context metadata owns tensor names, dimensions and quantization arrays.
     // Keep the System context and source binary alive through graphExecute.
@@ -502,6 +732,10 @@ int run(const Options& options) {
     const GraphView& g = system.find(options.graph);
     std::cout << "GRAPH " << g.name << " inputs=" << g.num_inputs
               << " outputs=" << g.num_outputs << "\n";
+    if (!options.input_list.empty() || !options.inputs_dir.empty()) {
+        run_multi(options, g, binary);
+        return 0;
+    }
     if (g.num_inputs != 1 || g.num_outputs != 1)
         throw std::runtime_error("Stage 2 supports exactly 1 input and 1 output; "
                                  "use --inspect to see graph I/O");
