@@ -2110,3 +2110,50 @@ Decode/LM Head/nonKV, история KV существенно влияет на
 в другом месте (в частности, INT8 Head и независимой проверке
 семантики). Даже полное совпадение INT8 максимумов не является
 доказательством эквивалентности Prefill/Decode.
+
+
+## Stage 6.16 — Q8B подтверждён, первый реальный токен после LF
+
+Токенизатор BPE: ID107 = `\n`; исходный prompt
+заканчивался на ID4368 = `model`, без завершающего LF.
+Официальный chat template требует `<|turn>model\n`.
+Сохранив неизменные исходные 17 Prefill токенов, Stage6.16
+выполнил Decode(pos17, ID107) и LM Head; получен единственный
+INT8 максимум ID236778 = `2`, `ties=1`, будущая
+позиция ответа 18. Маркер:
+`STAGE6_16_FIRST_RESPONSE_TOKEN: id=236778 ties=1 raw_piece='2' response_position=18`.
+`STAGE6_16_OK` на реальной Q8B. Никаких QNN binary/RAW изменений.
+
+## Stage 6.17 — четыре токена продолжения, код ожидает Q8B
+
+`scripts/test_correct_header_generation.sh` использует те же
+проверенные QNN контексты и сохранённые reference входы:
+Prefill 17 → Decode(pos17, LF107) → Head first ID2 →
+KV-feedback → Decode(pos18, ID236778) → Decode pos19,20
+с подбором следующих ID по уникальному квантованному максимуму.
+Флаг `--prefill-kv-steps 4`, существующий в C++ Stage6.7.
+При повторных INT8 максимумах до завершающего шага
+исполнение останавливается без произвольного tie-break.
+
+В последнем postprocessor на Python (stdlib, no tokenizers install)
+читаются 4 `CHAIN_DECODE_HEAD_OK` после
+`PREFILL_LINK_DECODE_OK`, печатаются четыре
+`STAGE6_17_GENERATED_TOKEN` и `STAGE6_17_TEXT_PREVIEW`.
+Это диагностическое BPE восстановление по
+Replace(▁→space), ByteFallback и Fuse, не полноценный BPE encoder.
+Максимум на четвёртом шаге может быть неоднозначен; число ties
+печатается и на следующую позицию не подаётся.
+
+Команды на Q8B:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+bash -n scripts/test_correct_header_generation.sh
+bash scripts/test_correct_header_generation.sh
+grep -E 'STAGE6_17_|PREFILL_LINK_GREEDY_CANDIDATES|QNN_RUN_ERROR' \
+  ~/gemma4_qnn_test/cpu_correct_header_generation_stage6_17.log
+```
+
+При ошибке не удалять лог: до неё могут быть
+`PREFILL_LINK_GREEDY_CANDIDATES` с достоверными tied IDs.

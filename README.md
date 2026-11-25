@@ -130,6 +130,10 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 6.16 (код ожидает Q8B):** [scripts/test_correct_model_header.sh](scripts/test_correct_model_header.sh) использует официальный chat-template `<|turn>model\\n` и токен 107=LF. Он не переписывает Prefill и не редактирует RAW: запускает имеющийся Prefill→Decode(pos17,token107)→Head и печатает `STAGE6_16_FIRST_RESPONSE_TOKEN` — первую реальную позицию ответа pos18. Официальный [Gemma 4 template](https://huggingface.co/google/gemma-4-E2B-it/blob/main/chat_template.jinja). Запуск: `bash scripts/test_correct_model_header.sh`.
 
+**Stage 6.16 (Q8B подтверждён):** ошибка оригинального 17-токенного prompt заключалась в отсутствующем LF после `<|turn>model`. Проверено без изменения Prefill 17, токен 107=LF выполнен через Decode на pos17, а LM Head выдал единственный первый токен ответа `236778` = `2` на pos18. Получение осмысленного начала ответа НЕ доказывает корректности полной генерации и не устраняет численные различия Prefill/Decode KV.
+
+**Stage 6.17 (код ожидает Q8B):** [scripts/test_correct_header_generation.sh](scripts/test_correct_header_generation.sh) продолжает исправленный Stage6.16 до 4 последовательных вызовов Decode (pos17..20), 30 KV feedback в RAM, проверяет неизменность эталонов, печатает raw BPE токены, `STAGE6_17_TEXT_PREVIEW`. На шагах 1..3 INT8 максимумы должны быть уникальны: при tie исполнитель по умолчанию останавливается, не выбирая token ID произвольно. Запуск: `bash scripts/test_correct_header_generation.sh`.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.
