@@ -756,3 +756,75 @@ CPU_FULL_NONKV_TWO_STEP_OK: CPU Section0/1/2 all non-KV inputs + in-RAM KV feedb
 списка, а tokenizer, выбор следующего ID и настоящий prompt → prefill →
 decode loop ещё не связаны. Поэтому этот этап не является
 полностью самостоятельной текстовой генерацией.
+
+## Stage 5.9 — Q8B подтвердил все восемь входов Decode через CPU + RAM
+
+Пользователь прислал успешный `scripts/test_cpu_full_nonkv_two_step.sh`:
+
+```text
+CPU_AUX_QNN_REPLACED: tensors=6 bytes=9730 ... scope=first
+CPU_EMBED_QNN_REPLACED: scope=first token=568 tensors=2 bytes=41984 verified_against_saved_decode=1
+PERSISTENT_CONTEXTS_READY: 3 graphs; one backend/device; all contexts alive
+ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors
+KV_AUTO_POS_OK: pos=3 changed_cache_tensors=30 total_cache_tensors=30
+KV_FEEDBACK_OK: pos=3 cache_tensors=30 inserted_bytes=9216 layout=K_strided,V_contiguous
+KV_NEXT_CACHE_MATCH: 30 cache tensors byte-identical
+CPU_AUX_NEXT_QNN_REPLACED: tensors=6 bytes=9730 cpu_pos=4 cpu_token=2
+CPU_EMBED_QNN_REPLACED: scope=next token=568 tensors=2 bytes=41984 verified_against_saved_decode=1
+DECODE_NEXT_INPUTS_READY: kv_from_RAM=30 non_kv_from_saved_next=8 cpu_aux_replaced=6 cpu_embeddings_replaced=2
+DECODE_NEXT_REFERENCE_MATCH: 31 output tensors byte-identical
+DECODE_NEXT_HEAD_REFERENCE_MATCH: 262144 logits bytes identical
+CPU_FULL_NONKV_TWO_STEP_OK: CPU Section0/1/2 all non-KV inputs + in-RAM KV feedback verified
+```
+
+**Подтверждение:** на обоих Decode шагах все 8 non-KV input tensors
+теперь прямо заполняются из Section1 TFLite (маски/RoPE, 9730 байт)
+и из собственного INT2/INT4 C++ обработчика Section0/Section2
+(41984 байта), всего 51714 байт/шаг. Отдельные prefill/head графы
+сохранили reference match, Decode(4) 31/31 и LM Head(4)
+262144/262144 байта. Не требуется читать non-KV `.raw` для
+**вычисления**; они остаются в тесте как обязательные эталоны.
+Начальные KV первого Decode и Prefill QNN inputs остаются сохранёнными.
+
+## Stage 6.0 — предстоящая связка Prefill-128 → Decode
+
+Оригинальный `qnn_io_report.txt` для `qnn_partition_2` содержит
+36 входов: **28 K/V cache** и **8 non-KV**. По порядку QNN:
+
+| QNN index | CPU output | Bytes |
+|---:|---|---:|
+| 3 | `prefill_128_pos_emb_cos_0` | 65536 |
+| 5 | `prefill_128_pos_emb_sin_0` | 65536 |
+| 6 | `prefill_128_pos_emb_local_sin_0` | 32768 |
+| 7 | `prefill_128_per_layer_embeddings_0` | 4587520 |
+| 18 | `prefill_128_pos_emb_local_cos_0` | 32768 |
+| 21 | `prefill_128_mask_local_0` | 540672 |
+| 26 | `prefill_128_mask_global_0` | 540672 |
+| 32 | `prefill_128_embeddings_0` | 786432 |
+
+Здесь 30 выходов Prefill существуют независимо от того, что
+входных K/V-кэшей только 28. Алгоритм связи Prefill outputs →
+Decode initial caches должен опираться на реальные размеры,
+имена/слои и раскладку — **не делать предположение 30:30**.
+
+Добавлен `scripts/probe_prefill_metadata.py`, который не требует
+TFLite runtime и QNN backend: читает Original Section0/1/2
+read-only mmap, выводит точные `prefill_*` сигнатуры, их
+именованные входы/выходы, формы и типы; из
+`prefill_real_input_list.txt` показывает исходные QNN non-KV
+файлы и сверяет их размеры с QNN metadata.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+python3 scripts/probe_prefill_metadata.py \
+  2>&1 | tee ~/gemma4_prefill_interface.log
+```
+
+Ключевые строки: `PREFILL_CPU_SIGNATURE`, `PREFILL_CPU_IO`,
+`PREFILL_QNN_NONKV` и `PREFILL_INTERFACE_PROBE_OK`.
+После реального Q8B отчёта можно подготовить **правильные** CPU
+входы prefill_rope_128 / prefill_mask_128, вычислить
+Section0/Section2 embeddings для 128 token IDs и строго проверить
+результаты с сохранённым QNN input list. Текущий Stage 6.0
+**не доказал** автоматическую связку Prefill→Decode.

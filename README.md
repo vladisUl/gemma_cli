@@ -86,6 +86,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 5.8 (проверен на Q8B):** идентифицирован токен **568** для обоих Decode шагов 3/4, нативный Section0 INT2 совпал с QNN входом по всем 6144 байтам и Section2 INT4 по всем 35840 байтам **для каждого шага**. **Stage 5.9 (код в GitHub, ожидает проверку на Q8B):** прямое CPU Section0/1/2 → QNN в RAM для всех восьми не-KV входов обоих Decode; готов [scripts/test_cpu_full_nonkv_two_step.sh](scripts/test_cpu_full_nonkv_two_step.sh). Начальные 30 K/V и тестовые Prefill входы пока из сохранённых файлов.
 
+**Stage 5.9 (Q8B подтверждён, 25.11.2026):** оба последовательных Decode получают все **8 non-KV CPU входов** напрямую в RAM (Section1 9730 байт + Section0/2 41984 байта), 30 K/V между шагами обновляются через CPU feedback; второй Decode 31/31 выходов и LM Head 262144/262144 байта совпали с QNN reference. **Stage 6.0** готовит Prefill-128: по QNN metadata у него 36 входов — 28 K/V и 8 non-KV. Добавлен [scripts/probe_prefill_metadata.py](scripts/probe_prefill_metadata.py) для проверки исходных CPU prefill-сигнатур и размеров сохранённых QNN входов перед соединением Prefill→Decode. Это пока диагностика, не автономная генерация.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.
