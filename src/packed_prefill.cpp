@@ -4,6 +4,7 @@
 #include "packed_embedder.h"
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
