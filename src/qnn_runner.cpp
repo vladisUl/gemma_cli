@@ -3,10 +3,12 @@
 // Intended for QAIRT 2.47 on Radxa Q8B; first target is Gemma 4 LM Head.
 #include <QNN/QnnInterface.h>
 #include <QNN/System/QnnSystemInterface.h>
+#include "kv_cache.h"
 
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
@@ -423,10 +425,12 @@ struct QnnRuntime {
 
 struct Options {
     std::string binary, backend, system, graph, input, output, reference;
-    std::string input_list, inputs_dir, outputs_dir, reference_dir, jobs;
+    std::string input_list, inputs_dir, outputs_dir, reference_dir, jobs, kv_next_list;
     bool inspect = false;
     bool check_inputs = false;
     bool chain_decode_head = false;
+    bool kv_feedback = false;
+    uint32_t kv_feedback_pos = 0;
     uint32_t repeat = 1;
 };
 
@@ -545,6 +549,8 @@ void usage(const char* executable) {
         << "  " << executable << " --system LIB --backend LIB --jobs JOBS.txt\n"
         << "  JOBS.txt lines: BINARY GRAPH INPUT_LIST REFERENCE_RESULT_0 (no spaces in paths).\n"
         << "  Add --chain-decode-head to execute LM Head again, directly using Decode hidden-state RAM.\n"
+        << "  Add --kv-feedback-pos N to update 30 K/V buffers in RAM (N=0..4095).\n"
+        << "  Optional --kv-next-list FILE compares updated buffers with saved next-step caches.\n"
         << "No implicit tensor conversions or synthetic zero inputs.\n";
 }
 
@@ -582,6 +588,17 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--outputs-dir") options.outputs_dir = value;
         else if (arg == "--reference-dir") options.reference_dir = value;
         else if (arg == "--jobs") options.jobs = value;
+        else if (arg == "--kv-next-list") options.kv_next_list = value;
+        else if (arg == "--kv-feedback-pos") {
+            if (value.empty() || value.front() == '-')
+                throw std::runtime_error("--kv-feedback-pos must be 0..4095");
+            size_t n = 0;
+            const auto pos = std::stoul(value, &n);
+            if (n != value.size() || pos >= 4096)
+                throw std::runtime_error("--kv-feedback-pos must be 0..4095");
+            options.kv_feedback = true;
+            options.kv_feedback_pos = static_cast<uint32_t>(pos);
+        }
         else if (arg == "--repeat") {
             size_t pos = 0;
             const auto repeat = std::stoul(value, &pos);
@@ -596,6 +613,8 @@ Options parse_options(int argc, char** argv) {
     if (!options.jobs.empty()) {
         if (options.system.empty() || options.backend.empty())
             throw std::runtime_error("--jobs needs --system and --backend");
+        if (!options.kv_next_list.empty() && !options.kv_feedback)
+            throw std::runtime_error("--kv-next-list requires --kv-feedback-pos");
         if (!options.binary.empty() || !options.graph.empty() ||
             !options.input.empty() || !options.output.empty() ||
             !options.reference.empty() || !options.input_list.empty() ||
@@ -605,8 +624,8 @@ Options parse_options(int argc, char** argv) {
             throw std::runtime_error("--jobs cannot be combined with single-graph options");
         return options;
     }
-    if (options.chain_decode_head)
-        throw std::runtime_error("--chain-decode-head requires --jobs");
+    if (options.chain_decode_head || options.kv_feedback || !options.kv_next_list.empty())
+        throw std::runtime_error("Chained/KV options require --jobs");
     if (options.binary.empty() || options.system.empty())
         throw std::runtime_error("--binary and --system are required");
     if (!options.inspect) {
@@ -932,6 +951,116 @@ void execute_chained_decode_head(QnnRuntime& runtime,
                  "if both samples were identical.\n";
 }
 
+// These mapping indices come from original Gemma 4 Decode TFLite signature,
+// NOT the QNN array order. QNN retains "StatefulPartitionedCall_<index>"
+// output names, while the actual graph output array is permuted. This known
+// AOT layout is checked strictly by name, shape, dtype, and input quantization.
+struct KvLink {
+    size_t input_index = 0;
+    size_t output_index = 0;
+    bool key = false;
+    uint32_t channels = 0;
+    std::string name;
+};
+
+std::vector<KvLink> decode_kv_links(const ReplayJob& decode) {
+    if (decode.graph_name != "qnn_partition_0")
+        throw std::runtime_error("KV feedback requires qnn_partition_0");
+    constexpr std::array<uint32_t, 15> order{
+        0,1,10,11,12,13,14,2,3,4,5,6,7,8,9
+    };
+    std::vector<KvLink> links;
+    std::set<size_t> seen_input, seen_output;
+    for (uint32_t n = 0; n < 30; ++n) {
+        const bool key = n < 15;
+        const std::string name = "decode_kv_cache_" +
+            std::string(key ? "k_" : "v_") +
+            std::to_string(order[n % 15]) + "_0";
+        const std::string output = "StatefulPartitionedCall_" + std::to_string(n);
+        size_t input_index = decode.inputs.size();
+        size_t output_index = decode.outputs.size();
+        for (size_t i = 0; i < decode.inputs.size(); ++i)
+            if (tensor_name(decode.inputs[i]) &&
+                name == tensor_name(decode.inputs[i]))
+                input_index = i;
+        for (size_t i = 0; i < decode.outputs.size(); ++i)
+            if (tensor_name(decode.outputs[i]) &&
+                output == tensor_name(decode.outputs[i]))
+                output_index = i;
+        if (input_index == decode.inputs.size() ||
+            output_index == decode.outputs.size())
+            throw std::runtime_error("KV map missing " + name + " or " + output);
+        const auto& ci = decode.inputs[input_index];
+        const auto& so = decode.outputs[output_index];
+        if (tensor_rank(ci) != 4 || tensor_rank(so) != 4 ||
+            tensor_dtype(ci) != QNN_DATATYPE_SFIXED_POINT_8 ||
+            tensor_dtype(so) != QNN_DATATYPE_SFIXED_POINT_8)
+            throw std::runtime_error("KV dtype/rank mismatch: " + name);
+        const auto* c = tensor_dims(ci);
+        const auto* s = tensor_dims(so);
+        const uint32_t channels = key ? c[2] : c[3];
+        if (c[0] != 1 || c[1] != 1 ||
+            (key ? c[3] : c[2]) != 4096 ||
+            (channels != 256 && channels != 512) ||
+            s[0] != 1 || s[1] != 1 ||
+            (key ? s[2] : s[3]) != channels ||
+            (key ? s[3] : s[2]) != 1 ||
+            tensor_nbytes(ci) != static_cast<size_t>(channels) * 4096 ||
+            tensor_nbytes(so) != channels)
+            throw std::runtime_error("KV tensor shape mismatch: " + name);
+        if (!seen_input.insert(input_index).second ||
+            !seen_output.insert(output_index).second)
+            throw std::runtime_error("Duplicate KV mapping: " + name);
+        const auto& qcache = tensor_quant(ci);
+        const auto& qslice = tensor_quant(so);
+        if (qcache.quantizationEncoding == QNN_QUANTIZATION_ENCODING_SCALE_OFFSET &&
+            qslice.quantizationEncoding == QNN_QUANTIZATION_ENCODING_SCALE_OFFSET &&
+            (qcache.scaleOffsetEncoding.scale != qslice.scaleOffsetEncoding.scale ||
+             qcache.scaleOffsetEncoding.offset != qslice.scaleOffsetEncoding.offset))
+            throw std::runtime_error("KV quantization mismatch: " + name);
+        links.push_back({input_index, output_index, key, channels, name});
+    }
+    if (seen_input.size() != 30 || seen_output.size() != 30)
+        throw std::runtime_error("Expected exactly 30 unique KV mappings");
+    return links;
+}
+
+void apply_kv_feedback(ReplayJob& decode, const std::vector<KvLink>& links,
+                       uint32_t pos, const std::vector<fs::path>& next_files) {
+    size_t inserted = 0;
+    for (const auto& link : links) {
+        auto& cache = decode.input_buffers.at(link.input_index);
+        const auto& slice = decode.output_buffers.at(link.output_index);
+        gemma4::update_kv_slot(cache, slice, link.channels, 4096, pos,
+                               link.key ? gemma4::KvLayout::Key : gemma4::KvLayout::Value);
+        inserted += slice.size();
+    }
+    std::cout << "KV_FEEDBACK_OK: pos=" << pos
+              << " cache_tensors=" << links.size()
+              << " inserted_bytes=" << inserted
+              << " layout=K_strided,V_contiguous\n" << std::flush;
+    if (next_files.empty()) {
+        std::cout << "KV_FEEDBACK_NOTE: next Decode cache was not provided; "
+                     "this checks only in-RAM placement, not next-step equivalence\n";
+        return;
+    }
+    for (const auto& link : links) {
+        const auto& actual = decode.input_buffers.at(link.input_index);
+        const fs::path& path = next_files.at(link.input_index);
+        const auto expected = read_file(path.string());
+        if (expected.size() != actual.size())
+            throw std::runtime_error("KV_NEXT_SIZE_MISMATCH: " + link.name);
+        auto mismatch = std::mismatch(actual.begin(), actual.end(), expected.begin());
+        if (mismatch.first != actual.end())
+            throw std::runtime_error("KV_NEXT_MISMATCH: " + link.name +
+                " byte=" + std::to_string(
+                    static_cast<size_t>(mismatch.first - actual.begin())) +
+                " slot=" + std::to_string(pos) +
+                "; verify samples are consecutive and slot is correct");
+    }
+    std::cout << "KV_NEXT_CACHE_MATCH: 30 cache tensors byte-identical\n" << std::flush;
+}
+
 int run_replay_jobs(const Options& options) {
     auto jobs = parse_replay_jobs(options.jobs);
     // Check all files, all tensor sizes and graph metadata BEFORE NPU init.
@@ -961,6 +1090,33 @@ int run_replay_jobs(const Options& options) {
                   << " hidden_bytes=" << tensor_nbytes(decode->outputs[hidden_output_index])
                   << " head_input_bytes=" << tensor_nbytes(head->inputs[0])
                   << "\n" << std::flush;
+    }
+
+    std::vector<KvLink> kv_links;
+    std::vector<fs::path> next_cache_files;
+    if (options.kv_feedback) {
+        if (jobs.front()->graph_name != "qnn_partition_0")
+            throw std::runtime_error("--kv-feedback-pos requires a Decode-first manifest");
+        for (auto& job : jobs) {
+            if (job->graph_name != "qnn_partition_0") continue;
+            if (decode && decode != job.get())
+                throw std::runtime_error("Duplicate Decode graph in jobs");
+            decode = job.get();
+        }
+        if (!decode) throw std::runtime_error("KV feedback needs Decode");
+        kv_links = decode_kv_links(*decode);
+        if (!options.kv_next_list.empty()) {
+            const auto& graph = decode->metadata->find(decode->graph_name);
+            next_cache_files = parse_qnn_input_list(options.kv_next_list, graph);
+            for (const auto& link : kv_links) {
+                const auto& p = next_cache_files.at(link.input_index);
+                if (!fs::is_regular_file(p) ||
+                    fs::file_size(p) != tensor_nbytes(decode->inputs[link.input_index]))
+                    throw std::runtime_error("Invalid next-sample KV file: " + p.string());
+            }
+        }
+        std::cout << "KV_MAPPING_OK: 30 cache/slice links; pos="
+                  << options.kv_feedback_pos << "\n" << std::flush;
     }
 
     QnnRuntime runtime(options.backend);
@@ -999,6 +1155,8 @@ int run_replay_jobs(const Options& options) {
     // incorrectly compare it to the newly chained Head output.
     if (options.chain_decode_head)
         execute_chained_decode_head(runtime, *decode, *head, hidden_output_index);
+    if (options.kv_feedback)
+        apply_kv_feedback(*decode, kv_links, options.kv_feedback_pos, next_cache_files);
     return 0;
 }
 
