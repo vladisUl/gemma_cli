@@ -459,6 +459,9 @@ struct Options {
     bool prefill_tie_policy_set = false;
     bool prefill_allow_tie_lowest = false;
     bool prefill_stop_on_eos = false;
+    bool dynamic_prefill = false;
+    std::string dynamic_prompt_tokens,dynamic_section0,dynamic_section1,dynamic_section2;
+    uint32_t dynamic_max_tokens = 16;
     bool prefill_kv_diagnose = false;
     uint32_t kv_feedback_pos = 0;
     int32_t cpu_aux_pos = 0;
@@ -609,6 +612,10 @@ void usage(const char* executable) {
         << "  Optional --prefill-kv-steps N (1..4; up to 16 with EOS-stop):\n"
         << "     previous Decode output KV feedback and prior LM Head INT8 argmax.\n"
         << "     Probe token is NOT derived from Prefill logits; no tokenizer.\n"
+        << "  --dynamic-prefill: sample-free QNN inference; requires --jobs,\n"
+        << "     --dynamic-prompt-tokens FILE --dynamic-section0 MODEL0\n"
+        << "     --dynamic-section1 MODEL1 --dynamic-section2 MODEL2\n"
+        << "     optional --dynamic-max-tokens N (1..32, default 16).\n"
         << "  --prefill-stop-on-eos: LF107 continuation; EOS ids 1,106,50 stop.\n"
         << "  --prefill-tie-policy stop|lowest-id (default stop): print all tied\n"
         << "     INT8 max IDs; lowest-id allows an EXPERIMENTAL tie-break only.\n"
@@ -655,6 +662,10 @@ Options parse_options(int argc, char** argv) {
         }
         if (arg == "--prefill-kv-probe") {
             options.prefill_kv_probe = true;
+            continue;
+        }
+        if (arg == "--dynamic-prefill") {
+            options.dynamic_prefill = true;
             continue;
         }
         if (arg == "--prefill-stop-on-eos") {
@@ -726,6 +737,19 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--kv-next-reference-dir") options.kv_next_reference_dir = value;
         else if (arg == "--kv-next-head-reference-dir") options.kv_next_head_reference_dir = value;
         else if (arg == "--cpu-aux-model") options.cpu_aux_model = value;
+        else if (arg == "--dynamic-prompt-tokens") options.dynamic_prompt_tokens = value;
+        else if (arg == "--dynamic-section0") options.dynamic_section0 = value;
+        else if (arg == "--dynamic-section1") options.dynamic_section1 = value;
+        else if (arg == "--dynamic-section2") options.dynamic_section2 = value;
+        else if (arg == "--dynamic-max-tokens") {
+            if(value.empty() || value.front()=='-')
+                throw std::runtime_error("--dynamic-max-tokens expects 1..32");
+            size_t consumed=0;
+            const auto num=std::stoul(value,&consumed);
+            if(consumed!=value.size() || num<1 || num>32)
+                throw std::runtime_error("--dynamic-max-tokens must be 1..32");
+            options.dynamic_max_tokens=static_cast<uint32_t>(num);
+        }
         else if (arg == "--cpu-prefill-tokens") options.cpu_prefill_tokens = value;
         else if (arg == "--cpu-prefill-section0") options.cpu_prefill_section0 = value;
         else if (arg == "--cpu-prefill-section2") options.cpu_prefill_section2 = value;
@@ -840,6 +864,34 @@ Options parse_options(int argc, char** argv) {
     if (!options.jobs.empty()) {
         if (options.system.empty() || options.backend.empty())
             throw std::runtime_error("--jobs needs --system and --backend");
+        if(options.dynamic_prefill) {
+            if(options.dynamic_prompt_tokens.empty() ||
+               options.dynamic_section0.empty() ||
+               options.dynamic_section1.empty() ||
+               options.dynamic_section2.empty() ||
+               options.chain_decode_head || options.prefill_kv_run ||
+               options.prefill_kv_probe || options.kv_feedback ||
+               options.kv_run_next || !options.cpu_aux_model.empty() ||
+               !options.cpu_prefill_tokens.empty() ||
+               !options.cpu_embed_section0.empty() ||
+               !options.binary.empty() || !options.graph.empty() ||
+               !options.input.empty() || !options.output.empty() ||
+               options.repeat!=1 || options.inspect ||
+               options.prefill_stop_on_eos || options.prefill_seed_last_prompt ||
+               options.prefill_seed_first_prompt || options.prefill_tie_policy_set)
+                throw std::runtime_error(
+                    "--dynamic-prefill requires only --jobs, --system, --backend, "
+                    "--dynamic-prompt-tokens, --dynamic-section0/1/2, "
+                    "optional --dynamic-max-tokens");
+            return options;
+        }
+        if(!options.dynamic_prompt_tokens.empty() ||
+           !options.dynamic_section0.empty() ||
+           !options.dynamic_section1.empty() ||
+           !options.dynamic_section2.empty() ||
+           options.dynamic_max_tokens!=16)
+            throw std::runtime_error(
+                "Dynamic input/model flags require --dynamic-prefill");
         if (options.cpu_aux_model.empty() != !options.cpu_aux_pos_set ||
             options.cpu_aux_model.empty() != !options.cpu_aux_token_set)
             throw std::runtime_error(
@@ -964,7 +1016,10 @@ Options parse_options(int argc, char** argv) {
             throw std::runtime_error("--jobs cannot be combined with single-graph options");
         return options;
     }
-    if (options.prefill_kv_probe || options.prefill_kv_run ||
+    if (options.dynamic_prefill || !options.dynamic_prompt_tokens.empty() ||
+        !options.dynamic_section0.empty() || !options.dynamic_section1.empty() ||
+        !options.dynamic_section2.empty() || options.dynamic_max_tokens!=16 ||
+        options.prefill_kv_probe || options.prefill_kv_run ||
         options.prefill_kv_token_set || options.prefill_kv_steps_set ||
         options.prefill_seed_last_prompt || options.prefill_seed_first_prompt ||
         options.prefill_bos_only_compare || options.prefill_first_input_compare ||
@@ -1169,48 +1224,53 @@ std::vector<std::unique_ptr<ReplayJob>> parse_replay_jobs(const std::string& fil
     return jobs;
 }
 
-void prepare_replay_job(ReplayJob& job, const std::string& system_library) {
+void prepare_replay_job(ReplayJob& job, const std::string& system_library,
+                        bool metadata_only = false) {
     job.binary = read_file(job.binary_path);
     job.metadata = std::make_unique<SystemMetadata>(system_library);
     job.metadata->parse(job.binary);
     const GraphView& graph = job.metadata->find(job.graph_name);
     if (!graph.num_inputs || !graph.num_outputs)
         throw std::runtime_error("Graph has no I/O: " + graph.name);
-    const auto paths = parse_qnn_input_list(job.input_list, graph);
+    const auto paths = metadata_only?std::vector<fs::path>{}:
+        parse_qnn_input_list(job.input_list, graph);
 
     job.inputs.assign(graph.inputs, graph.inputs + graph.num_inputs);
     job.outputs.assign(graph.outputs, graph.outputs + graph.num_outputs);
     job.input_buffers.resize(graph.num_inputs);
     job.output_buffers.resize(graph.num_outputs);
     const fs::path refdir(job.reference_dir);
-    if (!fs::is_directory(refdir))
+    if (!metadata_only && !fs::is_directory(refdir))
         throw std::runtime_error("Reference directory missing: " + job.reference_dir);
     for (uint32_t i = 0; i < graph.num_inputs; ++i) {
         const size_t required = tensor_nbytes(job.inputs[i]);
-        job.input_buffers[i] = read_file(paths[i].string());
+        if(metadata_only)job.input_buffers[i].assign(required,uint8_t{0});
+        else job.input_buffers[i] = read_file(paths[i].string());
         if (job.input_buffers[i].size() != required)
-            throw std::runtime_error("Wrong input size for " + job.graph_name + " [" +
-                std::to_string(i) + "]: expected " + std::to_string(required) +
-                ", actual " + std::to_string(job.input_buffers[i].size()) +
-                " in " + paths[i].string());
+            throw std::runtime_error("Wrong input size for " + job.graph_name +
+                " ["+std::to_string(i)+"]");
         bind_raw(job.inputs[i], job.input_buffers[i]);
     }
     for (uint32_t i = 0; i < graph.num_outputs; ++i) {
         const size_t required = tensor_nbytes(job.outputs[i]);
         job.output_buffers[i].resize(required);
         bind_raw(job.outputs[i], job.output_buffers[i]);
-        const fs::path reference = refdir / native_basename(job.outputs[i], i);
-        if (!fs::is_regular_file(reference))
-            throw std::runtime_error("Missing reference for " + job.graph_name + ": " +
-                                     reference.string());
-        if (fs::file_size(reference) != required)
-            throw std::runtime_error("Wrong reference size for " + job.graph_name + ": " +
-                                     reference.string());
-        job.references.push_back(reference);
+        if(!metadata_only) {
+            const fs::path reference = refdir / native_basename(job.outputs[i], i);
+            if (!fs::is_regular_file(reference))
+                throw std::runtime_error("Missing reference for " + job.graph_name + ": " +
+                                         reference.string());
+            if (fs::file_size(reference) != required)
+                throw std::runtime_error("Wrong reference size for " + job.graph_name + ": " +
+                                         reference.string());
+            job.references.push_back(reference);
+        }
     }
     std::cout << "REPLAY_PREPARED: " << job.graph_name
               << " inputs=" << graph.num_inputs << " outputs=" << graph.num_outputs
-              << " binary_bytes=" << job.binary.size() << "\n" << std::flush;
+              << " binary_bytes=" << job.binary.size()
+              << " metadata_only="<<(metadata_only?1:0)
+              << " saved_samples_read="<<(metadata_only?0:1)<<"\n" << std::flush;
 }
 
 // Match Decode's final INT8 hidden state to LM Head input using *actual*
@@ -2537,10 +2597,17 @@ void execute_prefill_linked_decode(
                                   kv,options,scratch_caches);
 }
 
+#include "stage7_2_dynamic.inc"
+
 int run_replay_jobs(const Options& options) {
     auto jobs = parse_replay_jobs(options.jobs);
     // Check all files, all tensor sizes and graph metadata BEFORE NPU init.
-    for (auto& job : jobs) prepare_replay_job(*job, options.system);
+    for (auto& job : jobs)
+        prepare_replay_job(*job, options.system,options.dynamic_prefill);
+    if(options.dynamic_prefill) {
+        run_stage7_2_dynamic(jobs,options);
+        return 0;
+    }
 
     ReplayJob* decode = nullptr;
     ReplayJob* head = nullptr;
