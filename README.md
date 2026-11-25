@@ -74,6 +74,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 5.5 (код в GitHub, проверка Q8B впереди):** при `--kv-run-next` новые `--cpu-aux-next-pos 4 --cpu-aux-next-token 2` позволяют заменить **ещё шесть AUX-входов второго Decode** вычислениями CPU Section1; 30 K/V-кэшей второго шага берутся из обратной связи в RAM. Готовый тест — [scripts/test_cpu_aux_two_step.sh](scripts/test_cpu_aux_two_step.sh).
 
+**Stage 5.5 (проверен на Q8B):** два последовательных Decode используют 6 CPU AUX-тензоров на каждом шаге, KV-feedback обновляет все 30 кэшей в RAM. Повторный Decode дал 31/31 точных выходов, повторный LM Head — все 262144 байта логитов в точности. Следующий блокер: **обычные и per-layer embeddings**. Подготовлен [scripts/test_cpu_embedder.sh](scripts/test_cpu_embedder.sh) для проверки исходных Section0/Section2 по отдельности, после однократного переноса моделей на Q8B.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.

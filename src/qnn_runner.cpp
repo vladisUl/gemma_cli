@@ -1461,8 +1461,10 @@ int run_replay_jobs(const Options& options) {
         if (!decode) throw std::runtime_error("CPU_AUX_MISSING_DECODE_JOB");
         apply_cpu_aux_first_decode(*decode, options);
         if (options.kv_run_next)
-            std::cout << "CPU_AUX_SCOPE_NOTE: CPU replaces AUX only for first Decode; "
-                         "second Decode non-KV inputs still come from next saved list\n";
+            std::cout << "CPU_AUX_SCOPE_NOTE: first Decode AUX from CPU; "
+                         "second Decode AUX from "
+                      << (options.cpu_aux_next_pos_set ? "CPU Section1" : "saved next list")
+                      << "; second-step embeddings remain saved\n";
     }
 
     QnnRuntime runtime(options.backend);

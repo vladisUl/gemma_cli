@@ -383,3 +383,78 @@ CPU_AUX_TWO_STEP_EXIT_OK: all requested comparisons completed
 это означает, что выбранные CPU pos/token не воспроизводят сохранённый
 тестовый шаг 4. Не обходить сверку. Пробный token=2 гарантирует только
 непустое значение, не идентифицирует оригинальный токен.
+
+## Stage 5.5 — Q8B подтвердил оба CPU AUX шага
+
+Запуск `scripts/test_cpu_aux_two_step.sh` завершился успешно:
+
+```text
+CPU_AUX_QNN_REPLACED: tensors=6 bytes=9730 from=Section1_TFLite_2.14 verified_against_saved_decode=1 scope=first
+ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors
+KV_AUTO_POS_OK: pos=3 changed_cache_tensors=30 total_cache_tensors=30
+KV_NEXT_CACHE_MATCH: 30 cache tensors byte-identical
+CPU_AUX_NEXT_QNN_REPLACED: tensors=6 bytes=9730 cpu_pos=4 cpu_token=2
+DECODE_NEXT_INPUTS_READY: kv_from_RAM=30 non_kv_from_saved_next=8 cpu_aux_replaced=6
+DECODE_NEXT_REFERENCE_MATCH: 31 output tensors byte-identical
+DECODE_NEXT_HEAD_REFERENCE_MATCH: 262144 logits bytes identical
+CPU_AUX_TWO_STEP_EXIT_OK: all requested comparisons completed
+```
+
+CPU TFLite Section1 создал по 6 AUX-входов на каждом из двух Decode
+(19 460 байт суммарно). Исходные сохранённые входы использовались только
+для проверки/всего остального. Для второго Decode 30 KV получены через
+CPU-feedback в RAM. Из восьми не-KV входов шесть были заменены на CPU AUX
+перед вызовом QNN, а **два FLOAT32 embeddings пока оставлены из сохранённых .raw**.
+Три QNN-контекста персистентны, output эталоны не изменяются.
+
+## Stage 5.6 — подготовка CPU Section0 и Section2 embeddings
+
+Осталось два входа Decode: `decode_embeddings_0` FLOAT32 1536 значений
+(6144 байта, QNN input[33]) и `decode_per_layer_embeddings_0` FLOAT32
+[1,1,35,256] (35840 байт, QNN input[7]).
+
+Оригинальные модели, согласно прежнему графическому отчёту:
+
+| Модель | Размер, байты | CPU decode-сигнатура | Ожидаемый выход |
+|---|---:|---|---|
+| `Section0_TFLiteModel_tf_lite_embedder.tflite` | 106959512 | `decode_embedder` | 6144 байта |
+| `Section2_TFLiteModel_tf_lite_per_layer_embedder.tflite` | 1394630752 | `decode_per_layer_embedder` | 35840 байт |
+
+Файл Section1 был найден на машине `comp` под `/root/gemma4/unpacked/`.
+Нужно проверить наличие **Section0 и Section2** в той же папке и один раз
+перенести на Q8B. Во время инференса WSL / SSH не используются.
+
+```bash
+# На comp (root):
+ls -lh /root/gemma4/unpacked/Section0_TFLiteModel_tf_lite_embedder.tflite \
+       /root/gemma4/unpacked/Section2_TFLiteModel_tf_lite_per_layer_embedder.tflite
+
+scp /root/gemma4/unpacked/Section0_TFLiteModel_tf_lite_embedder.tflite \
+    /root/gemma4/unpacked/Section2_TFLiteModel_tf_lite_per_layer_embedder.tflite \
+    radxa@192.168.0.161:/home/radxa/gemma4_qnn_test/cpu_models/
+```
+
+Затем Q8B, **сначала только Section0**:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+bash scripts/test_cpu_embedder.sh 2>&1 | tee ~/gemma4_cpu_embed0.log
+```
+
+После успешного Section0 запустить большой Section2 отдельно:
+
+```bash
+GEMMA4_EMBEDDER_SECTION=2 bash scripts/test_cpu_embedder.sh \
+  2>&1 | tee ~/gemma4_cpu_embed2.log
+```
+
+Тест использует `token_ids=2` **только для smoke-test CPU-модели**.
+Этот ID не считается фактическим токеном сохранённого шага 3.
+Побайтовая сверка с QNN Decode будет корректной, только когда известен
+настоящий ID токена оригинального сохранённого шага.
+
+Пока ожидаем только `CPU_EMBED_TEST_OK: section=0 output_bytes=6144` и
+`CPU_EMBED_TEST_OK: section=2 output_bytes=35840`; ни один из этих тестов
+ещё не выполнялся на Q8B.
