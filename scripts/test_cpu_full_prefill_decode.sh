@@ -31,11 +31,18 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 [[ "$(stat -c %s derived_prefill_128_token_ids_i32.raw)" == 512 ]] || { echo "PREFILL_TOKENS_INVALID: expected 512 bytes" >&2; exit 2; }
 echo "CPU_FULL_PREFILL_DECODE_BEGIN: Prefill-128 tokens from verified 512-byte ID file; Decode steps3/4 token=568"
 echo "CPU_FULL_PREFILL_REFERENCE_NOTE: all eight non-KV inputs for both Prefill and Decode byte-compared before QNN"
+PREFILL_KV_OPTIONS=()
+case "${GEMMA4_PREFILL_KV_PROBE:-0}" in
+    0) ;;
+    1) PREFILL_KV_OPTIONS+=(--prefill-kv-probe) ;;
+    *) echo "CPU_FULL_PREFILL_ERROR: GEMMA4_PREFILL_KV_PROBE must be 0 or 1" >&2; exit 2 ;;
+esac
 "$ROOT/build/gemma4-qnn-run" \
     --system "$PWD/sdk247/libQnnSystem.so" \
     --backend "$PWD/sdk247/libQnnHtp.so" \
     --jobs persistent_jobs_decode_prefill_head.txt \
     --chain-decode-head \
+    "${PREFILL_KV_OPTIONS[@]}" \
     --cpu-prefill-tokens "$PWD/derived_prefill_128_token_ids_i32.raw" \
     --cpu-prefill-section0 "$MODEL0" \
     --cpu-prefill-section2 "$MODEL2" \
