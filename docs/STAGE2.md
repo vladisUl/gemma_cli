@@ -31,7 +31,7 @@ ctest --test-dir build --output-on-failure
 
 ```sh
 cd ~/gemma4_qnn_test
-export LD_LIBRARY_PATH="$PWD/sdk247:\${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$PWD/sdk247:${LD_LIBRARY_PATH:-}"
 export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 ../gemma4-cli-stage1/build/gemma4-qnn-run \
@@ -50,7 +50,7 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 ```sh
 cd ~/gemma4_qnn_test
-export LD_LIBRARY_PATH="$PWD/sdk247:\${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$PWD/sdk247:${LD_LIBRARY_PATH:-}"
 export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 INPUT_RAW=/absolute/path/to/previous/lm_head_hidden_int8.raw
