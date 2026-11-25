@@ -52,7 +52,9 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Проверено на Radxa Q8B (2026-11-25):** сборка C++ и CTest (1/1), чтение QNN System метаданных LM Head, **`QnnGraph_execute` успешно запущен напрямую на NPU**, а все **262144 байта** логитов совпали с `qnn-net-run` (пара `real_result_decode_17` / `real_result_head_17`). Загрузка LM Head — 81.007 мс, время одного исполнения — 12.716 мс. Детали — в [docs/STAGE2.md](docs/STAGE2.md).
 
-**Stage 3 (Decode подтверждён на Q8B; Prefill ожидает проверки):** `gemma4-qnn-run` расширен до произвольного числа входных/выходных QNN-тензоров. Теперь можно напрямую подавать **ту же** `qnn-net-run` строку с путями к 38 входным файлам и побайтово сравнивать все 31 выхода Decode с эталоном. Инструкции — в [docs/STAGE3.md](docs/STAGE3.md). Тест Decode 38/31 успешно прошёл побайтовую сверку всех 31 выходов (`ALL_REFERENCES_MATCH: 31 output tensors`). Для следующего шага добавлен [scripts/test_prefill.sh](scripts/test_prefill.sh): replay Prefill-128 36/30 с обязательной сверкой с `qnn-net-run`. Рабочие AOT `.bin` не модифицируются.
+**Stage 3 (Decode и Prefill подтверждены на Q8B):** `gemma4-qnn-run` расширен до произвольного числа входных/выходных QNN-тензоров. Теперь можно напрямую подавать **ту же** `qnn-net-run` строку с путями к 38 входным файлам и побайтово сравнивать все 31 выхода Decode с эталоном. Инструкции — в [docs/STAGE3.md](docs/STAGE3.md). Тест Decode 38/31 успешно прошёл побайтовую сверку всех 31 выходов (`ALL_REFERENCES_MATCH: 31 output tensors`). Prefill-128 36/30 также прошёл строгую проверку: `PREFILL_VERIFIED: 30/30 outputs byte-identical`. Скрипт [scripts/test_prefill.sh](scripts/test_prefill.sh) сохранён. Рабочие AOT `.bin` не модифицируются.
+
+**Stage 4 — persistent QNN contexts (эксперимент, не проверен на Q8B):** в `gemma4-qnn-run` добавлен режим `--jobs`, позволяющий загрузить до трёх QNN-контекстов в одном процессе и побайтово проверить их выходы без повторного `contextCreateFromBinary` между вызовами. Инструкция: [docs/STAGE4.md](docs/STAGE4.md). Сохранённые входы и эталоны обязательны; это ещё не динамический KV-cache/генерация.
 
 ## Дорожная карта
 

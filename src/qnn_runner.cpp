@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -360,7 +361,7 @@ struct QnnRuntime {
     const QnnInterface_t* provider = nullptr;
     Qnn_BackendHandle_t backend = nullptr;
     Qnn_DeviceHandle_t device = nullptr;
-    Qnn_ContextHandle_t context = nullptr;
+    std::vector<Qnn_ContextHandle_t> contexts;
     bool device_created = false;
 
     explicit QnnRuntime(const std::string& path) : library(path) {
@@ -386,7 +387,10 @@ struct QnnRuntime {
     ~QnnRuntime() {
         if (!provider) return;
         const auto& api = provider->QNN_INTERFACE_VER_NAME;
-        if (context && api.contextFree) api.contextFree(context, nullptr);
+        if (api.contextFree) {
+            for (auto iter = contexts.rbegin(); iter != contexts.rend(); ++iter)
+                if (*iter) api.contextFree(*iter, nullptr);
+        }
         if (device_created && device && api.deviceFree) api.deviceFree(device);
         if (backend && api.backendFree) api.backendFree(backend);
     }
@@ -394,10 +398,13 @@ struct QnnRuntime {
     Qnn_GraphHandle_t load(const std::vector<uint8_t>& bytes, const std::string& name) {
         const auto& api = provider->QNN_INTERFACE_VER_NAME;
         if (bytes.empty()) throw std::runtime_error("Empty QNN context binary");
+        Qnn_ContextHandle_t context = nullptr;
         check(api.contextCreateFromBinary(backend, device, nullptr, bytes.data(),
                                            static_cast<Qnn_ContextBinarySize_t>(bytes.size()),
                                            &context, nullptr),
-              "contextCreateFromBinary");
+              "contextCreateFromBinary(" + name + ")");
+        // Keep every context live; its graph handle remains valid until destruction.
+        contexts.push_back(context);
         Qnn_GraphHandle_t graph = nullptr;
         check(api.graphRetrieve(context, name.c_str(), &graph), "graphRetrieve(" + name + ")");
         return graph;
@@ -416,7 +423,7 @@ struct QnnRuntime {
 
 struct Options {
     std::string binary, backend, system, graph, input, output, reference;
-    std::string input_list, inputs_dir, outputs_dir, reference_dir;
+    std::string input_list, inputs_dir, outputs_dir, reference_dir, jobs;
     bool inspect = false;
     bool check_inputs = false;
     uint32_t repeat = 1;
@@ -533,6 +540,9 @@ void usage(const char* executable) {
         << "      --input-list QNN_INPUT_LIST.txt --outputs-dir DIR [--reference-dir Result_0]\n"
         << "  or --inputs-dir DIR instead of --input-list FILE\n"
         << "  Add --check-inputs to validate all input tensors without NPU execution.\n"
+        << "Persistent multi-context replay (one backend/device, all contexts kept loaded):\n"
+        << "  " << executable << " --system LIB --backend LIB --jobs JOBS.txt\n"
+        << "  JOBS.txt lines: BINARY GRAPH INPUT_LIST REFERENCE_RESULT_0 (no spaces in paths).\n"
         << "No implicit tensor conversions or synthetic zero inputs.\n";
 }
 
@@ -565,6 +575,7 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--inputs-dir") options.inputs_dir = value;
         else if (arg == "--outputs-dir") options.outputs_dir = value;
         else if (arg == "--reference-dir") options.reference_dir = value;
+        else if (arg == "--jobs") options.jobs = value;
         else if (arg == "--repeat") {
             size_t pos = 0;
             const auto repeat = std::stoul(value, &pos);
@@ -575,6 +586,18 @@ Options parse_options(int argc, char** argv) {
         } else {
             throw std::runtime_error("Unknown argument: " + arg);
         }
+    }
+    if (!options.jobs.empty()) {
+        if (options.system.empty() || options.backend.empty())
+            throw std::runtime_error("--jobs needs --system and --backend");
+        if (!options.binary.empty() || !options.graph.empty() ||
+            !options.input.empty() || !options.output.empty() ||
+            !options.reference.empty() || !options.input_list.empty() ||
+            !options.inputs_dir.empty() || !options.outputs_dir.empty() ||
+            !options.reference_dir.empty() || options.inspect ||
+            options.check_inputs || options.repeat != 1)
+            throw std::runtime_error("--jobs cannot be combined with single-graph options");
+        return options;
     }
     if (options.binary.empty() || options.system.empty())
         throw std::runtime_error("--binary and --system are required");
@@ -722,7 +745,128 @@ void run_multi(const Options& options, const GraphView& graph,
 
 
 
+// Stage 4 / smoke test: keep multiple independent QNN contexts live in one
+// process. Saved input samples are replayed independently; this is NOT yet a
+// tokenizer / KV-cache generation loop.
+struct ReplayJob {
+    std::string binary_path, graph_name, input_list, reference_dir;
+    std::vector<uint8_t> binary;
+    std::unique_ptr<SystemMetadata> metadata;
+    Qnn_GraphHandle_t handle = nullptr;
+    std::vector<std::vector<uint8_t>> input_buffers, output_buffers;
+    std::vector<Qnn_Tensor_t> inputs, outputs;
+    std::vector<fs::path> references;
+};
+
+std::vector<std::unique_ptr<ReplayJob>> parse_replay_jobs(const std::string& filename) {
+    std::ifstream stream(filename);
+    if (!stream) throw std::runtime_error("Cannot open --jobs: " + filename);
+    std::vector<std::unique_ptr<ReplayJob>> jobs;
+    std::string line;
+    size_t number = 0;
+    while (std::getline(stream, line)) {
+        ++number;
+        const auto first = line.find_first_not_of(" \\t\\r");
+        if (first == std::string::npos || line[first] == '#') continue;
+        auto job = std::make_unique<ReplayJob>();
+        std::istringstream input(line);
+        std::string extra;
+        if (!(input >> job->binary_path >> job->graph_name >>
+                  job->input_list >> job->reference_dir) || (input >> extra))
+            throw std::runtime_error("Invalid jobs line " + std::to_string(number) +
+                ": expected BINARY GRAPH INPUT_LIST REFERENCE_RESULT_0");
+        if (jobs.size() >= 3)
+            throw std::runtime_error("--jobs accepts at most 3 contexts in this smoke test");
+        jobs.push_back(std::move(job));
+    }
+    if (jobs.empty()) throw std::runtime_error("--jobs has no graph entries");
+    return jobs;
+}
+
+void prepare_replay_job(ReplayJob& job, const std::string& system_library) {
+    job.binary = read_file(job.binary_path);
+    job.metadata = std::make_unique<SystemMetadata>(system_library);
+    job.metadata->parse(job.binary);
+    const GraphView& graph = job.metadata->find(job.graph_name);
+    if (!graph.num_inputs || !graph.num_outputs)
+        throw std::runtime_error("Graph has no I/O: " + graph.name);
+    const auto paths = parse_qnn_input_list(job.input_list, graph);
+
+    job.inputs.assign(graph.inputs, graph.inputs + graph.num_inputs);
+    job.outputs.assign(graph.outputs, graph.outputs + graph.num_outputs);
+    job.input_buffers.resize(graph.num_inputs);
+    job.output_buffers.resize(graph.num_outputs);
+    const fs::path refdir(job.reference_dir);
+    if (!fs::is_directory(refdir))
+        throw std::runtime_error("Reference directory missing: " + job.reference_dir);
+    for (uint32_t i = 0; i < graph.num_inputs; ++i) {
+        const size_t required = tensor_nbytes(job.inputs[i]);
+        job.input_buffers[i] = read_file(paths[i].string());
+        if (job.input_buffers[i].size() != required)
+            throw std::runtime_error("Wrong input size for " + job.graph_name + " [" +
+                std::to_string(i) + "]: expected " + std::to_string(required) +
+                ", actual " + std::to_string(job.input_buffers[i].size()) +
+                " in " + paths[i].string());
+        bind_raw(job.inputs[i], job.input_buffers[i]);
+    }
+    for (uint32_t i = 0; i < graph.num_outputs; ++i) {
+        const size_t required = tensor_nbytes(job.outputs[i]);
+        job.output_buffers[i].resize(required);
+        bind_raw(job.outputs[i], job.output_buffers[i]);
+        const fs::path reference = refdir / native_basename(job.outputs[i], i);
+        if (!fs::is_regular_file(reference))
+            throw std::runtime_error("Missing reference for " + job.graph_name + ": " +
+                                     reference.string());
+        if (fs::file_size(reference) != required)
+            throw std::runtime_error("Wrong reference size for " + job.graph_name + ": " +
+                                     reference.string());
+        job.references.push_back(reference);
+    }
+    std::cout << "REPLAY_PREPARED: " << job.graph_name
+              << " inputs=" << graph.num_inputs << " outputs=" << graph.num_outputs
+              << " binary_bytes=" << job.binary.size() << "\\n" << std::flush;
+}
+
+int run_replay_jobs(const Options& options) {
+    auto jobs = parse_replay_jobs(options.jobs);
+    // Check all files, all tensor sizes and graph metadata BEFORE NPU init.
+    for (auto& job : jobs) prepare_replay_job(*job, options.system);
+    QnnRuntime runtime(options.backend);
+    // Critical property: load ALL contexts before executing ANY graph.
+    for (auto& job : jobs) {
+        const auto start = std::chrono::steady_clock::now();
+        job->handle = runtime.load(job->binary, job->graph_name);
+        const auto stop = std::chrono::steady_clock::now();
+        std::cout << "QNN_CONTEXT_READY: " << job->graph_name
+                  << " load_ms="
+                  << std::chrono::duration<double, std::milli>(stop - start).count()
+                  << "\\n" << std::flush;
+    }
+    std::cout << "PERSISTENT_CONTEXTS_READY: " << jobs.size()
+              << " graphs; one backend/device; all contexts alive\\n" << std::flush;
+
+    size_t total_outputs = 0;
+    for (auto& job : jobs) {
+        const auto start = std::chrono::steady_clock::now();
+        runtime.execute(job->handle, job->inputs, job->outputs);
+        const auto stop = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < job->references.size(); ++i) {
+            // This checks all bytes and throws at the first mismatch.
+            compare_reference(job->output_buffers[i], job->references[i].string());
+            ++total_outputs;
+        }
+        std::cout << "PERSISTENT_GRAPH_OK: " << job->graph_name
+                  << " outputs=" << job->outputs.size() << " execute_ms="
+                  << std::chrono::duration<double, std::milli>(stop - start).count()
+                  << "\\n" << std::flush;
+    }
+    std::cout << "ALL_JOBS_REFERENCES_MATCH: " << jobs.size()
+              << " graphs " << total_outputs << " output tensors\\n";
+    return 0;
+}
+
 int run(const Options& options) {
+    if (!options.jobs.empty()) return run_replay_jobs(options);
     // Context metadata owns tensor names, dimensions and quantization arrays.
     // Keep the System context and source binary alive through graphExecute.
     auto binary = read_file(options.binary);
