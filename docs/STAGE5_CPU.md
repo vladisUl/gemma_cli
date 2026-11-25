@@ -590,3 +590,35 @@ GEMMA4_PACKED_SECTION=2 bash scripts/test_packed_embedder.sh \
 `SELECT_V2`), `BUILTIN_2` заменён на `CONCATENATION`, и
 `SignatureDef.subgraph_index` читается из правильного поля 4
 (поле 3 — устаревший `deprecated_tag`).
+
+### Stage 5.7.1 — исправлена передача результата через RESHAPE (2026-11-25)
+
+На Q8B новый `gemma4-packed-embed` собрался, все четыре CTest прошли.
+Первый запуск Section0 с пробным `token=2` подтвердил вычисление последнего
+`MUL` с константой `39.1918`, но завершился ошибкой
+`PACKED_ERROR: no computed output tensor for original graph`.
+
+Причина в первоначальной реализации: она сознательно игнорировала
+`RESHAPE` в том числе после `MUL`, поэтому итоговый FLOAT32 буфер не
+попал в индекс выходного тензора FlatBuffer. Добавлена передача значений
+через `RESHAPE` только для уже вычисленных FLOAT32 embeddings с
+проверкой размерности; первый INT32 token-side RESHAPE по-прежнему не
+запускается. Это исправление **не прошло повторный тест на Q8B**.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+bash scripts/test_packed_embedder.sh 2>&1 | tee ~/gemma4_packed_embed0_retry.log
+```
+
+Ожидаемые дополнительные строки:
+
+```text
+PACKED_EMBED_MUL: scalar=39.1918
+PACKED_EMBED_RESHAPE: elements=1536 ...
+PACKED_EMBED_OK: ... bytes=6144
+PACKED_TEST_OK: section=0 output_bytes=6144 (not yet reference-verified)
+```
+
+Сверка с исходным FLOAT32 reference от конкретного токена нужна отдельно.
