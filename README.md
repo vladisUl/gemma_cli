@@ -98,6 +98,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 6.3.1 (код исправления в GitHub, ожидает Q8B):** обе Prefill-маски расходились ровно в **8103 байтах** нижнего причинного треугольника padding query rows 17..127; `time_step=0`, 4096 cache columns и первые 17 query rows совпали. `scripts/test_cpu_prefill_aux.py` теперь вычисляет zero suffix и преобразует только 127→INT8 -128 в этих 8103 элементах при строгом доказательстве отсутствия других ошибок. Добавлен синтетический `prefill_padding_unit` тест. Исходные TFLite и эталоны неизменны.
 
+**Stage 6.3.1 (Q8B доказан):** все 6 Section1 Prefill RoPE/mask входов байт-в-байт совпали с QNN, включая исправление только 8103 causal-allow байт для 111 padding query rows. Вместе с Stage 6.2 это все 8 не-KV входов Prefill (6 651 904 байта). **Stage 6.4 (код в GitHub, ожидает Q8B):** `gemma4-qnn-run` рассчитывает все 8 Prefill non-KV непосредственно через CPU Section0/1/2 в одном процессе и байт-в-байт сравнивает перед передачей в QNN; [scripts/test_cpu_full_prefill_decode.sh](scripts/test_cpu_full_prefill_decode.sh) сохраняет также двухшаговую регрессию Decode/LM Head. 28 Prefill initial KV и 30 Decode initial KV всё ещё из независимых saved QNN samples; их реальное связывание — отдельный Stage 6.5.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.

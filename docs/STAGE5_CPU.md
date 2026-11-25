@@ -1159,3 +1159,103 @@ PREFILL_AUX_ALL_MATCH: tensors=6 bytes=1277952 pos_start=0 time_step=0 verified_
 После успешной проверки можно будет объединять в Prefill QNN
 Section0+Section2 FLOAT32 embeddings и Section1 RoPE +
 явную padding-masked Section1 masks внутри одного процесса.
+
+## Stage 6.3.1 — подтверждён на Q8B: все шесть Prefill RoPE/mask выходов
+
+Пользователь прислал полный успешный тест Section1 Prefill 128:
+
+```text
+CPU_SIGNATURE_OK: prefill_rope_128 inputs=1 outputs=4
+PREFILL_AUX_SIGNATURE_OK: prefill_rope_128 outputs=4
+CPU_SIGNATURE_OK: prefill_mask_128 inputs=2 outputs=2
+PREFILL_MASK_PADDING_UNPATCHED: name=mask_local mismatching_bytes=8103 expected_padding_triangle=8103
+PREFILL_MASK_PADDING_APPLIED: name=mask_local rows=111 rewritten_bytes=8103 from_i8=127 to_i8=-128 reference_match=1
+PREFILL_MASK_PADDING_UNPATCHED: name=mask_global mismatching_bytes=8103 expected_padding_triangle=8103
+PREFILL_MASK_PADDING_APPLIED: name=mask_global rows=111 rewritten_bytes=8103 from_i8=127 to_i8=-128 reference_match=1
+PREFILL_AUX_SIGNATURE_OK: prefill_mask_128 outputs=2
+PREFILL_AUX_ALL_MATCH: tensors=6 bytes=1277952 pos_start=0 time_step=0 verified_against_saved_qnn=1
+```
+
+Таким образом, все восемь не-KV входов Prefill доказаны как CPU-вычислимые:
+
+- Section0/2 FLOAT32: 5373952 байта, INT2/INT4 на C++ без TFLite runtime;
+- Section1 INT8 RoPE/mask: 1277952 байта, TFLite 2.14.1 и
+  строго установленная треугольная query-padding коррекция;
+- Всего 6651904 байта/Prefill, все по независимым оригинальным QNN RAW
+  эталонам. Начальные 28 K/V Prefill пока из сохранённого input list.
+
+Реальные TFLite input signatures подтверждены на Q8B:
+`prefill_rope_128(input_pos INT32[128])`,
+`prefill_mask_128(input_tokens INT32[1,128],time_step INT32 scalar)`.
+Для проверенного образца `input_pos=[0..127]`, `time_step=0`,
+17 значащих ID и 111 нулевых padded IDs.
+
+## Stage 6.4 — первые общие CPU→QNN Prefill и Decode в одном процессе
+
+**Новый код ожидает теста на Q8B.** Функция
+`gemma4::run_prefill_aux` в `src/cpu_aux.cpp` теперь выполняет
+обе `prefill_*` сигнатуры в одной in-process TFLite 2.14.1
+интерпретации. Позиции/маски формируются по 128 INT32
+токенам, без посторонних RAW, и две маски корректируются строго
+по нулевому суффиксу: только causal-allow байты 127 у padded
+query rows заменяются на INT8 -128. Все остальные байты
+не трогаются.
+
+В `gemma4-qnn-run --jobs` добавлены четыре совместно обязательных
+аргумента:
+
+```text
+--cpu-prefill-tokens derived_prefill_128_token_ids_i32.raw
+--cpu-prefill-section0 cpu_models/Section0_TFLiteModel_tf_lite_embedder.tflite
+--cpu-prefill-section2 cpu_models/Section2_TFLiteModel_tf_lite_per_layer_embedder.tflite
+--cpu-prefill-aux-model cpu_models/Section1_TFLiteModel_tf_lite_aux.tflite
+```
+
+Перед NPU-выполнением `qnn_partition_2` из CPU вычисляются
+две FLOAT32 embeddings через packed INT2/INT4 (единственный mmap
+каждой модели и кеширование повторных ID) и шесть Section1 INT8
+RoPE/mask tensors. **Каждый** QNN input index, metadata dtype,
+имя и размер проверяются; затем все байты CPU результата сравниваются
+со старым input_buffer из сохранённого Prefill QNN sample.
+Только после byte-match соответствующий QNN input buffer заменяется
+вычисленным в памяти буфером. K/V не изменяются. При отличии
+хотя бы одного байта NPU ещё не инициализируется.
+
+Запуск реплея **полной цепочки проверенных контекстов** в порядке
+Decode → Prefill → LM Head; все 62 выхода по исходным эталонам;
+оба Decode шага также получают свои 8 CPU входов, а 30 K/V
+между шагами обновляются в RAM:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+bash scripts/test_cpu_full_prefill_decode.sh
+```
+
+Лог: `~/gemma4_qnn_test/cpu_full_prefill_decode.log`.
+Искомые **пока не подтверждённые** маркеры:
+
+```text
+CPU_PREFILL_PADDING_APPLIED: prefill_128_mask_local_0 first_pad=17 rewritten_bytes=8103 signed_int8=-128
+CPU_PREFILL_PADDING_APPLIED: prefill_128_mask_global_0 first_pad=17 rewritten_bytes=8103 signed_int8=-128
+CPU_PREFILL_ALL_NONKV_QNN_REPLACED: tensors=8 embeddings_bytes=5373952 aux_bytes=1277952 total_bytes=6651904 kv_inputs_from_saved=28 verified_against_saved_qnn=1
+ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors
+KV_NEXT_CACHE_MATCH: 30 cache tensors byte-identical
+DECODE_NEXT_REFERENCE_MATCH: 31 output tensors byte-identical
+DECODE_NEXT_HEAD_REFERENCE_MATCH: 262144 logits bytes identical
+CPU_FULL_PREFILL_DECODE_OK: Prefill-128 eight CPU inputs, 3 QNN graphs 62 outputs, two Decode steps and LM Head byte-identical
+```
+
+**Важная граница:** три QNN контекста исполняют самостоятельные
+референсные samples, а не одно и то же продолжение prompt.
+Initial Prefill-128 28 K/V inputs — из saved baseline, initial
+Decode 30 K/V — отдельно из saved step3. Prefill 30 output
+KV slices **ещё не передаются** в Decode cache. Даже при успехе
+Stage 6.4 это не автономный `prompt→prefill→decode` loop.
+
+Stage 6.5: определить правильную укладку 30 Prefill output slices
+в Decode K/V (слоты, слои, порядок K strided / V contiguous),
+инициализацию cache и позиции первого Decode; потом tokenizer
+и генерацию последовательных ID без saved QNN input.
