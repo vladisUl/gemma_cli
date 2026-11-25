@@ -82,6 +82,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 5.7.1 (исправление после теста Q8B):** `gemma4-packed-embed` собирается, но Section0 после `MUL` завершался ошибкой из-за непереданного завершающего `RESHAPE`. Исправлено в [src/packed_embedder.cpp](src/packed_embedder.cpp), ожидается повторное испытание и последующая побайтовая проверка.
 
+**Stage 5.7 (smoke-тесты Section0 и Section2 подтверждены на Q8B):** обе нативные C++ распаковки INT2/INT4 создают FLOAT32 нужной длины. Следующая строгая проверка — **Stage 5.8**: [scripts/verify_packed_embeddings.py](scripts/verify_packed_embeddings.py) автоматически ищет реальный token ID сохранённого QNN Decode по знакам INT2 и проверяет все 6144 байта Section0, затем все 35840 байт Section2 отдельно для шагов 3 и 4. Проверка ещё не запущена на Q8B.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.

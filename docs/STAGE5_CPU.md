@@ -622,3 +622,52 @@ PACKED_TEST_OK: section=0 output_bytes=6144 (not yet reference-verified)
 ```
 
 Сверка с исходным FLOAT32 reference от конкретного токена нужна отдельно.
+
+## Stage 5.8 — token ID из сохранённых QNN embeddings и строгая сверка Section0/2
+
+Пользователь подтвердил успешные smoke-tests **обоих** экспериментальных
+`gemma4-packed-embed` на Q8B после исправления завершающего RESHAPE.
+Это пока подтверждение корректной загрузки оригинальных TFLite, распаковки
+INT2/INT4, применения MUL и CONCAT и размеров выходных FLOAT32.
+**Точность полученных FLOAT32 до этого шага ещё не доказана.**
+
+Подготовлен `scripts/verify_packed_embeddings.py`:
+
+1. Разбирает оригинальные `auto_decode_step3_list.txt` / `auto_decode_step4_list.txt`
+   и извлекает входы QNN **[33] decode_embeddings_0 (6144 байта)** и
+   **[7] decode_per_layer_embeddings_0 (35840 байт)**.
+2. По знакам 32 FLOAT32 значений сохранённого Section0 ищет совпадающие
+   упакованные INT2-строки таблицы оригинальной модели. Для каждого из 262144
+   токенов проверяются только первые 8 байт строки (знаковые шаблоны INT2),
+   поэтому не требуется 262144 полных CPU-инференса.
+3. Каждый кандидат полностью пересчитывается `gemma4-packed-embed`; token ID
+   считается подтверждённым, **только если все 6144 байта Section0 совпадают**.
+4. С найденным token ID рассчитывает Section2 и сравнивает **35840 байт**
+   с сохранённым входом QNN этого же Decode. Любое различие — ошибка.
+5. Делает всё отдельно для шагов 3 и 4; оригиналы и QNN эталоны не изменяет.
+
+Нулевые/положительные/отрицательные значения исходной INT2-квантизации
+сохраняют знак при положительном per-token scale и при положительном
+Section0 MUL (`39.1918` на Q8B). Поэтому поиск лишь сокращает кандидатов;
+полный результат обязательно подтверждается строгой побайтовой сверкой.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+python3 scripts/verify_packed_embeddings.py --steps 3 \
+  2>&1 | tee ~/gemma4_packed_verify_step3.log
+```
+
+После успешного шага 3 можно проверить шаг 4:
+
+```bash
+python3 scripts/verify_packed_embeddings.py --steps 4 \
+  2>&1 | tee ~/gemma4_packed_verify_step4.log
+```
+
+Программа выводит `PACKED_TOKEN_CANDIDATES`,
+`PACKED_TOKEN_IDENTIFIED`, `PACKED_EMBED_REFERENCE_MATCH`,
+`PACKED_STEP_VERIFIED` — только при реальных совпадениях.
+Любое несовпадение показывает первый отличающийся байт, число
+несовпавших FLOAT32 и максимальную абсолютную разницу.
+Режим пока **не тестировался на Q8B**.
