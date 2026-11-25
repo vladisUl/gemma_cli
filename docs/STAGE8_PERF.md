@@ -444,3 +444,61 @@ Links:
 - QNN Profile API, QnnMem registration API
 
 No clock or thermal conclusions are drawn without measurements.
+
+### Stage 8.2 board results, 2026-11-25 — RAW profile works, MEMHANDLE probe fails
+
+User ran Stage 8.2 on Radxa Dragon Q8B / QAIRT 2.47. Original
+golden 2+2 regression passed. The RAW-only BASIC profile run
+(`--mode profile --steps 16 --profile-level basic`) succeeded:
+six graphExecute profiles (Decode and Head at steps 1, 2, 16),
+36 QNN events, types 400, 3001, 3002, 3004, 3012, 8001.
+Raw logs/report are available **on the board**, not committed:
+
+`/home/radxa/gemma4_qnn_test/bench_stage8_2_20261125_195245_u64dtd2b/profile_raw.log`
+
+| BASIC event | Decode step 1 (ms) | Decode step 2 (ms) | Decode step 16 (ms) |
+|---|---:|---:|---:|
+| Host graphExecute (steady_clock) | 81.055 | 67.830 | 69.236 |
+| 400 QNN execute | 81.043 | 67.819 | 69.220 |
+| 3001 RPC (execute) | 73.860 | 64.822 | 65.006 |
+| 3002 QNN accelerator (execute) | 71.655 | 63.799 | 63.994 |
+| 3004 Accelerator (execute) | 71.353 | 63.528 | 63.715 |
+| 3012 Accelerator excluding wait | 71.208 | 63.359 | 63.563 |
+
+All time-event entries have unit=1 (microseconds according to
+QnnProfile.h) and were converted to milliseconds above. Separate
+Head accelerator-excluding-wait values at steps 1, 2, 16 were
+11.106, 10.501, 10.559 ms. Events of type 8001 had unit=4,
+value=4, identifier `Number_of_HVX_threads_used`.
+
+**Interpretation**: At steps 2 and 16, about 63–64 ms appears in
+accelerator execution itself; the difference between total QNN
+graphExecute and the accelerator-excluding-wait event is ~4.46
+and ~5.66 ms. Thus host-only overhead outside the accelerator
+cannot trivially explain the ~73ms unprofiled Decode API latency.
+The accelerator event can still include internal memory traffic;
+this is not proof of raw operator compute cost or zero-copy.
+QNN profiling overhead may affect these numbers.
+
+The separate `--mode probe --probe-steps 8` ran its RAW golden
+successfully but **MEMHANDLE first candidate FAILED**:
+
+`QNN_RUN_ERROR: QnnGraph_execute: QNN error 1100`
+
+Board-side failing log:
+
+`/home/radxa/gemma4_qnn_test/bench_stage8_2_20261125_195450_nuz3xmw2/probe_memhandle.log`
+
+Code 1100 is `QNN_COMMON_ERROR_GENERAL` (=1000+100),
+not a specific API message proving that QnnMem_register failed.
+The exception arose at graphExecute, after the experimental
+Stage82KvMem constructor and registration completed. Before
+proceeding, inspect the failing log for
+`STAGE82_MEM_REGISTERED`, `STAGE82_KV_MIRROR_OK`,
+`BENCH81_STEP`, `STAGE82_CHECKSUM`, and backend driver errors.
+Do NOT report MEMHANDLE as supported, correct, or faster; RAW /
+MEMHANDLE output equivalence and long A/B have NOT passed.
+
+No production AOT, model, tokenizer or CLI changes were required.
+See QAIRT QnnCommon.h (GENERAL error), QnnProfile.h (MICROSEC unit),
+QnnHtpProfile.h (accelerator event meanings) for interpretation.
