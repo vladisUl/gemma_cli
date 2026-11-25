@@ -1937,3 +1937,53 @@ MAE вычисляется в деквантованных единицах с Q
 AB=0 указывает на независимость Prefill row0 от будущих токенов/pad
 в проверенном режиме. Если AB>0, нужно проверить causal mask,
 padding и CPU AUX входы. Маркер OK не доказывает семантическое совпадение.
+
+
+## Stage 6.12 — результат Q8B
+
+На реальной Q8B: `AB_mismatches=0/9216` для всех 30 K/V, `AC=BC=5449/9216` на позиции 0.
+BOS-only Prefill и Prefill(17 tokens) имеют побайтово одинаковые K/V первой строки.
+Это исключает влияние **будущих токенов и padding** на row0 в данном тесте;
+не доказывает равенство Prefill и Decode.
+
+## Stage 6.13 — сверка 8 не-KV входов первого токена (код, ожидает Q8B)
+
+Три источника: A = CPU-входы Prefill(BOS-only), B = уже проверенные
+CPU-входы Prefill(17 tokens), C = реальные 8 Decode входов
+перед QNN graphExecute(pos0, token2, нулевой KV) из Stage6.11.
+
+`PREFILL_FIRST_INPUT_TENSOR` логируется 8 раз:
+- `embeddings`: 6144 байта
+- `per_layer_embeddings`: 35840 байт
+- global RoPE sin/cos: 512 + 512
+- local RoPE sin/cos: 256 + 256
+- local/global attention masks: по 4097 байт
+
+Итого ровно 51714 байт общих подпространств входных тензоров.
+Для масок Prefill `[128,4224]`, Decode `[4097]`: сравнивается row0,
+колонки 0..4096, а дополнительные Prefill колонки 4097..4223
+публикуются отдельно (`mask_tail_masked/unmasked/other`).
+Полные буферы несовместимых размеров НЕ сравниваются.
+Для квантованных INT8 тензоров обязательно совпадение scale/offset.
+Печатаются `AB_mismatches`, `AC_mismatches`, `BC_mismatches`,
+`first_AC_offset`; итог `PREFILL_FIRST_INPUT_TOTAL`.
+
+Запуск:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+bash scripts/test_prefill_first_inputs.sh
+```
+
+Лог: `~/gemma4_qnn_test/cpu_prefill_first_inputs_stage6_13.log`.
+
+Интерпретация: если `AC_mismatches=0` для всех 8, первый токен
+Prefill и Decode получает одинаковые смысловые CPU-входы (при
+сравнимой области attention masks), и расхождение K/V нужно искать
+в самих QNN графах / вычислениях и в их операционной структуре.
+Если `AC>0`, нужно локализовать конкретный вход, проверить
+маски/RoPE/эмбеддинги, прежде чем обвинять NPU kernels.
+`_OK` означает только завершение диагностического режима.

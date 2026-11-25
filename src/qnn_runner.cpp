@@ -453,6 +453,7 @@ struct Options {
     bool prefill_seed_last_prompt = false;
     bool prefill_seed_first_prompt = false;
     bool prefill_bos_only_compare = false;
+    bool prefill_first_input_compare = false;
     bool prefill_tie_policy_set = false;
     bool prefill_allow_tie_lowest = false;
     bool prefill_kv_diagnose = false;
@@ -614,6 +615,8 @@ void usage(const char* executable) {
         << "  --prefill-seed-first-prompt: one-step independent Decode(pos0)\n"
         << "     using the first verified prompt ID and zero initial KV; compare\n"
         << "     its KV slices to Prefill row0 (diagnostic only).\n"
+        << "  --prefill-first-input-compare: Stage 6.13 compare 8 first-token\n"
+        << "     Prefill vs Decode non-KV input slices, including mask semantics.\n"
         << "  --prefill-bos-only-compare: Stage 6.12 A/B/C KV row0 control.\n"
         << "     Isolated Prefill BOS-only execution; needs first-token diagnostic.\n"
         << "  --prefill-kv-diagnose: read-only per-layer/row/layer-mapping INT8\n"
@@ -656,6 +659,10 @@ Options parse_options(int argc, char** argv) {
         }
         if (arg == "--prefill-seed-first-prompt") {
             options.prefill_seed_first_prompt = true;
+            continue;
+        }
+        if (arg == "--prefill-first-input-compare") {
+            options.prefill_first_input_compare = true;
             continue;
         }
         if (arg == "--prefill-bos-only-compare") {
@@ -892,6 +899,10 @@ Options parse_options(int argc, char** argv) {
             throw std::runtime_error(
                 "--prefill-bos-only-compare requires --prefill-seed-first-prompt, "
                 "--prefill-kv-diagnose and one Decode step");
+        if (options.prefill_first_input_compare &&
+            !options.prefill_bos_only_compare)
+            throw std::runtime_error(
+                "--prefill-first-input-compare requires --prefill-bos-only-compare");
         if (!options.kv_next_list.empty() && !options.kv_feedback)
             throw std::runtime_error("--kv-next-list requires --kv-feedback-pos or --kv-auto-pos");
         if (options.kv_auto_pos && options.kv_next_list.empty())
@@ -915,7 +926,8 @@ Options parse_options(int argc, char** argv) {
     if (options.prefill_kv_probe || options.prefill_kv_run ||
         options.prefill_kv_token_set || options.prefill_kv_steps_set ||
         options.prefill_seed_last_prompt || options.prefill_seed_first_prompt ||
-        options.prefill_bos_only_compare || options.prefill_tie_policy_set ||
+        options.prefill_bos_only_compare || options.prefill_first_input_compare ||
+        options.prefill_tie_policy_set ||
         options.prefill_kv_diagnose || options.chain_decode_head ||
         options.kv_feedback || options.kv_run_next ||
         !options.kv_next_list.empty() || !options.kv_next_reference_dir.empty() ||
@@ -2279,7 +2291,7 @@ void execute_prefill_linked_decode(
                  <<" numerical_equivalence_not_assumed=1\n"<<std::flush;
     }
     if(options.prefill_bos_only_compare)
-        run_stage6_12_bos_only(runtime,prefill,decode,kv,options);
+        run_stage6_12_bos_only(runtime,prefill,decode,kv,options,scratch_caches);
     execute_chained_decode_head(runtime,decode,head,hidden_index,true);
     std::cout<<"PREFILL_LINK_HEAD_OK: logits_bytes="<<head.output_buffers[0].size()
              <<" linked_prefill_kv=1"

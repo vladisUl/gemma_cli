@@ -116,6 +116,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 6.12 (код, ожидает Q8B):** [scripts/test_prefill_bos_only.sh](scripts/test_prefill_bos_only.sh) запускает отдельный Prefill-128 с BOS`2` и 127 pad, сравнивает KV row0 с исходным Prefill (17 токенов) и Decode(pos0, нулевой KV). Для 30 K/V: AB, AC, BC mismatches и деквантованный MAE. Без замены старых QNN-контекстов, RAW-эталонов и KV; успех теста означает завершение диагностики, а не численную эквивалентность.
 
+**Stage 6.13 (код, ожидает Q8B):** [scripts/test_prefill_first_inputs.sh](scripts/test_prefill_first_inputs.sh) побайтово проверяет 8 не-KV входов первого BOS (Prefill-A / Prefill-B / Decode-C), где A=Prefill(BOS-only), B=Prefill(17 tokens), C=Decode(pos0,нулевой KV). Сравниваются embeddings, per-layer embeddings, global/local RoPE и первые 4097 столбцов global/local mask; оставшиеся 127 столбцов маски Prefill учитываются отдельно. 30 выходных KV Stage 6.12 по-прежнему сравниваются. Только диагностика, без редактирования RAW, QNN contexts или KV.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.
