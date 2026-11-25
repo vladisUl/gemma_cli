@@ -671,3 +671,88 @@ python3 scripts/verify_packed_embeddings.py --steps 4 \
 Любое несовпадение показывает первый отличающийся байт, число
 несовпавших FLOAT32 и максимальную абсолютную разницу.
 Режим пока **не тестировался на Q8B**.
+
+## Stage 5.8 — оба embeddings на шаге 3 и 4 побайтово совпали
+
+Пользователь прислал подтверждённые результаты Q8B:
+
+```text
+PACKED_TOKEN_CANDIDATES: step=3 count=1 ids=[568]
+PACKED_TOKEN_IDENTIFIED: step=3 token=568 proof=Section0_6144_bytes_exact
+PACKED_EMBED_REFERENCE_MATCH: step=3 section=0 token=568 bytes=6144
+PACKED_EMBED_REFERENCE_MATCH: step=3 section=2 token=568 bytes=35840
+PACKED_STEP_VERIFIED: step=3 token=568 sections=0,2 total_bytes=41984
+PACKED_TOKEN_CANDIDATES: step=4 count=1 ids=[568]
+PACKED_TOKEN_IDENTIFIED: step=4 token=568 proof=Section0_6144_bytes_exact
+PACKED_EMBED_REFERENCE_MATCH: step=4 section=0 token=568 bytes=6144
+PACKED_EMBED_REFERENCE_MATCH: step=4 section=2 token=568 bytes=35840
+PACKED_STEP_VERIFIED: step=4 token=568 sections=0,2 total_bytes=41984
+```
+
+Таким образом, оригинальные INT2/INT4 модели Section0 и Section2
+воспроизведены собственным C++17 исполнителем `mmap` побайтово точно
+на обоих сохранённых Decode шагах: 2 × 41984 байта.
+
+## Stage 5.9 — 8 не-KV входов Decode вычисляются внутри gemma4-qnn-run
+
+**Новый код пока не испытан на Q8B.** Тот же `packed_embedder.cpp`,
+который прошёл строгую проверку Stage 5.8, собирается также в статическую
+библиотеку `gemma4-packed-embed-core` без main. Функция
+`gemma4::compute_packed_embedding` возвращает float32-байты напрямую
+в RAM. `gemma4-qnn-run` находит два входа Decode по метаданным QNN:
+
+- `decode_embeddings_0`: Section0, float32 [1,1,1536], 6144 байта;
+- `decode_per_layer_embeddings_0`: Section2, float32 [1,1,35,256], 35840 байт.
+
+По двум новым опциям моделей и ID токена runner вычисляет embeddings
+из оригинальных TFLite (не используя runtime TFLite для Section0/2),
+побайтово сверяет **сохранённые QNN-входы**, и только после совпадения
+заменяет ими QNN input_buffers. Section1 аналогично заменяет шесть AUX
+входов. На втором Decode 30 кэшей поступают из KV-feedback в RAM;
+два embeddings и шесть AUX заново вычисляются по следующим pos/token.
+Перезаписывать оригинальные .raw запрещено.
+
+Новые CLI-опции для jobs:
+
+```text
+--cpu-embed-section0 Section0_TFLiteModel_tf_lite_embedder.tflite
+--cpu-embed-section2 Section2_TFLiteModel_tf_lite_per_layer_embedder.tflite
+--cpu-embed-token 568
+--cpu-embed-next-token 568
+```
+
+Section1 mask-test продолжает использовать `--cpu-aux-token 2`
+(любое согласованное непустое значение); это **не тот же токен, который
+вычислен из сохранённого embeddings**. Для embeddings token=568
+подтверждён строгим сравнением.
+
+### Готовый тест (на Q8B)
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+bash scripts/test_cpu_full_nonkv_two_step.sh
+```
+
+Лог: `~/gemma4_qnn_test/cpu_full_nonkv_two_step.log`.
+Ключевые **ожидаемые**, пока не подтверждённые строки:
+
+```text
+CPU_EMBED_QNN_REPLACED: scope=first token=568 tensors=2 bytes=41984 verified_against_saved_decode=1
+CPU_AUX_QNN_REPLACED: tensors=6 bytes=9730 ... scope=first
+ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors
+KV_NEXT_CACHE_MATCH: 30 cache tensors byte-identical
+CPU_EMBED_QNN_REPLACED: scope=next token=568 tensors=2 bytes=41984 verified_against_saved_decode=1
+CPU_AUX_NEXT_QNN_REPLACED: tensors=6 bytes=9730 cpu_pos=4 cpu_token=2
+DECODE_NEXT_REFERENCE_MATCH: 31 output tensors byte-identical
+DECODE_NEXT_HEAD_REFERENCE_MATCH: 262144 logits bytes identical
+CPU_FULL_NONKV_TWO_STEP_OK: CPU Section0/1/2 all non-KV inputs + in-RAM KV feedback verified
+```
+
+**Граница:** у первого Decode начальные 30 полных K/V пока загружаются
+из сохранённых файлов эталона, Prefill входы пока из сохранённого
+списка, а tokenizer, выбор следующего ID и настоящий prompt → prefill →
+decode loop ещё не связаны. Поэтому этот этап не является
+полностью самостоятельной текстовой генерацией.

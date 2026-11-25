@@ -84,6 +84,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 5.7 (smoke-тесты Section0 и Section2 подтверждены на Q8B):** обе нативные C++ распаковки INT2/INT4 создают FLOAT32 нужной длины. Следующая строгая проверка — **Stage 5.8**: [scripts/verify_packed_embeddings.py](scripts/verify_packed_embeddings.py) автоматически ищет реальный token ID сохранённого QNN Decode по знакам INT2 и проверяет все 6144 байта Section0, затем все 35840 байт Section2 отдельно для шагов 3 и 4. Проверка ещё не запущена на Q8B.
 
+**Stage 5.8 (проверен на Q8B):** идентифицирован токен **568** для обоих Decode шагов 3/4, нативный Section0 INT2 совпал с QNN входом по всем 6144 байтам и Section2 INT4 по всем 35840 байтам **для каждого шага**. **Stage 5.9 (код в GitHub, ожидает проверку на Q8B):** прямое CPU Section0/1/2 → QNN в RAM для всех восьми не-KV входов обоих Decode; готов [scripts/test_cpu_full_nonkv_two_step.sh](scripts/test_cpu_full_nonkv_two_step.sh). Начальные 30 K/V и тестовые Prefill входы пока из сохранённых файлов.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.
