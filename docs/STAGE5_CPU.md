@@ -1094,3 +1094,68 @@ python3 scripts/diagnose_prefill_mask.py \
 почему исходный QNN sample использовал именно эту семантику маски.
 Если нет — изучить по отличиям actual/expected первую строку
 padding и проверить подготовку `time_step`/mask для sample.
+
+## Stage 6.3.1 — установлена точная геометрия расхождения padding mask
+
+На Q8B скрипт `diagnose_prefill_mask.py` подтвердил для обоих
+`mask_local` и `mask_global` при исходном `time_step=0`: 
+
+```text
+PREFILL_MASK_PADDING_BOUNDARY: first_zero=17 zero_suffix=111
+PREFILL_MASK_PROBE: candidate=original time_step=0 output=mask_local diff_bytes=8103 first_byte=75904 first_row=17 first_column=4096 actual=127 expected=128 prefix_rows_diff=0 cache_columns_diff=0 current_window_diff=8103 bad_rows=111
+PREFILL_MASK_PROBE: candidate=original time_step=0 output=mask_global diff_bytes=8103 first_byte=75904 first_row=17 first_column=4096 actual=127 expected=128 prefix_rows_diff=0 cache_columns_diff=0 current_window_diff=8103 bad_rows=111
+```
+
+Ровно **8103 = sum(r+1, r=17..127) = 128*129/2 - 17*18/2**.
+Это полный нижний причинный треугольник для 111 padded query rows.
+Первые 17 rows и все 4096 исторических cache columns совпадают.
+Пробные `time_step` 1,17,128 добавляют расхождения в cache columns,
+а замена padded `input_tokens` на 1/2 не меняет ошибки: Section1
+Prefill выдаёт causal-mask, а QNN эталон исключает padding query rows.
+Это выведено из совпадения структуры ошибок; точное направление
+маскирования подтверждается значениями CPU 127, QNN 128
+(для signed INT8 это -128).
+
+**Исправление**, только в `scripts/test_cpu_prefill_aux.py`:
+
+- после выполнения TFLite `prefill_mask_128` определяет границу
+  padding из строго восстановленных token IDs (нулевой suffix);
+- для каждой строки r начиная с padding boundary устанавливает
+  INT8 = -128 (байт `0x80`) только в текущем окне, для
+  causal columns `0..r` (смещение `r*4224 + 4096 + c`);
+- до преобразования требует **ровно 8103** исходных различий
+  на обеих масках, и на каждом ожидаемом байте пару (127,128);
+- после преобразования строго сравнивает все 540672 байта
+  `mask_local` и все 540672 байт `mask_global` с QNN.
+  Любое несоответствие вне треугольника блокирует успех.
+
+Эталонные `.raw` остаются read-only. Изменение выполняется только
+временной копии CPU-маски. Для Prefill здесь речь не об изменении
+оригинального TFLite, а о явном логическом query-padding mask
+после выполнения его исходного causal op.
+
+Добавлена стандартная синтетическая регрессия
+`scripts/test_prefill_padding_unit.py` (CTest при наличии Python3).
+Проверяются 8103 замен, неприкосновенность reference и
+отклонение неправильных байтов вне разрешённого треугольника.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+ctest --test-dir build --output-on-failure
+python3 scripts/test_cpu_prefill_aux.py \
+  2>&1 | tee ~/gemma4_prefill_aux_stage6_3_retry.log
+```
+
+**Пока повторный запуск на Q8B не подтверждён.** Искомые строки:
+
+```text
+PREFILL_MASK_PADDING_UNPATCHED: name=mask_local mismatching_bytes=8103 expected_padding_triangle=8103
+PREFILL_MASK_PADDING_APPLIED: name=mask_local rows=111 rewritten_bytes=8103 from_i8=127 to_i8=-128 reference_match=1
+PREFILL_MASK_PADDING_APPLIED: name=mask_global rows=111 rewritten_bytes=8103 from_i8=127 to_i8=-128 reference_match=1
+PREFILL_AUX_ALL_MATCH: tensors=6 bytes=1277952 pos_start=0 time_step=0 verified_against_saved_qnn=1
+```
+
+После успешной проверки можно будет объединять в Prefill QNN
+Section0+Section2 FLOAT32 embeddings и Section1 RoPE +
+явную padding-masked Section1 masks внутри одного процесса.

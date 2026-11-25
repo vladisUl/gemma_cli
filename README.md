@@ -96,6 +96,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 6.3 (Q8B выявил padding mismatch):** Section1 `prefill_mask_128` создаёт INT8 `[1,1,128,4224]`, но `mask_global` впервые расходится с QNN на байте **75904 = row17,col4096** — первой строке 111-позиционного padding после 17 настоящих токенов. RoPE часть прошла, маски **пока не подтверждены**. Добавлен [scripts/diagnose_prefill_mask.py](scripts/diagnose_prefill_mask.py) для безопасной read-only диагностики с controlled probes `time_step` и representation padding. Decode и packed Prefill embeddings остаются точными.
 
+**Stage 6.3.1 (код исправления в GitHub, ожидает Q8B):** обе Prefill-маски расходились ровно в **8103 байтах** нижнего причинного треугольника padding query rows 17..127; `time_step=0`, 4096 cache columns и первые 17 query rows совпали. `scripts/test_cpu_prefill_aux.py` теперь вычисляет zero suffix и преобразует только 127→INT8 -128 в этих 8103 элементах при строгом доказательстве отсутствия других ошибок. Добавлен синтетический `prefill_padding_unit` тест. Исходные TFLite и эталоны неизменны.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.
