@@ -92,6 +92,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 6.1 (подтверждён на Q8B):** строго восстановлены все 128 ID Prefill по 6144 байтам Section0 каждого токена: 17 значащих позиций + 111 нулевых позиций заполнения, 15 уникальных ID; создан 512-байтовый `derived_prefill_128_token_ids_i32.raw`. **Stage 6.2 (новый код, ожидает Q8B):** [gemma4-packed-prefill](src/packed_prefill.cpp) получает [1,128,1536] и [1,128,35,256] FLOAT32 из Section0/2 через один mmap каждой модели и кэш 15 уникальных токенов; [scripts/test_packed_prefill.py](scripts/test_packed_prefill.py) строго сравнивает оба массива (всего 5 373 952 байта) с входами Prefill QNN.
 
+**Stage 6.2 (Q8B подтверждён):** Section0/2 Prefill-128 embeddings побайтово совпали с эталоном по всем 5 373 952 байтам, Section2 использовал 15 уникальных токенов и один `mmap`. **Stage 6.3 (код в GitHub, ожидает Q8B):** [scripts/test_cpu_prefill_aux.py](scripts/test_cpu_prefill_aux.py) выполняет Section1 `prefill_rope_128` и `prefill_mask_128` через TFLite 2.14.1, сверяет оставшиеся 6 INT8 Prefill входов (1 277 952 байта) строго с QNN. Начальные позиции/time_step=0 — гипотеза, пока не подтверждённая эталоном.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.

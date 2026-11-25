@@ -967,3 +967,72 @@ Prefill non-KV входов, и лишь затем можно переводи�
 prefill graph QNN на полностью локальные входы.
 Перенос KV Prefill → Decode и tokenizer/generation loop остаётся
 отдельной задачей.
+
+## Stage 6.2 — Q8B подтвердил оба Prefill embeddings
+
+Пользователь прислал успешный конец теста
+`scripts/test_packed_prefill.py`: 
+
+```text
+PACKED_PREFILL_RAM_READY: section=2 positions=128 unique_tokens=15 bytes=4587520 mmap_count=1
+PACKED_PREFILL_REFERENCE_MATCH: section=2 bytes=4587520 positions=128
+PREFILL_EMBED_INPUT_MATCH: section=2 qnn_index=7 bytes=4587520 positions=128
+PREFILL_EMBED_ALL_MATCH: sections=0,2 tensors=2 bytes=5373952 positions=128 byte_identical=1
+```
+
+Сводный `PREFILL_EMBED_ALL_MATCH` подтверждает проверку и Section0
+(786432 байта), и Section2 (4587520 байт). Вычисления выполняются
+с оригинальными INT2/INT4 моделями без TFLite runtime, одним mmap
+на модель и кэшированием 15 уникальных ID.
+
+## Stage 6.3 — Section1 CPU Prefill RoPE + маски
+
+**Новый код ещё не проверен на Q8B.** Добавлен
+`scripts/test_cpu_prefill_aux.py`: читает из Section1 `.tflite`
+реальные `prefill_rope_128` / `prefill_mask_128` signature maps
+(имена, dtype и формы входов/выходов),
+формирует INT32 `input_tokens` из подтверждённого
+`derived_prefill_128_token_ids_i32.raw`, генерирует позиции
+и `time_step` для первого Prefill (по умолчанию 0), затем
+вызывает проверенный `gemma4-cpu-run` через системную TFLite 2.14.1.
+Каждый CPU-выход сверяется **байт-в-байт** с файлом из
+`prefill_real_input_list.txt`, без NPU и без изменений исходных файлов.
+
+| QNN input индекс | Имя | Байты |
+|---:|---|---:|
+| 3 | `prefill_128_pos_emb_cos_0` | 65536 |
+| 5 | `prefill_128_pos_emb_sin_0` | 65536 |
+| 6 | `prefill_128_pos_emb_local_sin_0` | 32768 |
+| 18 | `prefill_128_pos_emb_local_cos_0` | 32768 |
+| 21 | `prefill_128_mask_local_0` | 540672 |
+| 26 | `prefill_128_mask_global_0` | 540672 |
+| **Итого** | **6 INT8 тензоров** | **1277952** |
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+python3 scripts/test_cpu_prefill_aux.py \
+  2>&1 | tee ~/gemma4_prefill_aux_stage6_3.log
+```
+
+Ожидаемые (ещё не подтверждённые) итоговые строки:
+
+```text
+PREFILL_AUX_SIGNATURE_OK: prefill_rope_128 outputs=4
+PREFILL_AUX_SIGNATURE_OK: prefill_mask_128 outputs=2
+PREFILL_AUX_ALL_MATCH: tensors=6 bytes=1277952 pos_start=0 time_step=0 verified_against_saved_qnn=1
+```
+
+Если именованная сигнатура содержит неизвестные входы или CPU-выход
+отличается от эталона, программа **останавливается без успеха**.
+Для диагностики будут напечатаны `PREFILL_AUX_SIGNATURE_IO` и
+`CPU_RUN_ERROR` с исходными именами/типами.
+Параметры `--pos-start N` и `--time-step N` доступны, но
+изменять их наугад не следует: это лишь гипотеза о
+координатах исходного Prefill, пока сравнение её не подтвердило.
+
+После успеха Stage 6.3 все **восемь** не-KV Prefill входов
+будут доказаны как CPU-вычислимые (6 INT8 Section1 +
+2 FLOAT32 Section0/2). Далее их связываем в один QNN runtime
+и отдельно решаем init 28 входных KV и переход 30 выходных
+Prefill slices к Decode KV cache.
