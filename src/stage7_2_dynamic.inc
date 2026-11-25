@@ -206,7 +206,7 @@ void run_stage7_2_dynamic(
         decode->input_buffers[found]=std::move(value);
         return found;
     };
-    size_t executed=0,produced=0;
+    size_t executed=0,produced=0,tie_resolutions=0;
     int32_t token=seed;
     size_t position=seed_pos;
     bool eos=false;
@@ -244,16 +244,48 @@ void run_stage7_2_dynamic(
             if(q>best){best=q;id=static_cast<int32_t>(i);ties=1;}
             else if(q==best)++ties;
         }
+        if(ties>1) {
+            // Print the tied IDs from the actual current LM Head output,
+            // never imply that INT8 q distinguishes their FP32 ordering.
+            constexpr size_t kMaxDisplayed=64;
+            std::ostringstream candidates;
+            size_t emitted=0;
+            for(size_t i=0;i<logits.size();++i) {
+                const int q=logits[i]<128?int(logits[i]):int(logits[i])-256;
+                if(q!=best)continue;
+                if(emitted<kMaxDisplayed) {
+                    if(emitted)candidates<<",";
+                    candidates<<i;
+                }
+                ++emitted;
+            }
+            if(emitted!=ties)
+                throw std::runtime_error("DYNAMIC_TIE_COUNT_CHANGED");
+            std::cout<<"DYNAMIC_TIE_CANDIDATES: step="<<step
+                     <<" max_q="<<best<<" ties="<<ties
+                     <<" candidate_ids="<<candidates.str()
+                     <<" shown="<<std::min(emitted,kMaxDisplayed)
+                     <<" truncated="<<(emitted>kMaxDisplayed?1:0)
+                     <<" quantized_logits_only=1"
+                     <<" no_fp32_ranking_claim=1\n"<<std::flush;
+        }
         std::cout<<"DYNAMIC_GENERATED_TOKEN: step="<<step
                  <<" response_pos="<<(position+1)
                  <<" id="<<id<<" max_q="<<best
                  <<" ties="<<ties<<" input_pos="<<position
                  <<" input_token="<<token<<"\n"<<std::flush;
         if(ties!=1) {
-            std::cout<<"DYNAMIC_STOP_TIE: step="<<step
-                     <<" max_q="<<best<<" ties="<<ties
-                     <<" no_arbitrary_tiebreak=1\n"<<std::flush;
-            return;
+            if(!options.dynamic_allow_tie_lowest) {
+                std::cout<<"DYNAMIC_STOP_TIE: step="<<step
+                         <<" max_q="<<best<<" ties="<<ties
+                         <<" no_arbitrary_tiebreak=1\n"<<std::flush;
+                return;
+            }
+            ++tie_resolutions;
+            std::cout<<"DYNAMIC_TIE_RESOLVED: step="<<step
+                     <<" ties="<<ties<<" chosen_id="<<id
+                     <<" policy=lowest-id-experimental"
+                     <<" no_fp32_ranking_claim=1\n"<<std::flush;
         }
         if(id==1 || id==106 || id==50) {
             eos=true;
@@ -281,6 +313,7 @@ void run_stage7_2_dynamic(
     }
     std::cout<<"DYNAMIC_GENERATION_OK: npu_decode_steps="<<executed
              <<" text_tokens="<<produced
+             <<" tie_resolutions="<<tie_resolutions
              <<" stop_reason="<<(eos?"eos":"limit")
              <<" saved_QNN_inputs_used=0 saved_references_used=0"
              <<" all_CPU_nonKV=1 prefill_KV_in_RAM=1\n"<<std::flush;

@@ -86,5 +86,74 @@ class Stage73Unit(unittest.TestCase):
             parse_dynamic(log, VOCAB)
 
 
+    def test_tie_candidates_shown_but_no_arbitrary_output(self):
+        tied = ("DYNAMIC_GENERATED_TOKEN: step=2 response_pos=19 id=900"
+                " max_q=118 ties=2 input_pos=18 input_token=236778")
+        details = ("DYNAMIC_TIE_CANDIDATES: step=2 max_q=118 ties=2"
+                   " candidate_ids=900,1234 shown=2 truncated=0"
+                   " quantized_logits_only=1 no_fp32_ranking_claim=1")
+        log = "\n".join([
+            PREFIX, TOKEN1, details, tied,
+            "DYNAMIC_STOP_TIE: step=2 max_q=118 ties=2"
+            " no_arbitrary_tiebreak=1",
+        ])
+        r = parse_dynamic(log, VOCAB)
+        self.assertEqual(r["ids"], [236778])
+        self.assertEqual(r["text"], "2")
+        self.assertEqual(r["stop_reason"], "tie")
+        self.assertEqual(r["tie_details"][-1]["candidate_ids"], [900, 1234])
+        self.assertEqual(r["tie_details"][-1]["candidate_pieces"][0], "▁+")
+        self.assertFalse(r["experimental_tie_break"])
+
+    def test_explicit_lowest_id_tie_resolves_with_warning_metadata(self):
+        tied = ("DYNAMIC_GENERATED_TOKEN: step=2 response_pos=19 id=900"
+                " max_q=118 ties=2 input_pos=18 input_token=236778")
+        details = ("DYNAMIC_TIE_CANDIDATES: step=2 max_q=118 ties=2"
+                   " candidate_ids=900,1234 shown=2 truncated=0"
+                   " quantized_logits_only=1 no_fp32_ranking_claim=1")
+        resolved = ("DYNAMIC_TIE_RESOLVED: step=2 ties=2 chosen_id=900"
+                    " policy=lowest-id-experimental no_fp32_ranking_claim=1")
+        third = ("DYNAMIC_GENERATED_TOKEN: step=3 response_pos=20 id=106"
+                 " max_q=120 ties=1 input_pos=19 input_token=900")
+        log = "\n".join([
+            PREFIX, TOKEN1, details, tied, resolved, third,
+            "DYNAMIC_STOP_EOS: step=3 eos_id=106 eos_not_submitted_to_decode=1",
+            "DYNAMIC_GENERATION_OK: npu_decode_steps=3 text_tokens=2"
+            " tie_resolutions=1 stop_reason=eos",
+        ])
+        r = parse_dynamic(log, VOCAB)
+        self.assertEqual(r["ids"], [236778, 900, 106])
+        self.assertEqual(r["text"], "2 +")
+        self.assertTrue(r["complete"])
+        self.assertTrue(r["experimental_tie_break"])
+        self.assertEqual(r["tie_resolutions"], 1)
+
+    def test_forged_tie_resolution_is_rejected(self):
+        tied = ("DYNAMIC_GENERATED_TOKEN: step=2 response_pos=19 id=900"
+                " max_q=118 ties=2")
+        wrong = ("DYNAMIC_TIE_RESOLVED: step=2 ties=2 chosen_id=1234"
+                 " policy=lowest-id-experimental no_fp32_ranking_claim=1")
+        log = "\n".join([
+            PREFIX, TOKEN1, tied, wrong,
+            "DYNAMIC_GENERATION_OK: npu_decode_steps=2 text_tokens=2"
+            " tie_resolutions=1 stop_reason=limit",
+        ])
+        with self.assertRaisesRegex(GenerationParseError, "Untrusted tie"):
+            parse_dynamic(log, VOCAB)
+
+    def test_experiment_requires_tie_count_in_final_summary(self):
+        tied = ("DYNAMIC_GENERATED_TOKEN: step=2 response_pos=19 id=900"
+                " max_q=118 ties=2")
+        resolved = ("DYNAMIC_TIE_RESOLVED: step=2 ties=2 chosen_id=900"
+                    " policy=lowest-id-experimental no_fp32_ranking_claim=1")
+        log = "\n".join([
+            PREFIX, TOKEN1, tied, resolved,
+            "DYNAMIC_GENERATION_OK: npu_decode_steps=2 text_tokens=2"
+            " stop_reason=limit",
+        ])
+        with self.assertRaisesRegex(GenerationParseError, "Unreported"):
+            parse_dynamic(log, VOCAB)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -45,56 +45,126 @@ def decode_ids(ids, reverse_vocab):
 
 
 def parse_dynamic(log, reverse_vocab):
-    """Never include the arbitrary first argmax if its INT8 maximum was tied."""
+    """Parse exact QNN steps; distinguish safe ties from explicit experiments."""
     lines = log.splitlines()
     required = ("DYNAMIC_PROMPT_READY:", "DYNAMIC_PREFILL_NPU_OK:",
                 "DYNAMIC_KV_BRIDGE_OK:")
     for marker in required:
         if not any(line.startswith(marker) for line in lines):
             raise GenerationParseError("Missing " + marker)
-    candidates = [
-        line for line in lines if line.startswith("DYNAMIC_GENERATED_TOKEN:")
-    ]
+
+    candidates = [line for line in lines
+                  if line.startswith("DYNAMIC_GENERATED_TOKEN:")]
     if not candidates:
         raise GenerationParseError("No DYNAMIC_GENERATED_TOKEN lines")
+
+    def indexed(marker):
+        result = {}
+        for line in lines:
+            if not line.startswith(marker):
+                continue
+            step = field(line, "step")
+            if step in result:
+                raise GenerationParseError("Duplicate " + marker)
+            result[step] = line
+        return result
+
+    tie_candidates = indexed("DYNAMIC_TIE_CANDIDATES:")
+    tie_resolved = indexed("DYNAMIC_TIE_RESOLVED:")
+    stops = [line for line in lines if line.startswith("DYNAMIC_STOP_EOS:")]
+    ambiguous = [line for line in lines if line.startswith("DYNAMIC_STOP_TIE:")]
+    summaries = [line for line in lines
+                 if line.startswith("DYNAMIC_GENERATION_OK:")]
+
+    def inspect_tie(step, tid, ties, logit_q):
+        record = tie_candidates.get(step)
+        if record is None:
+            # Logs created before Stage 7.4 didn't include candidates.
+            return None
+        if (field(record, "ties") != ties or
+                field(record, "max_q") != logit_q):
+            raise GenerationParseError("Tie candidate metadata mismatch")
+        match = re.search(r"\bcandidate_ids=([0-9,]+)\b", record)
+        if not match:
+            raise GenerationParseError("Missing candidate token IDs")
+        all_ids = [int(s) for s in match.group(1).split(",")]
+        shown = field(record, "shown")
+        truncated = field(record, "truncated")
+        if (len(all_ids) != shown or shown > ties or
+                truncated not in (0, 1) or
+                (truncated == 0 and shown != ties) or
+                (truncated == 1 and shown >= ties) or
+                not all(0 <= t < 262144 for t in all_ids) or
+                all_ids != sorted(set(all_ids)) or
+                all_ids[0] != tid):
+            raise GenerationParseError("Malformed tie candidate list")
+        return {
+            "step": step, "candidate_ids": all_ids,
+            "candidate_pieces": [
+                reverse_vocab.get(i, "(unknown)") for i in all_ids
+            ],
+            "count": ties, "truncated": bool(truncated)
+        }
+
     ids = []
-    tie_step = None
-    tie_count = None
+    tie_details = []
+    resolved_count = 0
+    stopped_at = None
     for index, line in enumerate(candidates, 1):
         if field(line, "step") != index:
             raise GenerationParseError("Nonconsecutive Decode step")
         tid = field(line, "id")
         ties = field(line, "ties")
+        quant = field(line, "max_q")
         if ties < 1 or tid < 0 or tid >= 262144:
             raise GenerationParseError("Invalid INT8 token candidate")
-        if ties != 1:
-            if index != len(candidates):
-                raise GenerationParseError("Decode ran after ambiguous INT8 argmax")
-            tie_step, tie_count = index, ties
-            break
+        if ties == 1:
+            if index in tie_candidates or index in tie_resolved:
+                raise GenerationParseError("Unexpected tie metadata")
+        else:
+            details = inspect_tie(index, tid, ties, quant)
+            if details:
+                tie_details.append(details)
+            resolved = tie_resolved.get(index)
+            if resolved is None:
+                if index != len(candidates):
+                    raise GenerationParseError(
+                        "Decode ran after unresolved INT8 tie")
+                stopped_at = (index, ties)
+                break
+            if (field(resolved, "ties") != ties or
+                    field(resolved, "chosen_id") != tid or
+                    "policy=lowest-id-experimental" not in resolved or
+                    "no_fp32_ranking_claim=1" not in resolved):
+                raise GenerationParseError("Untrusted tie resolution")
+            resolved_count += 1
         ids.append(tid)
         if tid in STOP_IDS and index != len(candidates):
             raise GenerationParseError("Decode ran after EOS")
 
-    stops = [line for line in lines if line.startswith("DYNAMIC_STOP_EOS:")]
-    ambiguous = [line for line in lines if line.startswith("DYNAMIC_STOP_TIE:")]
-    summaries = [line for line in lines if line.startswith("DYNAMIC_GENERATION_OK:")]
+    if len(tie_candidates) > len(tie_details):
+        raise GenerationParseError("Unexpected tie candidates")
+    if len(tie_resolved) != resolved_count:
+        raise GenerationParseError("Unexpected tie-resolution markers")
 
-    if tie_step is not None:
+    if stopped_at is not None:
+        step, count = stopped_at
         if len(ambiguous) != 1 or summaries or stops:
             raise GenerationParseError("Ambiguous prediction lacks stop marker")
-        if field(ambiguous[0], "step") != tie_step:
-            raise GenerationParseError("Wrong tie-stop position")
-        if field(ambiguous[0], "ties") != tie_count:
-            raise GenerationParseError("Tie count disagreement")
+        if (field(ambiguous[0], "step") != step or
+                field(ambiguous[0], "ties") != count):
+            raise GenerationParseError("Tie stop count/position mismatch")
         return {
             "text": decode_ids(ids, reverse_vocab),
             "ids": ids, "stop_reason": "tie",
-            "steps": len(candidates), "tie_count": tie_count,
+            "steps": len(candidates), "tie_count": count,
+            "tie_details": tie_details,
+            "tie_resolutions": resolved_count,
+            "experimental_tie_break": resolved_count > 0,
             "complete": False
         }
 
-    if len(summaries) != 1 or len(ambiguous) != 0:
+    if len(summaries) != 1 or ambiguous:
         raise GenerationParseError("Missing unique final generation summary")
     stop_reason = re.search(r"\bstop_reason=(eos|limit)\b", summaries[0])
     if not stop_reason:
@@ -104,18 +174,25 @@ def parse_dynamic(log, reverse_vocab):
         raise GenerationParseError("NPU executed step count mismatch")
     if field(summaries[0], "text_tokens") != sum(t not in STOP_IDS for t in ids):
         raise GenerationParseError("Text token count mismatch")
+    count_match = re.search(r"\btie_resolutions=(\d+)\b", summaries[0])
+    if count_match and int(count_match.group(1)) != resolved_count:
+        raise GenerationParseError("Tie resolution count mismatch")
+    if resolved_count and not count_match:
+        raise GenerationParseError("Unreported experimental tie resolutions")
     if reason == "eos":
         if len(stops) != 1 or ids[-1] not in STOP_IDS:
             raise GenerationParseError("EOS stop not supported by token ID")
         if field(stops[0], "eos_id") != ids[-1]:
             raise GenerationParseError("EOS stop ID mismatch")
-    else:
-        if stops or any(t in STOP_IDS for t in ids):
-            raise GenerationParseError("Limit stop has EOS")
+    elif stops or any(t in STOP_IDS for t in ids):
+        raise GenerationParseError("Limit stop has EOS")
     return {
         "text": decode_ids(ids, reverse_vocab),
         "ids": ids, "stop_reason": reason,
-        "steps": len(candidates), "complete": reason == "eos"
+        "steps": len(candidates), "complete": reason == "eos",
+        "tie_details": tie_details,
+        "tie_resolutions": resolved_count,
+        "experimental_tie_break": resolved_count > 0
     }
 
 

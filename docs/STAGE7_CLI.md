@@ -84,3 +84,43 @@ python3 scripts/gemma4_cli.py
 ```
 
 **Status:** Stage 7.3 code committed, not yet compiled/tested on Q8B.
+
+
+## Stage 7.3 — Q8B confirmed
+
+The terminal frontend was tested on the Dragon Q8B: the one-shot command
+returned `Gemma 4> 3 + 5 = **8**`. Interactive input successfully
+answered `ты кто` in Russian; `привет как дела` and
+`что ты умеешь` showed partial valid text followed by an explicit
+INT8-argmax-tie stop. These are distinct from context-loading errors.
+
+## Stage 7.4 — explicit experimental tie handling
+
+Stage 7.4 adds `--dynamic-tie-policy stop|lowest-id` on
+`gemma4-qnn-run --dynamic-prefill`, and `--tie-policy stop|lowest-id`
+in `scripts/gemma4_cli.py`. Default is `stop`, identical to the
+previous behavior. At ties C++ emits:
+- `DYNAMIC_TIE_CANDIDATES`: exact maximum INT8 value, total ties,
+  up to the first 64 ascending candidate IDs (truncation declared)
+- `DYNAMIC_STOP_TIE`: if default policy is `stop`; **no tied
+  candidate is included in the displayed response**
+- `DYNAMIC_TIE_RESOLVED`: ONLY if the user explicitly selected
+  `lowest-id`; includes chosen ID and `no_fp32_ranking_claim=1`
+
+The Python log parser validates candidate IDs and explicit resolution,
+counts experimentally resolved ties, and gives a warning in the
+terminal if any were selected. It cannot recover the original FP32
+ranking from the quantized INT8 values and makes no such claim.
+The default mode remains cautious and backwards-compatible.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+python3 scripts/gemma4_cli.py --text 'Что ты умеешь?'
+python3 scripts/gemma4_cli.py --text 'Что ты умеешь?' --tie-policy lowest-id
+```
+
+**Status:** Stage7.4 source committed but not yet compiled or NPU-tested
+on Q8B; previous Stage7.3 behavior was confirmed on device.

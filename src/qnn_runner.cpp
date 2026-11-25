@@ -460,6 +460,8 @@ struct Options {
     bool prefill_allow_tie_lowest = false;
     bool prefill_stop_on_eos = false;
     bool dynamic_prefill = false;
+    bool dynamic_tie_policy_set = false;
+    bool dynamic_allow_tie_lowest = false;
     std::string dynamic_prompt_tokens,dynamic_section0,dynamic_section1,dynamic_section2;
     uint32_t dynamic_max_tokens = 16;
     bool prefill_kv_diagnose = false;
@@ -616,6 +618,8 @@ void usage(const char* executable) {
         << "     --dynamic-prompt-tokens FILE --dynamic-section0 MODEL0\n"
         << "     --dynamic-section1 MODEL1 --dynamic-section2 MODEL2\n"
         << "     optional --dynamic-max-tokens N (1..32, default 16).\n"
+        << "  --dynamic-tie-policy stop|lowest-id (default stop):\n"
+        << "     lowest-id is EXPERIMENTAL, quantized-tie only, no FP32 claim.\n"
         << "  --prefill-stop-on-eos: LF107 continuation; EOS ids 1,106,50 stop.\n"
         << "  --prefill-tie-policy stop|lowest-id (default stop): print all tied\n"
         << "     INT8 max IDs; lowest-id allows an EXPERIMENTAL tie-break only.\n"
@@ -741,6 +745,14 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--dynamic-section0") options.dynamic_section0 = value;
         else if (arg == "--dynamic-section1") options.dynamic_section1 = value;
         else if (arg == "--dynamic-section2") options.dynamic_section2 = value;
+        else if (arg == "--dynamic-tie-policy") {
+            if(options.dynamic_tie_policy_set ||
+               (value!="stop" && value!="lowest-id"))
+                throw std::runtime_error(
+                    "--dynamic-tie-policy must be stop or lowest-id exactly once");
+            options.dynamic_tie_policy_set=true;
+            options.dynamic_allow_tie_lowest=(value=="lowest-id");
+        }
         else if (arg == "--dynamic-max-tokens") {
             if(value.empty() || value.front()=='-')
                 throw std::runtime_error("--dynamic-max-tokens expects 1..32");
@@ -885,6 +897,8 @@ Options parse_options(int argc, char** argv) {
                     "optional --dynamic-max-tokens");
             return options;
         }
+        if(options.dynamic_tie_policy_set)
+            throw std::runtime_error("--dynamic-tie-policy requires --dynamic-prefill");
         if(!options.dynamic_prompt_tokens.empty() ||
            !options.dynamic_section0.empty() ||
            !options.dynamic_section1.empty() ||
@@ -1016,7 +1030,8 @@ Options parse_options(int argc, char** argv) {
             throw std::runtime_error("--jobs cannot be combined with single-graph options");
         return options;
     }
-    if (options.dynamic_prefill || !options.dynamic_prompt_tokens.empty() ||
+    if (options.dynamic_prefill || options.dynamic_tie_policy_set ||
+        !options.dynamic_prompt_tokens.empty() ||
         !options.dynamic_section0.empty() || !options.dynamic_section1.empty() ||
         !options.dynamic_section2.empty() || options.dynamic_max_tokens!=16 ||
         options.prefill_kv_probe || options.prefill_kv_run ||

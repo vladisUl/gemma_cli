@@ -66,7 +66,7 @@ def save_error_log(work, log):
     return destination
 
 
-def generate(text, work, runner, max_tokens):
+def generate(text, work, runner, max_tokens, tie_policy='stop'):
     """Run exactly one fresh request, return decoded response JSON."""
     if not text.strip():
         raise CliError("Empty user question")
@@ -110,6 +110,8 @@ def generate(text, work, runner, max_tokens):
                 work / "cpu_models/Section2_TFLiteModel_tf_lite_per_layer_embedder.tflite"),
             "--dynamic-max-tokens", str(max_tokens),
         ]
+        if tie_policy != "stop":
+            command.extend(["--dynamic-tie-policy", tie_policy])
         with log_path.open("wb") as log_file:
             status = subprocess.run(
                 command, cwd=work, env=env, stdout=log_file,
@@ -148,6 +150,10 @@ def main():
     parser.add_argument("--text", help="One-shot question; omit for terminal loop")
     parser.add_argument("--max-tokens", type=int, default=32,
                         help="Max QNN Decode predictions per question, 1..32")
+    parser.add_argument("--tie-policy", choices=("stop", "lowest-id"),
+                        default="stop",
+                        help="INT8 max tie: stop (default), or experimental lowest-id; "
+                             "cannot recover the true FP32 ordering")
     parser.add_argument("--workdir", type=Path, default=DEFAULT_WORK)
     parser.add_argument("--runner", type=Path,
                         default=ROOT / "build/gemma4-qnn-run")
@@ -162,13 +168,32 @@ def main():
     runner_ready(runner)
 
     def ask(question):
-        result = generate(question, work, runner, args.max_tokens)
+        result = generate(question, work, runner, args.max_tokens,
+                          tie_policy=args.tie_policy)
         print("Gemma 4> " + result["text"], flush=True)
+        if result.get("experimental_tie_break"):
+            count = result.get("tie_resolutions", 0)
+            print("[Экспериментальная генерация: неоднозначных INT8 "
+                  f"максимумов разрешено: {count}. Выбраны минимальные ID; "
+                  "правильность FP32-порядка не установлена.]",
+                  flush=True)
         if result["stop_reason"] == "limit":
             print("[Лимит токенов: ответ может быть неполным.]", flush=True)
         elif result["stop_reason"] == "tie":
             print("[Остановка: неоднозначный INT8 максимум; "
                   "токен не выбирался произвольно.]", flush=True)
+            details = result.get("tie_details", [])
+            if details:
+                last = details[-1]
+                snippets = [
+                    f"{tid}: {piece!r}" for tid, piece in zip(
+                        last["candidate_ids"][:12],
+                        last["candidate_pieces"][:12])
+                ]
+                print("[Кандидаты одинакового INT8 максимума: " +
+                      ", ".join(snippets) +
+                      ("; список сокращён" if last["truncated"] else "") +
+                      "]", flush=True)
         return result
 
     if args.text is not None:
