@@ -112,6 +112,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 6.9 (Q8B подтверждён):** `PREFILL_TIE_STAGE6_9_OK`; после первого prompt-conditioned ID236921 на pos17 два равных INT8 максимума — **152294,236787**. Только экспериментальный `lowest-id` выбрал 152294 для Decode(pos18), где Head выдал ID236888 (logit124, ties1). **Обнаружено серьёзное расхождение Prefill/Decode KV:** повтор последнего токена4368 на pos16 даёт 6975 несовпадающих байт из 9216 (75.68%), точных тензоров 0/30; не списывать это на обычное округление. **Stage 6.10 (новая диагностика, ждёт Q8B):** [scripts/test_prefill_kv_diagnostics.sh](scripts/test_prefill_kv_diagnostics.sh) анализирует все 30 K/V по signed INT8 дельтам, временному смещению и совместимости layer mapping/quant без изменения кешей или старых эталонов. До прояснения этого расхождения нельзя считать модельную генерацию семантически проверенной.
 
+**Stage 6.10 (Q8B подтверждён):** для всех 30 K/V правильные Prefill row16 и source layer; 6975/9216 байт отличаются, но signed INT8 |delta|=1: 2911, |delta|=2: 1407, >2: 2657. Особенно заметны 512-канальные K/V (2766/3072 отличаются, abs max27). **Stage 6.11 (код в GitHub, ожидает Q8B):** [scripts/test_prefill_first_row_kv.sh](scripts/test_prefill_first_row_kv.sh) выполняет Decode(pos0, ID2) с полностью нулевыми K/V и сравнивает 30 срезов с Prefill row0; [scripts/compare_prefill_kv_diagnostics.py](scripts/compare_prefill_kv_diagnostics.py) сравнивает отчёты row0 и row16 по K/V и каналам. Это диагностика причины расхождения, а не автоматическое изменение KV; полный text CLI пока не подтверждён.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.

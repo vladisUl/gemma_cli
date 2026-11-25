@@ -1796,3 +1796,105 @@ PREFILL_KV_STAGE6_10_OK: all 30 KV tensors inspected; original reference data un
 подтверждения модели/токенизатора и стратегии работы с
 INT8 ties. Успех `PREFILL_KV_STAGE6_10_OK` означает лишь
 получение всех диагностик, а не устранение расхождения.
+
+## Stage 6.10 — Q8B подтвердил корректные строки/слои, но KV численно расходятся
+
+Пользователь прислал полный 30-тензорный отчёт
+`PREFILL_KV_DIAG_TENSOR` и агрегат:
+
+```text
+PREFILL_KV_DIAG_SUMMARY: tensors=30 compared_bytes=9216 mismatched_bytes=6975 best_same_tensor_row_is_expected=30 best_compatible_layer_is_expected=30 exact_some_same_tensor_row=0 exact_some_compatible_layer=0 no_relabel_or_patch_applied=1 diagnostic_only=1
+PREFILL_LAST_PROMPT_KV_COMPARE: tensors=30 compared_bytes=9216 mismatching_bytes=6975 exact_tensors=0 bit_exact=0 position=16 numerical_equivalence_not_assumed=1
+```
+
+**Доказанное уточнение к Stage 6.9:** никакого правильного
+альтернативного row либо layer mapping обнаружить не удалось.
+Для **всех 30** лучшими остаются собственный тензор и
+временная строка16. Из 9216 байт несовпадают 6975 (75.68%),
+но величины INT8 отличий распределены неравномерно:
+
+| Группа | Байт | Не совпало | Доля |
+|---|---:|---:|---:|
+| K (15 tensors) | 4608 | 3221 | 69.9% |
+| V (15 tensors) | 4608 | 3754 | 81.5% |
+| Кэш-каналы 256 (24 tensors) | 6144 | 4209 | 68.5% |
+| Кэш-каналы 512 (6 tensors) | 3072 | 2766 | 90.0% |
+
+Различие signed INT8 по абсолютной величине:
+ровно1 — **2911** байт, ровно2 — **1407** байт,
+больше2 — **2657** байт; максимум27. Из >2 отклонений
+**1890** относятся к 512-канальным тензорам (3072 байта),
+**767** — к 256-канальным (6144 байта).
+Суммарная абсолютная signed INT8 дельта по всем 9216
+байтам **20423**.
+
+Все 256-канальные K преимущественно отличаются на1..2;
+512-канальные K/V показывают усиленные различия
+(например `k_14` max24, `v_14` max27).
+Это **согласуется** с численной чувствительностью/накоплением
+ошибок в некоторых слоях, но пока **не доказывает** причину.
+Режим Stage 6.10 не изменил ни одного QNN входа или KV.
+
+## Stage 6.11 — изолированный численный тест без истории: Decode pos0 vs Prefill row0
+
+**Новый код в GitHub, Q8B ещё не проверял.**
+Добавлен флаг `--prefill-seed-first-prompt`,
+который исключает все Prefill KV из входного Decode
+и вместо последнего ID воспроизводит **первый реальный
+ID=2** исходного prompt на **позиции0** с **30 нулевыми
+K/V кэшами**. Исходные 28 Prefill cache уже проверены
+нулевыми в Stage6.6. Важно: запрет на ненулевые
+cache offset/quant по-прежнему действует.
+
+В отличие от стандартного Stage6.8, этот эксперимент
+сравнивает 30 выходных Decode KV slices с соответствующими
+**нулевыми строками** 30 Prefill blocks. После сравнения
+печатаются `PREFILL_FIRST_PROMPT_KV_COMPARE` и подробные
+`PREFILL_KV_DIAG_TENSOR` по всем слоям, времени и
+INT8-разнице. Результаты НЕ подменяют нормальный K/V.
+Ввиду потенциальных разных QNN kernels полное байтовое
+совпадение не предполагается — проверяем распределение и
+величину расхождений.
+
+Изолированная оболочка `scripts/test_prefill_first_row_kv.sh`
+запускает стандартный byte-exact baseline Decode/Prefill/Head,
+после чего отдельно один `Decode(pos0,token2)` и LM Head;
+требует проверки всех 30 KV slices, 38 CPU/KV входов и
+отсутствия сохранённых Decode input bytes.
+Лог Stage6.11:
+`~/gemma4_qnn_test/cpu_prefill_first_row_stage6_11.log`.
+
+Дополнительный stdlib-only скрипт
+`scripts/compare_prefill_kv_diagnostics.py` автоматически
+сравнивает количественные отчёты pos0 и сохранённый
+`cpu_prefill_kv_diagnostic_stage6_10.log` pos16.
+Группирует K/V по 256/512 каналам и считает процент
+несовпадающих байт и среднюю абсолютную signed INT8 дельту.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+bash scripts/test_prefill_first_row_kv.sh
+```
+
+Контрольные строки, ещё **не подтверждённые Q8B**:
+
+```text
+PREFILL_FIRST_PROMPT_SEED: prompt_tokens=17 replay_position=0 replay_token=2 kv_rows_from_prefill=0 all_KV_raw_zero=1 no_previous_attention_context=1
+PREFILL_FIRST_PROMPT_KV_COMPARE: tensors=30 compared_bytes=9216 mismatching_bytes=... exact_tensors=... bit_exact=... position=0
+PREFILL_KV_DIAG_SUMMARY: tensors=30 compared_bytes=9216 ...
+PREFILL_KV_FIRST_ROW_STAGE6_11_OK: 30 zero-history Decode(pos0,token2) KV slices compared against Prefill row0 without rewriting caches or reference files
+PREFILL_KV_POSITION_TOTAL: row=0 tensors=30 bytes=9216 different_bytes=...
+PREFILL_KV_POSITION_TOTAL: row=16 tensors=30 bytes=9216 different_bytes=6975 ...
+PREFILL_KV_POSITION_COMPARISON_OK: mapped_tensors=30 row0_mismatches=... row16_mismatches=6975 delta_mismatches=...
+```
+
+**Интерпретация:** если KV расхождение велико уже при pos0,
+то накопление ошибки при передаче Prefill cache не является
+единственной причиной. Если в pos0 расхождений почти нет,
+а на pos16 их 6975, изучать attention masks/арифметику
+в истории и рост ошибочного состояния.
+Ни один из выводов нельзя объявлять семантической
+эквивалентностью без дополнительного численного контроля.
