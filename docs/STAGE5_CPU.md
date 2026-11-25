@@ -1898,3 +1898,42 @@ PREFILL_KV_POSITION_COMPARISON_OK: mapped_tensors=30 row0_mismatches=... row16_m
 в истории и рост ошибочного состояния.
 Ни один из выводов нельзя объявлять семантической
 эквивалентностью без дополнительного численного контроля.
+
+
+## Stage 6.12 — проверка причин расхождения Prefill и Decode на первом токене
+
+**Режим подготовлен; ожидает испытания на реальном Q8B.**
+A=Prefill-128(BOS=2 + 127 паддингов ID0),
+B=уже проверенный Prefill-128(17 реальных токенов),
+C=Decode(pos0, BOS=2, пустой KV).
+Сравниваем 30 срезов K/V только для row0 (9216 байт).
+Новый Prefill-A использует тот же QNN context, но отдельные tensor descriptors,
+8 заново вычисленных CPU-входов, 28 неизменных нулевых K/V и 30 независимых
+выходных буферов. Сохранённые результаты B/C проверяются на неизменность.
+Существующие Stage 6.8–6.11 не изменены.
+
+Запуск:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+bash scripts/test_prefill_bos_only.sh
+```
+
+Лог: `~/gemma4_qnn_test/cpu_prefill_bos_only_stage6_12.log`.
+
+Маркеры: `PREFILL_BOS_ONLY_INPUTS_READY`,
+`PREFILL_BOS_ONLY_NPU_OK`, 30 строк
+`PREFILL_BOS_ONLY_KV_TENSOR`, 4 строки
+`PREFILL_BOS_ONLY_KV_GROUP`, `PREFILL_BOS_ONLY_KV_TOTAL`
+и `PREFILL_BOS_ONLY_STAGE6_12_OK`.
+
+AB — BOS-only Prefill против Prefill(17), AC — BOS-only Prefill
+против Decode(pos0), BC — прежнее сравнение Prefill(17) с Decode.
+MAE вычисляется в деквантованных единицах с QNN scale,
+проверяется совместимость quant metadata выходных тензоров.
+AB=0 указывает на независимость Prefill row0 от будущих токенов/pad
+в проверенном режиме. Если AB>0, нужно проверить causal mask,
+padding и CPU AUX входы. Маркер OK не доказывает семантическое совпадение.

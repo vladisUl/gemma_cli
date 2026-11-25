@@ -114,6 +114,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 6.10 (Q8B подтверждён):** для всех 30 K/V правильные Prefill row16 и source layer; 6975/9216 байт отличаются, но signed INT8 |delta|=1: 2911, |delta|=2: 1407, >2: 2657. Особенно заметны 512-канальные K/V (2766/3072 отличаются, abs max27). **Stage 6.11 (код в GitHub, ожидает Q8B):** [scripts/test_prefill_first_row_kv.sh](scripts/test_prefill_first_row_kv.sh) выполняет Decode(pos0, ID2) с полностью нулевыми K/V и сравнивает 30 срезов с Prefill row0; [scripts/compare_prefill_kv_diagnostics.py](scripts/compare_prefill_kv_diagnostics.py) сравнивает отчёты row0 и row16 по K/V и каналам. Это диагностика причины расхождения, а не автоматическое изменение KV; полный text CLI пока не подтверждён.
 
+**Stage 6.12 (код, ожидает Q8B):** [scripts/test_prefill_bos_only.sh](scripts/test_prefill_bos_only.sh) запускает отдельный Prefill-128 с BOS`2` и 127 pad, сравнивает KV row0 с исходным Prefill (17 токенов) и Decode(pos0, нулевой KV). Для 30 K/V: AB, AC, BC mismatches и деквантованный MAE. Без замены старых QNN-контекстов, RAW-эталонов и KV; успех теста означает завершение диагностики, а не численную эквивалентность.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.
