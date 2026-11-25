@@ -438,9 +438,13 @@ struct Options {
     bool kv_run_next = false;
     bool cpu_aux_pos_set = false;
     bool cpu_aux_token_set = false;
+    bool cpu_aux_next_pos_set = false;
+    bool cpu_aux_next_token_set = false;
     uint32_t kv_feedback_pos = 0;
     int32_t cpu_aux_pos = 0;
     int32_t cpu_aux_token = 0;
+    int32_t cpu_aux_next_pos = 0;
+    int32_t cpu_aux_next_token = 0;
     uint32_t repeat = 1;
 };
 
@@ -568,6 +572,8 @@ void usage(const char* executable) {
         << "  --cpu-aux-model Section1.tflite --cpu-aux-pos N --cpu-aux-token ID\n"
         << "     replaces six first-Decode INT8 mask/RoPE inputs from CPU LiteRT;\n"
         << "     requires exact match to saved inputs before NPU execution.\n"
+        << "  With --kv-run-next, --cpu-aux-next-pos N --cpu-aux-next-token ID\n"
+        << "     replaces six next Decode AUX inputs via CPU in RAM.\n"
         << "No implicit tensor conversions or synthetic zero inputs.\n";
 }
 
@@ -640,6 +646,26 @@ Options parse_options(int argc, char** argv) {
             options.cpu_aux_token=static_cast<int32_t>(token);
             options.cpu_aux_token_set=true;
         }
+        else if (arg == "--cpu-aux-next-pos") {
+            if (options.cpu_aux_next_pos_set || value.empty() || value.front() == '-')
+                throw std::runtime_error("--cpu-aux-next-pos expects an integer 0..4095");
+            size_t consumed=0;
+            const auto pos=std::stoul(value,&consumed);
+            if (consumed!=value.size() || pos >= 4096)
+                throw std::runtime_error("--cpu-aux-next-pos must be 0..4095");
+            options.cpu_aux_next_pos=static_cast<int32_t>(pos);
+            options.cpu_aux_next_pos_set=true;
+        }
+        else if (arg == "--cpu-aux-next-token") {
+            if (options.cpu_aux_next_token_set || value.empty() || value.front() == '-')
+                throw std::runtime_error("--cpu-aux-next-token expects an integer 0..262143");
+            size_t consumed=0;
+            const auto token=std::stoul(value,&consumed);
+            if (consumed!=value.size() || token >= 262144)
+                throw std::runtime_error("--cpu-aux-next-token must be 0..262143");
+            options.cpu_aux_next_token=static_cast<int32_t>(token);
+            options.cpu_aux_next_token_set=true;
+        }
         else if (arg == "--kv-feedback-pos") {
             if (options.kv_feedback)
                 throw std::runtime_error("Choose --kv-auto-pos OR --kv-feedback-pos");
@@ -670,6 +696,14 @@ Options parse_options(int argc, char** argv) {
             options.cpu_aux_model.empty() != !options.cpu_aux_token_set)
             throw std::runtime_error(
                 "CPU AUX requires all of --cpu-aux-model, --cpu-aux-pos and --cpu-aux-token");
+        if (options.cpu_aux_next_pos_set != options.cpu_aux_next_token_set)
+            throw std::runtime_error(
+                "CPU AUX next step requires both --cpu-aux-next-pos and --cpu-aux-next-token");
+        if (options.cpu_aux_next_pos_set &&
+            (options.cpu_aux_model.empty() || !options.cpu_aux_pos_set ||
+             !options.cpu_aux_token_set || !options.kv_run_next))
+            throw std::runtime_error(
+                "CPU AUX next step requires --kv-run-next and first-step --cpu-aux-model/pos/token");
         if (!options.kv_next_list.empty() && !options.kv_feedback)
             throw std::runtime_error("--kv-next-list requires --kv-feedback-pos or --kv-auto-pos");
         if (options.kv_auto_pos && options.kv_next_list.empty())
@@ -694,7 +728,8 @@ Options parse_options(int argc, char** argv) {
         !options.kv_next_list.empty() || !options.kv_next_reference_dir.empty() ||
         !options.kv_next_head_reference_dir.empty() ||
         !options.cpu_aux_model.empty() || options.cpu_aux_pos_set ||
-        options.cpu_aux_token_set)
+        options.cpu_aux_token_set || options.cpu_aux_next_pos_set ||
+        options.cpu_aux_next_token_set)
         throw std::runtime_error("Chained/KV/CPU AUX options require --jobs");
     if (options.binary.empty() || options.system.empty())
         throw std::runtime_error("--binary and --system are required");
@@ -1177,7 +1212,8 @@ void execute_next_decode(QnnRuntime& runtime,
                          ReplayJob& decode,
                          const std::vector<KvLink>& kv_links,
                          const std::vector<fs::path>& next_files,
-                         const std::vector<fs::path>& next_refs) {
+                         const std::vector<fs::path>& next_refs,
+                         const Options& options) {
     if (next_files.size() != decode.inputs.size() ||
         kv_links.size() != 30)
         throw std::runtime_error("Incomplete next-step Decode input metadata");
@@ -1197,6 +1233,14 @@ void execute_next_decode(QnnRuntime& runtime,
         decode.input_buffers[i] = std::move(next_input);
         ++changed_non_kv;
     }
+    if (options.cpu_aux_next_pos_set) {
+        // The 30 K/V caches are already updated in RAM; only six out of the
+        // eight non-KV inputs are substituted by Section1 CPU execution.
+        // Compare against this exact saved next-step sample before NPU.
+        apply_cpu_aux_decode(decode, options.cpu_aux_model,
+                             options.cpu_aux_next_pos,
+                             options.cpu_aux_next_token, "next");
+    }
     // Rebind ALL 38 input pointers, including the 30 updated K/V buffers,
     // in case replacing any non-KV vector caused its allocation to move.
     for (size_t i = 0; i < decode.inputs.size(); ++i)
@@ -1206,6 +1250,7 @@ void execute_next_decode(QnnRuntime& runtime,
         throw std::runtime_error("Expected 8 next-step non-KV inputs");
     std::cout << "DECODE_NEXT_INPUTS_READY: kv_from_RAM=" << kv_links.size()
               << " non_kv_from_saved_next=" << changed_non_kv
+              << " cpu_aux_replaced=" << (options.cpu_aux_next_pos_set ? 6 : 0)
               << "\n" << std::flush;
     const auto start = std::chrono::steady_clock::now();
     runtime.execute(decode.handle, decode.inputs, decode.outputs);
@@ -1234,12 +1279,15 @@ void execute_next_decode(QnnRuntime& runtime,
 // tensors computed by local Linux/ARM64 TFLite Section1. Validate exact bytes
 // against the original QNN Decode input buffers BEFORE replacement, so the
 // pre-existing 31-output graph reference test remains independently meaningful.
-void apply_cpu_aux_first_decode(ReplayJob& decode, const Options& options) {
+void apply_cpu_aux_decode(ReplayJob& decode,
+                          const std::string& model_file,
+                          int32_t position, int32_t token_id,
+                          const std::string& scope) {
     if (decode.graph_name != "qnn_partition_0" ||
         decode.inputs.size() != 38 || decode.input_buffers.size() != 38)
         throw std::runtime_error("CPU_AUX_REQUIRES_DECODE_38_INPUTS");
     auto outputs = gemma4::run_decode_aux(
-        options.cpu_aux_model, options.cpu_aux_pos, options.cpu_aux_token);
+        model_file, position, token_id);
     if (outputs.size() != 6)
         throw std::runtime_error("CPU_AUX_INVALID_OUTPUT_COUNT");
     std::set<size_t> indexes;
@@ -1281,7 +1329,18 @@ void apply_cpu_aux_first_decode(ReplayJob& decode, const Options& options) {
     std::cout << "CPU_AUX_QNN_REPLACED: tensors=" << indexes.size()
               << " bytes=" << byte_total
               << " from=Section1_TFLite_2.14"
-              << " verified_against_saved_decode=1\n" << std::flush;
+              << " verified_against_saved_decode=1 scope=" << scope
+              << "\n" << std::flush;
+    if (scope == "next")
+        std::cout << "CPU_AUX_NEXT_QNN_REPLACED: tensors=6 bytes=9730"
+                  << " cpu_pos=" << position
+                  << " cpu_token=" << token_id
+                  << "\n" << std::flush;
+}
+
+void apply_cpu_aux_first_decode(ReplayJob& decode, const Options& options) {
+    apply_cpu_aux_decode(decode, options.cpu_aux_model,
+                         options.cpu_aux_pos, options.cpu_aux_token, "first");
 }
 
 int run_replay_jobs(const Options& options) {
@@ -1443,7 +1502,7 @@ int run_replay_jobs(const Options& options) {
         apply_kv_feedback(*decode, kv_links, position, next_cache_files);
         if (options.kv_run_next) {
             execute_next_decode(runtime, *decode, kv_links, next_cache_files,
-                                next_decode_references);
+                                next_decode_references, options);
             if (options.chain_decode_head) {
                 execute_chained_decode_head(runtime, *decode, *head, hidden_output_index);
                 std::cout << "DECODE_NEXT_HEAD_EXECUTE_OK: logits="
