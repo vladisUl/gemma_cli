@@ -163,10 +163,13 @@ def main():
                     check=False,
                 )
                 if run.returncode:
-                    raise ValueError(
-                        f"CPU invocation failed for {tag}:\n"
-                        f"{run.stdout}\n{run.stderr}"
+                    print(
+                        f"PREFILL_MASK_PROBE_INVOKE_FAILED: candidate={padding_name} "
+                        f"time_step={time_step} exit_code={run.returncode} "
+                        f"details={(run.stderr or run.stdout)[-700:]!r}",
+                        flush=True,
                     )
+                    continue
                 total = 0
                 both_exact = True
                 for alias, (index, name, expected_size) in SIGNATURE_OUTPUTS[MASK].items():
