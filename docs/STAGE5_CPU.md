@@ -60,3 +60,28 @@ Do not assume an Android binary is usable on native Linux.
 
 **Next milestone:** CPU outputs replace the eight saved non-KV Decode
 inputs, while the known-good QNN executor and KV-feedback remain unchanged.
+
+## Q8B: first CPU inventory result (2026-11-25)
+
+The board is AArch64 (kernel 7.0.11-7-qcom). Sections 0, 1, 2 were not found
+under $HOME (depth 7). System runtime was found:
+`/usr/lib/aarch64-linux-gnu/libtensorflow-lite.so.2.14.1`.
+Gemma tokenizer JSON exists at `/home/radxa/gemma4_qnn_test/tokenizer.json`
+(32,155,733 bytes). The Python TFLite and SentencePiece packages were not
+found, but Python packages are not needed for the native C++ generation path.
+
+Availability of **TFLite C++ headers**, a linker `.so` symlink, the required
+exported symbols, compatibility of operations, and the source `.tflite` files
+still needs independent confirmation. The original probe matched only Section
+filenames; the new script also looks for other `.tflite` names and inspects
+the tokenizer JSON metadata.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+bash scripts/probe_cpu_native.sh 2>&1 | tee ~/gemma4_cpu_native.log
+```
+
+If Section0/1/2 only exist on the WSL development machine, they must be
+transferred **once** to the Q8B (preferably under `~/gemma4_qnn_test/cpu_models`).
+Do not copy over, modify or re-export the three verified QNN context binaries.
