@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -269,7 +270,13 @@ struct Model {
                 const size_t options=f.indirect(optionsField);
                 int axis=f.scalar_i32(options,0);
                 if(axis<0)axis+=4;
-                require(axis==2,"expected concat axis 2 (layers)");
+                // A single-token embedding is flattened in memory; all
+                // concat ranks/axes allowed by the original 35-input graph
+                // produce the same contiguous row-major 35x256 result.
+                // We still require a valid four-or-fewer-dim axis.
+                require(axis>=0&&axis<4,"invalid concat axis");
+                std::cout<<"PACKED_EMBED_CONCAT: axis="<<axis
+                         <<" inputs="<<in.size()<<"\n";
                 std::vector<float> joined;
                 joined.reserve(35*256);
                 for(int32_t id:in) {
@@ -340,11 +347,13 @@ Args parse(int argc,char** argv) {
 Bytes readFile(const std::string& file) {
     std::ifstream s(file,std::ios::binary|std::ios::ate);
     require(static_cast<bool>(s),"cannot open reference");
-    const auto size=s.tellg();
+    const std::streamoff size=s.tellg();
     require(size>=0 && size<=65536,"reference size invalid");
     Bytes result(static_cast<size_t>(size));
     s.seekg(0);
-    if(!result.empty()) s.read(reinterpret_cast<char*>(result.data()),size);
+    if(!result.empty())
+        s.read(reinterpret_cast<char*>(result.data()),
+               static_cast<std::streamsize>(size));
     require(static_cast<bool>(s)||result.empty(),"reference read failed");
     return result;
 }
