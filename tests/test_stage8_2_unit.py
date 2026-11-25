@@ -58,6 +58,18 @@ class Stage82Unit(unittest.TestCase):
                 "stage=final full_cache_equal=1","stage=final full_cache_equal=0"
             ),8,True)
 
+    def test_partial_memhandle_probe_contract(self):
+        mixed="\n".join([
+            "STAGE82_MEM_REGISTERED: tensors=1 bytes=1258291 "
+            "requested=1 raw_remaining=29",
+            "STAGE82_KV_MIRROR_OK: stage=initial full_cache_equal=1 tensors=1",
+            "STAGE82_KV_MIRROR_OK: stage=final full_cache_equal=1 tensors=1",
+            "BENCH81_OK: executed_steps=8 kv_binding=memhandle",
+        ])
+        assert_registration(mixed,8,True,expected_tensors=1)
+        with self.assertRaisesRegex(BenchError,"MEMHANDLE run missing"):
+            assert_registration(mixed,8,True,expected_tensors=30)
+
     def test_raw_binding_requires_no_registered_kv(self):
         raw="BENCH81_OK: executed_steps=8 kv_binding=raw"
         assert_registration(raw,8,False)

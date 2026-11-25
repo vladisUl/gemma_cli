@@ -22,10 +22,14 @@ class Stage82KvMem {
     FdFn to_fd_=nullptr;
     std::vector<Buffer> buffers_;
     size_t registered_=0;
+    size_t requested_=30;
 public:
     Stage82KvMem(QnnRuntime& runtime,ReplayJob& decode,
-                 const std::vector<KvLink>& links):
-        runtime_(runtime),decode_(decode) {
+                 const std::vector<KvLink>& links,
+                 size_t requested=30):
+        runtime_(runtime),decode_(decode),requested_(requested) {
+        if(requested_==0 || requested_>30 || links.size()!=30)
+            throw std::runtime_error("STAGE82_BAD_MEMHANDLE_COUNT");
         // libcdsprpc must be provided by the BSP / QAIRT loader on this board.
         // If unavailable, fail this experiment, NEVER silently use RAW.
         const char* override=std::getenv("GEMMA4_RPCMEM_LIBRARY");
@@ -37,10 +41,11 @@ public:
         const auto& api=runtime_.provider->QNN_INTERFACE_VER_NAME;
         if(!api.memRegister || !api.memDeRegister)
             throw std::runtime_error("STAGE82_MEM_REGISTER_APIS_UNAVAILABLE");
-        buffers_.reserve(links.size());
+        buffers_.reserve(requested_);
         try {
             const auto ctx=runtime_.context_for(decode.handle);
             for(const auto& link:links) {
+                if(registered_==requested_)break;
                 const auto& t=decode.inputs.at(link.input_index);
                 const auto& raw=decode.input_buffers.at(link.input_index);
                 const size_t bytes=raw.size();
@@ -80,15 +85,17 @@ public:
             release();
             throw;
         }
-        if(registered_!=30) {
+        if(registered_!=requested_) {
             release();
-            throw std::runtime_error("STAGE82_REGISTERED_KV_NOT_30");
+            throw std::runtime_error("STAGE82_REGISTERED_KV_COUNT_MISMATCH");
         }
         try {
             size_t sum=0;
             for(const auto& b:buffers_)sum+=b.bytes;
             std::cout<<"STAGE82_MEM_REGISTERED: tensors="<<registered_
-                     <<" bytes="<<sum<<" source=rpcmem fd_handles=1"
+                     <<" bytes="<<sum<<" requested="<<requested_
+                     <<" raw_remaining="<<(30-registered_)
+                     <<" source=rpcmem fd_handles=1"
                      <<" backend_io=memhandle decode_only=1"
                      <<" cpu_mirror_only_new_slot=1\n"<<std::flush;
             verify_equal("initial");
@@ -114,7 +121,7 @@ public:
         registered_=0;
     }
     void bind_all() {
-        if(registered_!=30)
+        if(registered_!=requested_)
             throw std::runtime_error("STAGE82_KV_NOT_REGISTERED");
         for(const auto& b:buffers_) {
             auto& t=decode_.inputs.at(b.input_index);
@@ -146,10 +153,10 @@ public:
             }
             return;
         }
-        throw std::runtime_error("STAGE82_MIRROR_INDEX_MISSING");
+        // This KV tensor was deliberately left in RAW mode.
     }
     void verify_equal(const char* stage) const {
-        if(registered_!=30)
+        if(registered_!=requested_)
             throw std::runtime_error("STAGE82_VERIFY_BAD_HANDLE_COUNT");
         for(const auto& b:buffers_) {
             const auto& original=decode_.input_buffers.at(b.input_index);
@@ -159,6 +166,6 @@ public:
                     std::string("STAGE82_CPU_RPCMEM_KV_MISMATCH: ")+stage);
         }
         std::cout<<"STAGE82_KV_MIRROR_OK: stage="<<stage
-                 <<" full_cache_equal=1 tensors=30\n"<<std::flush;
+                 <<" full_cache_equal=1 tensors="<<registered_<<"\n"<<std::flush;
     }
 };

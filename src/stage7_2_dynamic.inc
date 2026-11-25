@@ -229,7 +229,8 @@ void run_stage7_2_dynamic(
     };
     std::unique_ptr<Stage82KvMem> stage82_mem;
     if(options.dynamic_memhandle_kv)
-        stage82_mem=std::make_unique<Stage82KvMem>(runtime,*decode,links);
+        stage82_mem=std::make_unique<Stage82KvMem>(
+            runtime,*decode,links,options.dynamic_memhandle_kv_count);
     // Stage 8.1: fixed-length SYNTHETIC load test. Each QNN graph is executed
     // for the same real inputs as Stage 7.x, but after the header LF107,
     // force token ID 236778 ("2") on EVERY subsequent Decode position.
@@ -283,6 +284,12 @@ void run_stage7_2_dynamic(
             for(size_t i=0;i<decode->inputs.size();++i)
                 bind_raw(decode->inputs[i],decode->input_buffers[i]);
             if(stage82_mem)stage82_mem->bind_all();
+            if(stage82_mem && step==1)
+                std::cout<<"STAGE82_MEM_FIRST_EXECUTE: step=1"
+                         <<" registered_kv="<<options.dynamic_memhandle_kv_count
+                         <<" raw_kv="<<(30-options.dynamic_memhandle_kv_count)
+                         <<" all_full_outputs_still_RAW=1"
+                         <<" decode_graph=qnn_partition_0\n"<<std::flush;
             const auto t1=std::chrono::steady_clock::now();
             const bool profile_sample=options.dynamic_qnn_profile_set &&
                 (step==1 || step==2 || step==16 || step==64 ||

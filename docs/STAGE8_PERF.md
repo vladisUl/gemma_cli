@@ -502,3 +502,60 @@ MEMHANDLE output equivalence and long A/B have NOT passed.
 No production AOT, model, tokenizer or CLI changes were required.
 See QAIRT QnnCommon.h (GENERAL error), QnnProfile.h (MICROSEC unit),
 QnnHtpProfile.h (accelerator event meanings) for interpretation.
+
+### Stage 8.2 diagnostic for HTP DMA error 1100 on MEMHANDLE
+
+On the board, `probe_memhandle.log` showed:
+
+```text
+STAGE82_MEM_REGISTERED: tensors=30 bytes=37748736
+STAGE82_KV_MIRROR_OK: stage=initial full_cache_equal=1 tensors=30
+BENCH81_MODE: ... kv_binding=memhandle ...
+<E> Internal error handing: Dma execution failed on the skel side.
+    result = 1100 transport error = 0
+QNN_RUN_ERROR: QnnGraph_execute: QNN error 1100
+```
+
+This proves all 30 registrations returned success and CPU/RPCmem
+contents initially agree. The first Decode graphExecute failed
+**on the DSP-side DMA path**, before any Decode step or output
+checksum. It does NOT prove that the physical shared memory mapping
+is usable, nor that MEMHANDLE is unsupported or faster.
+
+A new deliberately conservative optional diagnostic can register
+only the first N Decode KV inputs and leave the remaining inputs
+as RAW, keeping the AOT, host cache updates, and correctness checks
+unchanged. Pass `--kv-count N` to the Python probe:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+python3 scripts/bench_stage8_2.py --mode probe --probe-steps 2 --kv-count 1
+```
+
+If one registered tensor succeeds, try 2, 4, 15, then 30.
+If it fails, examine the complete backend diagnostics around the
+first `STAGE82_MEM_FIRST_EXECUTE` line; a failure with one
+MEMHANDLE could mean DMA/fd mapping or that mixed RAW/MEMHANDLE
+I/O is not supported by that graph/backend. It is NOT conclusive.
+A successful short probe requires matching *all* Decode and Head
+checksums across RAW and MEMHANDLE and matching selected KV memory
+in RAM vs RPCmem before/after all steps.
+
+Direct runner flag `--dynamic-kv-memhandle-count N` (1..30, default 30)
+requires `--dynamic-kv-memhandle`, `--dynamic-prefill`,
+`--dynamic-benchmark`, and `--dynamic-bench-fixed-steps`.
+It changes only how many KV **inputs** use registered memory,
+not the 30 KV updates, head/other graph bindings or model shape.
+The normal production path and old Stage 8.1 remain RAW.
+The Python `--mode ab` requires all 30 MEMHANDLE inputs and
+will not accept `--kv-count <30`; partial tests are diagnostics,
+not zero-copy performance claims.
+
+For additional DSP error context, inspect *unfiltered* lines:
+`sed -n '65,105p' <board-side probe_memhandle.log>`.
+When a batch fails with the skel-side DMA error, the driver and
+QNN backend log lines before the final error are likely more
+actionable than the common code 1100.

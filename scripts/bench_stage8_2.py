@@ -47,12 +47,12 @@ def get_digests(log, steps):
     return records
 
 
-def assert_registration(log, steps, enabled):
+def assert_registration(log, steps, enabled, expected_tensors=30):
     if enabled:
         for marker in (
-            "STAGE82_MEM_REGISTERED: tensors=30",
-            "STAGE82_KV_MIRROR_OK: stage=initial full_cache_equal=1 tensors=30",
-            "STAGE82_KV_MIRROR_OK: stage=final full_cache_equal=1 tensors=30",
+            f"STAGE82_MEM_REGISTERED: tensors={expected_tensors} ",
+            f"STAGE82_KV_MIRROR_OK: stage=initial full_cache_equal=1 tensors={expected_tensors}",
+            f"STAGE82_KV_MIRROR_OK: stage=final full_cache_equal=1 tensors={expected_tensors}",
             "kv_binding=memhandle",
             "STAGE82_MEM_REGISTERED:",
         ):
@@ -168,6 +168,8 @@ def main():
                    help="Exact Decode steps per long run, 1..256")
     p.add_argument("--runs", type=int, default=3,
                    help="A/B run pairs, 1..10")
+    p.add_argument("--kv-count", type=int, default=30,
+                   help="MEMHANDLE KV tensor count (1..30), for probe only if <30")
     p.add_argument("--profile-level", choices=("basic", "detailed"),
                    default="basic")
     p.add_argument("--workdir", type=Path, default=DEFAULT_WORK)
@@ -180,6 +182,10 @@ def main():
         p.error("--steps must be 1..256")
     if not 1 <= args.runs <= 10:
         p.error("--runs must be 1..10")
+    if not 1 <= args.kv_count <= 30:
+        p.error("--kv-count must be 1..30")
+    if args.kv_count < 30 and args.mode != "probe":
+        p.error("partial MEMHANDLE is diagnostic only: use --mode probe")
     work = args.workdir.expanduser().resolve()
     runner = args.runner.expanduser().resolve()
     if not work.is_dir():
@@ -215,11 +221,13 @@ def main():
                             args.probe_steps,("--dynamic-bench-checksums",))
         mem_probe=run_fixed(work,runner,folder,"probe_memhandle",args.text,
                             args.probe_steps,("--dynamic-bench-checksums",
-                                              "--dynamic-kv-memhandle"))
+                                              "--dynamic-kv-memhandle",
+                                              "--dynamic-kv-memhandle-count",
+                                              str(args.kv_count)))
         raw_log=Path(raw_probe["log"]).read_text(errors="replace")
         mem_log=Path(mem_probe["log"]).read_text(errors="replace")
         assert_registration(raw_log,args.probe_steps,False)
-        assert_registration(mem_log,args.probe_steps,True)
+        assert_registration(mem_log,args.probe_steps,True,args.kv_count)
         count=compare_checksums(raw_log,mem_log,args.probe_steps)
         print(f"STAGE82_PREFLIGHT_OK: raw_memhandle_equal_steps={count} "
               "all_decode_outputs_equal=1 all_lm_head_logits_equal=1 "
@@ -263,6 +271,8 @@ def main():
         "profile_level":args.profile_level,
         "prompt":args.text,
         "capacity":4096,
+        "memhandle_probe_tensors":args.kv_count,
+        "mixed_memory_mode_diagnostic":args.kv_count<30,
         "prefill_graph_tokens":128,
         "long_steps":args.steps,
         "runs_per_binding":len(raw_runs),

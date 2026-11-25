@@ -543,6 +543,8 @@ struct Options {
     bool dynamic_benchmark = false;
     bool dynamic_bench_fixed_steps_set = false;
     bool dynamic_memhandle_kv = false;
+    bool dynamic_memhandle_kv_count_set = false;
+    uint32_t dynamic_memhandle_kv_count = 30;
     bool dynamic_bench_checksums = false;
     bool dynamic_qnn_profile_set = false;
     bool dynamic_qnn_profile_detailed = false;
@@ -712,6 +714,9 @@ void usage(const char* executable) {
         << "     Requires --dynamic-prefill --dynamic-benchmark; NOT normal text.\n"
         << "  --dynamic-kv-memhandle: Stage 8.2 opt-in RPCmem KV inputs;\n"
         << "     requires --dynamic-bench-fixed-steps (NOT text generation).\n"
+        << "  --dynamic-kv-memhandle-count N (1..30; default 30):\n"
+        << "     diagnostically register first N KV inputs, leave rest RAW.\n"
+        << "     Mixed RAW/MEMHANDLE may not be backend-supported.\n"
         << "  --dynamic-bench-checksums: output digests for RAW/MEMHANDLE\n"
         << "     equivalence preflight (may slow execution).\n"
         << "  --dynamic-qnn-profile basic|detailed: sample select Decode/Head\n"
@@ -867,6 +872,19 @@ Options parse_options(int argc, char** argv) {
             options.dynamic_tie_policy_set=true;
             options.dynamic_allow_tie_lowest=(value=="lowest-id");
         }
+        else if (arg == "--dynamic-kv-memhandle-count") {
+            if(options.dynamic_memhandle_kv_count_set ||
+               value.empty() || value.front()=='-')
+                throw std::runtime_error(
+                    "--dynamic-kv-memhandle-count expects 1..30 exactly once");
+            size_t consumed=0;
+            const auto n=std::stoul(value,&consumed);
+            if(consumed!=value.size() || n<1 || n>30)
+                throw std::runtime_error(
+                    "--dynamic-kv-memhandle-count must be 1..30");
+            options.dynamic_memhandle_kv_count=static_cast<uint32_t>(n);
+            options.dynamic_memhandle_kv_count_set=true;
+        }
         else if (arg == "--dynamic-qnn-profile") {
             if(options.dynamic_qnn_profile_set ||
                (value!="basic" && value!="detailed"))
@@ -1012,6 +1030,10 @@ Options parse_options(int argc, char** argv) {
         if (options.system.empty() || options.backend.empty())
             throw std::runtime_error("--jobs needs --system and --backend");
         if(options.dynamic_prefill) {
+            if(options.dynamic_memhandle_kv_count_set &&
+               !options.dynamic_memhandle_kv)
+                throw std::runtime_error(
+                    "--dynamic-kv-memhandle-count requires --dynamic-kv-memhandle");
             if((options.dynamic_memhandle_kv || options.dynamic_qnn_profile_set ||
                 options.dynamic_bench_checksums) &&
                (!options.dynamic_benchmark || !options.dynamic_bench_fixed_steps_set))
@@ -1051,8 +1073,8 @@ Options parse_options(int argc, char** argv) {
         if(options.dynamic_bench_fixed_steps_set)
             throw std::runtime_error(
                 "--dynamic-bench-fixed-steps requires --dynamic-prefill");
-        if(options.dynamic_memhandle_kv || options.dynamic_qnn_profile_set ||
-           options.dynamic_bench_checksums)
+        if(options.dynamic_memhandle_kv || options.dynamic_memhandle_kv_count_set ||
+           options.dynamic_qnn_profile_set || options.dynamic_bench_checksums)
             throw std::runtime_error("Stage 8.2 flags require --dynamic-prefill");
         if(!options.dynamic_prompt_tokens.empty() ||
            !options.dynamic_section0.empty() ||
@@ -1187,8 +1209,8 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.dynamic_prefill || options.dynamic_tie_policy_set ||
         options.dynamic_benchmark || options.dynamic_bench_fixed_steps_set ||
-        options.dynamic_memhandle_kv || options.dynamic_qnn_profile_set ||
-        options.dynamic_bench_checksums ||
+        options.dynamic_memhandle_kv || options.dynamic_memhandle_kv_count_set ||
+        options.dynamic_qnn_profile_set || options.dynamic_bench_checksums ||
         !options.dynamic_prompt_tokens.empty() ||
         !options.dynamic_section0.empty() || !options.dynamic_section1.empty() ||
         !options.dynamic_section2.empty() || options.dynamic_max_tokens!=16 ||
