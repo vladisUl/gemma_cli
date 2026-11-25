@@ -83,3 +83,14 @@ target_compile_options(gemma4-packed-prefill PRIVATE -Wall -Wextra -Wpedantic)
 if(BUILD_TESTING)
   add_test(NAME packed_prefill_help COMMAND gemma4-packed-prefill --help)
 endif()
+
+# Stage 6.3: optional stdlib-only regression for causal padding masking.
+# Do not require Python at CMake configure/build time.
+if(BUILD_TESTING)
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME prefill_padding_unit
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_prefill_padding_unit.py")
+  endif()
+endif()
