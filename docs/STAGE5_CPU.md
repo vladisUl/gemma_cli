@@ -224,3 +224,36 @@ python3 ../gemma4-cli-stage1/scripts/verify_cpu_aux.py \
 Ожидаемый результат при полном совпадении: `CPU_AUX_ALL_MATCH: kind=rope tensors=4 bytes=1536`. В случае отличий — `CPU_AUX_MISMATCH` с названием, индексом QNN-входа и первым различающимся байтом; **не** считать уже подтверждённое исполнение CPU доказательством побайтовой точности до этой проверки.
 
 После RoPE можно выполнить `decode_mask` с правильным токеном и `time_step`, сохранить маски в отдельный каталог и запустить тот же скрипт с `--kind mask`. Значения реального токена пока не извлечены из сохранённых шагов; не подставлять случайный ID при проверке соответствия.
+
+## Stage 5.3 — CPU decode_mask для сохранённого шага 3
+
+Пользователь подтвердил побайтовое совпадение всех четырёх результатов Section1
+`decode_rope` с четырьмя входами QNN Decode шага 3. Stage 5.2 проверен на Q8B.
+
+Следующий CPU AUX тест: две маски `decode_mask` длиной по 4097 INT8 байт.
+Точные индексы входов QNN: `mask_local = 22`, `mask_global = 27`.
+Новый скрипт выполняет Section1 `decode_mask`, пишет выходы в уникальный каталог,
+затем проверяет оба массива по сохранённому `auto_decode_step3_list.txt`.
+Сохранённые .raw и QNN бинарники не изменяются.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+bash scripts/test_cpu_mask.sh 2>&1 | tee ~/gemma4_cpu_mask.log
+```
+
+По умолчанию используются `input_tokens=2`, `time_step=3`.
+ID 2 является только **пробным непустым токеном**, а не установленным
+настоящим token ID шага 3. Совпадение докажет точность масок для данного
+случая, но не подтвердит идентичность самого token ID.
+При несовпадении нужно установить фактический токен и значение time_step;
+их можно задать через `GEMMA4_MASK_TOKEN` и `GEMMA4_MASK_STEP`.
+
+Ожидаемый успех (проверка ещё не проводилась):
+
+```text
+CPU_AUX_REFERENCE_MATCH: mask_local qnn_input_index=22 bytes=4097
+CPU_AUX_REFERENCE_MATCH: mask_global qnn_input_index=27 bytes=4097
+CPU_AUX_ALL_MATCH: kind=mask tensors=2 bytes=8194
+CPU_MASK_STEP3_VERIFIED: outputs byte-identical to saved QNN inputs
+```
