@@ -75,7 +75,7 @@ for marker in \
       exit 1
     }
 done
-python3 - "$LOG" <<'PY'
+python3 - "$LOG" <<'PY' | tee -a "$LOG"
 import json,re,sys
 from pathlib import Path
 lines=Path(sys.argv[1]).read_text(errors="replace").splitlines()
