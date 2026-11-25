@@ -89,6 +89,10 @@ endif()
 if(BUILD_TESTING)
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
+    add_test(NAME tokenizer_stage7_help
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/scripts/probe_tokenizer_stage7.py"
+              --help)
     add_test(NAME prefill_padding_unit
       COMMAND "${Python3_EXECUTABLE}"
               "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_prefill_padding_unit.py")

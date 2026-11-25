@@ -2224,3 +2224,53 @@ grep -E 'STAGE6_18_|PREFILL_LINK_STOP_(EOS|LIMIT)|PREFILL_LINK_GREEDY_CANDIDATES
 Если остановка произошла при неоднозначности INT8, раннее
 `PREFILL_LINK_GREEDY_CANDIDATES` в логе остаётся и
 поддерживает дальнейшую диагностику, а `_OK` не печатается.
+
+
+## Stage 6.18 — Q8B генерация завершена EOS (подтверждено)
+
+После корректного chat template
+`<bos><|turn>user\nПривет! Сколько будет 2+2?<turn|>\n<|turn>model\n`,
+самодостаточная цепочка CPU embeddings / CPU AUX + QNN Prefill /
+Decode / LM Head / KV feedback на Q8B предсказала девять
+однозначных (INT8 ties=1) токенов:
+`236778, 900, 236743, 236778, 16632, 5213, 236812, 84750, 106`.
+BPE восстановление тела до EOS: `2 + 2 будет **4**.`.
+Позиция EOS 26, ID106=end-of-turn, EOS не возвращается в Decode.
+Совпадает по тексту с ранее полученным ответом гибридной WSL+Q8B
+реализации. Не требует SSH/WSL в процессе инференса.
+Но prompt подаётся из заранее подготовленного файла token IDs.
+
+## Stage 7.0 — спецификация токенизатора и контрольная пара
+
+`scripts/probe_tokenizer_stage7.py`: stdlib-only Python,
+работает read-only и не требует установленного HuggingFace
+`tokenizers`/SentencePiece. На реальном Q8B:
+1. проверяет `tokenizer.json`: BPE, 262144 vocab ID, JSON decoder
+   `Sequence(Replace(▁->space),ByteFallback,Fuse)`;
+2. выводит нормализатор, pre_tokenizer, post_processor,
+   BPE merges (тип и первые пять), важные флаги BPE;
+3. проверяет все 17 ID исходного prompt в сохранённом RAW;
+4. подтверждает исправленный заголовок `model\n` (ID107 LF);
+5. проверяет девять ожидаемых ID ответа и текст после удаления EOS.
+
+Это **контракт для последующей реализации кодировщика**, а не
+утверждение, что произвольный текст уже кодируется. Нельзя заменять
+BPE на SentencePiece/Unigram или упрощать сложный Unicode Split.
+
+Запуск:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+ctest --test-dir build --output-on-failure
+python3 scripts/probe_tokenizer_stage7.py
+```
+
+Нужный вывод:
+`TOKENIZER_STAGE7_MODEL`,
+`TOKENIZER_STAGE7_NORMALIZER`,
+`TOKENIZER_STAGE7_PRE_TOKENIZER`,
+`TOKENIZER_STAGE7_POST_PROCESSOR`,
+`TOKENIZER_STAGE7_DECODER`,
+`TOKENIZER_STAGE7_GOLDEN_OK`.
+Модель и все бинарные файлы остаются неизменными.
