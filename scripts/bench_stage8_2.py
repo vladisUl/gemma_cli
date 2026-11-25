@@ -112,7 +112,7 @@ def median(runs, key):
     return statistics.median(row[key] for row in runs)
 
 
-def present(raw_runs, mem_runs, profile, folder):
+def present(raw_runs, mem_runs, profile, folder, preflight_verified):
     print("\nSTAGE82_RESULT: RAW vs RPCmem MEMHANDLE (same AOT, KV4096)")
     for label, results in (("RAW", raw_runs), ("MEMHANDLE", mem_runs)):
         for index, run in enumerate(results, 1):
@@ -143,9 +143,14 @@ def present(raw_runs, mem_runs, profile, folder):
               f"events={profile['event_records']} "
               f"types={profile['profile_event_types']}")
     print(f"STAGE82_REPORT: {folder / 'summary.json'}")
-    print("STAGE82_OK: output_checksums_identical=1 same_qnn_aot=1 "
-          "prefill128=1 kv_capacity4096=1 "
-          "matched_litert_256_256_1024=0")
+    if preflight_verified:
+        print("STAGE82_OK: output_checksums_identical=1 same_qnn_aot=1 "
+              "prefill128=1 kv_capacity4096=1 "
+              "matched_litert_256_256_1024=0")
+    elif profile:
+        print("STAGE82_PROFILE_OK: raw_qnn_profile=1"
+              " memhandle_not_required=1"
+              " matched_litert_256_256_1024=0")
 
 
 def main():
@@ -200,21 +205,27 @@ def main():
             golden["stop_reason"] != "eos"):
         raise BenchError("Original 2+2 QNN regression failed; no benchmarks")
     print("STAGE82_GOLDEN_OK: exact nine token IDs EOS106", flush=True)
-    print("STAGE82_PREFLIGHT: comparing ALL Decode and Head output checksums",
-          flush=True)
-    raw_probe=run_fixed(work,runner,folder,"probe_raw",args.text,
-                        args.probe_steps,("--dynamic-bench-checksums",))
-    mem_probe=run_fixed(work,runner,folder,"probe_memhandle",args.text,
-                        args.probe_steps,("--dynamic-bench-checksums",
-                                          "--dynamic-kv-memhandle"))
-    raw_log=Path(raw_probe["log"]).read_text(errors="replace")
-    mem_log=Path(mem_probe["log"]).read_text(errors="replace")
-    assert_registration(raw_log,args.probe_steps,False)
-    assert_registration(mem_log,args.probe_steps,True)
-    count=compare_checksums(raw_log,mem_log,args.probe_steps)
-    print(f"STAGE82_PREFLIGHT_OK: raw_memhandle_equal_steps={count} "
-          "all_decode_outputs_equal=1 all_lm_head_logits_equal=1 "
-          "all_30_KV_cache_bytes_equal_at_finish=1", flush=True)
+    raw_probe=None
+    mem_probe=None
+    count=0
+    if args.mode != "profile":
+        print("STAGE82_PREFLIGHT: comparing ALL Decode and Head output checksums",
+              flush=True)
+        raw_probe=run_fixed(work,runner,folder,"probe_raw",args.text,
+                            args.probe_steps,("--dynamic-bench-checksums",))
+        mem_probe=run_fixed(work,runner,folder,"probe_memhandle",args.text,
+                            args.probe_steps,("--dynamic-bench-checksums",
+                                              "--dynamic-kv-memhandle"))
+        raw_log=Path(raw_probe["log"]).read_text(errors="replace")
+        mem_log=Path(mem_probe["log"]).read_text(errors="replace")
+        assert_registration(raw_log,args.probe_steps,False)
+        assert_registration(mem_log,args.probe_steps,True)
+        count=compare_checksums(raw_log,mem_log,args.probe_steps)
+        print(f"STAGE82_PREFLIGHT_OK: raw_memhandle_equal_steps={count} "
+              "all_decode_outputs_equal=1 all_lm_head_logits_equal=1 "
+              "all_30_KV_cache_bytes_equal_at_finish=1", flush=True)
+    else:
+        print("STAGE82_PROFILE_ONLY: RAW profiling independent of rpcmem",flush=True)
     raw_runs=[]
     mem_runs=[]
     if args.mode in ("ab","all"):
@@ -256,7 +267,7 @@ def main():
         "long_steps":args.steps,
         "runs_per_binding":len(raw_runs),
         "not_matched_litert_256_256_1024":True,
-        "both_io_modes_exact_same_decode_head_outputs_in_probe":True,
+        "both_io_modes_exact_same_decode_head_outputs_in_probe":count>0,
         "golden":golden,
         "probe":{"steps":count,"raw":raw_probe,"memhandle":mem_probe},
         "raw_runs":raw_runs,
@@ -276,7 +287,7 @@ def main():
     with (folder/"summary.json").open("x",encoding="utf-8") as output:
         json.dump(report,output,ensure_ascii=False,indent=2)
         output.write("\n")
-    present(raw_runs,mem_runs,profile,folder)
+    present(raw_runs,mem_runs,profile,folder,count>0)
 
 
 if __name__=="__main__":
