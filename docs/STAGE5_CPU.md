@@ -190,3 +190,37 @@ TFLite 2.14.1 successfully exporting its C API does not guarantee that
 the particular source model's op versions are supported; the first
 real model load is a separate test.
 
+
+## Stage 5.2 — подтверждён первый CPU вызов Section1 и подготовлена сверка с QNN
+
+На Q8B через системную TFLite 2.14.1 успешно выполнена **настоящая** сигнатура `decode_rope` из оригинальной `Section1_TFLiteModel_tf_lite_aux.tflite`:
+
+```text
+CPU_TFLITE_VERSION: 2.14.1
+CPU_SIGNATURE_COUNT: 6
+CPU_INPUT_META: input_pos type=2 shape=[1] bytes=4
+CPU_INVOKE_BEGIN: decode_rope
+CPU_OUTPUT: pos_emb_cos type=9 shape=[1,1,512] bytes=512
+CPU_OUTPUT: pos_emb_local_cos type=9 shape=[1,1,256] bytes=256
+CPU_OUTPUT: pos_emb_local_sin type=9 shape=[1,1,256] bytes=256
+CPU_OUTPUT: pos_emb_sin type=9 shape=[1,1,512] bytes=512
+CPU_SIGNATURE_OK: decode_rope inputs=1 outputs=4
+```
+
+Все четыре файла сохранены под `cpu_rope_pos3/`, пока **не сверены** с QNN Decode. Из сохранённого отчёта ввода `qnn_partition_0` установлено точное соответствие: `pos_emb_cos = input[3]`, `pos_emb_sin = input[5]`, `pos_emb_local_sin = input[6]`, `pos_emb_local_cos = input[18]`. Соответствующие размеры: 512/512/256/256 байт. Отдельно для будущей проверки масок: `mask_local = input[22]`, `mask_global = input[27]`, по 4097 байт.
+
+Добавлен читающий-only `scripts/verify_cpu_aux.py`; он разбирает реальный qnn-net-run input-list (38 путей в порядке QNN metadata), проверяет имена при `name:=file`, наличие файлов и размеры, после чего сравнивает **все байты**. Используем именно сохранённую выборку шага 3, соответствующую `input_pos=3`:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+
+cd ~/gemma4_qnn_test
+python3 ../gemma4-cli-stage1/scripts/verify_cpu_aux.py \
+  --kind rope --cpu-dir cpu_rope_pos3 \
+  --decode-list auto_decode_step3_list.txt
+```
+
+Ожидаемый результат при полном совпадении: `CPU_AUX_ALL_MATCH: kind=rope tensors=4 bytes=1536`. В случае отличий — `CPU_AUX_MISMATCH` с названием, индексом QNN-входа и первым различающимся байтом; **не** считать уже подтверждённое исполнение CPU доказательством побайтовой точности до этой проверки.
+
+После RoPE можно выполнить `decode_mask` с правильным токеном и `time_step`, сохранить маски в отдельный каталог и запустить тот же скрипт с `--kind mask`. Значения реального токена пока не извлечены из сохранённых шагов; не подставлять случайный ID при проверке соответствия.
