@@ -451,6 +451,7 @@ struct Options {
     bool prefill_kv_token_set = false;
     bool prefill_kv_steps_set = false;
     bool prefill_seed_last_prompt = false;
+    bool prefill_seed_first_prompt = false;
     bool prefill_tie_policy_set = false;
     bool prefill_allow_tie_lowest = false;
     bool prefill_kv_diagnose = false;
@@ -609,6 +610,9 @@ void usage(const char* executable) {
         << "     final real prompt token at pos16 with Prefill KV rows 0..15,\n"
         << "     then computes the FIRST next token with linked LM Head.\n"
         << "     Experimental: outputs are NOT compared to independent saved Decode.\n"
+        << "  --prefill-seed-first-prompt: one-step independent Decode(pos0)\n"
+        << "     using the first verified prompt ID and zero initial KV; compare\n"
+        << "     its KV slices to Prefill row0 (diagnostic only).\n"
         << "  --prefill-kv-diagnose: read-only per-layer/row/layer-mapping INT8\n"
         << "     differences of last prompt Prefill KV vs Decode KV slices.\n"
         << "     Requires --prefill-seed-last-prompt; does NOT change any data.\n"
@@ -645,6 +649,10 @@ Options parse_options(int argc, char** argv) {
         }
         if (arg == "--prefill-seed-last-prompt") {
             options.prefill_seed_last_prompt = true;
+            continue;
+        }
+        if (arg == "--prefill-seed-first-prompt") {
+            options.prefill_seed_first_prompt = true;
             continue;
         }
         if (arg == "--prefill-kv-diagnose") {
@@ -835,13 +843,16 @@ Options parse_options(int argc, char** argv) {
                 "and all three CPU model files");
         if (options.prefill_kv_run &&
             (!options.prefill_kv_probe ||
-             (options.prefill_kv_token_set == options.prefill_seed_last_prompt) ||
+             (static_cast<int>(options.prefill_kv_token_set) +
+              static_cast<int>(options.prefill_seed_last_prompt) +
+              static_cast<int>(options.prefill_seed_first_prompt) != 1) ||
              !options.chain_decode_head || options.cpu_aux_model.empty() ||
              options.cpu_embed_section0.empty() ||
              options.cpu_embed_section2.empty()))
             throw std::runtime_error(
                 "--prefill-kv-run requires --prefill-kv-probe, exactly one "
-                "of --prefill-kv-token ID or --prefill-seed-last-prompt, "
+                "of --prefill-kv-token ID, --prefill-seed-last-prompt, "
+                "or --prefill-seed-first-prompt, "
                 "--chain-decode-head, --cpu-aux-model, "
                 "--cpu-embed-section0 and --cpu-embed-section2");
         if (options.prefill_kv_token_set && !options.prefill_kv_run)
@@ -853,14 +864,21 @@ Options parse_options(int argc, char** argv) {
         if (options.prefill_seed_last_prompt && !options.prefill_kv_run)
             throw std::runtime_error(
                 "--prefill-seed-last-prompt only valid with --prefill-kv-run");
+        if (options.prefill_seed_first_prompt &&
+            (!options.prefill_kv_run || options.prefill_kv_steps!=1))
+            throw std::runtime_error(
+                "--prefill-seed-first-prompt requires --prefill-kv-run "
+                "and exactly one Decode step");
         if (options.prefill_tie_policy_set && !options.prefill_kv_run)
             throw std::runtime_error(
                 "--prefill-tie-policy only valid with --prefill-kv-run");
         if (options.prefill_kv_diagnose &&
-            (!options.prefill_kv_run || !options.prefill_seed_last_prompt))
+            (!options.prefill_kv_run ||
+             !(options.prefill_seed_last_prompt ||
+               options.prefill_seed_first_prompt)))
             throw std::runtime_error(
                 "--prefill-kv-diagnose requires --prefill-kv-run "
-                "and --prefill-seed-last-prompt");
+                "and --prefill-seed-last-prompt or --prefill-seed-first-prompt");
         if (!options.kv_next_list.empty() && !options.kv_feedback)
             throw std::runtime_error("--kv-next-list requires --kv-feedback-pos or --kv-auto-pos");
         if (options.kv_auto_pos && options.kv_next_list.empty())
@@ -883,7 +901,8 @@ Options parse_options(int argc, char** argv) {
     }
     if (options.prefill_kv_probe || options.prefill_kv_run ||
         options.prefill_kv_token_set || options.prefill_kv_steps_set ||
-        options.prefill_seed_last_prompt || options.prefill_tie_policy_set ||
+        options.prefill_seed_last_prompt || options.prefill_seed_first_prompt ||
+        options.prefill_tie_policy_set ||
         options.prefill_kv_diagnose || options.chain_decode_head ||
         options.kv_feedback || options.kv_run_next ||
         !options.kv_next_list.empty() || !options.kv_next_reference_dir.empty() ||
@@ -1721,7 +1740,8 @@ void probe_prefill_kv_bridge(
     const ReplayJob& prefill,const ReplayJob& decode,
     const std::string& token_file,
     std::vector<std::vector<uint8_t>>* linked_caches = nullptr,
-    bool seed_last_prompt = false) {
+    bool seed_last_prompt = false,
+    bool seed_first_prompt = false) {
     constexpr size_t kCapacity=4096,kBlockRows=128;
     if(prefill.graph_name!="qnn_partition_2" ||
        decode.graph_name!="qnn_partition_0" ||
@@ -1747,9 +1767,14 @@ void probe_prefill_kv_bridge(
     if(seed_last_prompt && (!linked_caches || valid_tokens<2))
         throw std::runtime_error(
             "PREFILL_LAST_TOKEN_PROBE_NEEDS_TWO_TOKENS_AND_SCRATCH");
-    // Keep the last real prompt token out of the scratch KV cache: it
-    // will be replayed via Decode so LM Head can produce first logits.
-    const size_t copied_rows=valid_tokens-(seed_last_prompt?1:0);
+    if(seed_first_prompt && (!linked_caches || !valid_tokens || seed_last_prompt))
+        throw std::runtime_error(
+            "PREFILL_FIRST_TOKEN_PROBE_REQUIRES_EXCLUSIVE_SCRATCH_MODE");
+    // Last-token mode copies the true prompt prefix. First-token mode
+    // deliberately copies NONE of the Prefill KV outputs so it can test
+    // the numerical disagreement in the absence of history.
+    const size_t copied_rows=seed_first_prompt?0:
+        valid_tokens-(seed_last_prompt?1:0);
     const auto links=decode_kv_links(decode);
     if(links.size()!=30)
         throw std::runtime_error("KV_PREFILL_PROBE_REQUIRES_30_KV_LINKS");
@@ -1856,9 +1881,10 @@ void probe_prefill_kv_bridge(
         // Never start from the independent saved Decode sample. A future
         // true prompt path must initialize its own 30 K/V caches correctly.
         std::vector<uint8_t> scratch(tensor_nbytes(target),0);
-        gemma4::update_kv_block(
-            scratch,block,link.channels,kCapacity,0,kBlockRows,copied_rows,
-            link.key?gemma4::KvLayout::Key:gemma4::KvLayout::Value);
+        if(copied_rows)
+            gemma4::update_kv_block(
+                scratch,block,link.channels,kCapacity,0,kBlockRows,copied_rows,
+                link.key?gemma4::KvLayout::Key:gemma4::KvLayout::Value);
         // Independent readback of all inserted bytes (not just a checksum).
         for(size_t row=0;row<copied_rows;++row) {
             for(size_t c=0;c<link.channels;++c) {
@@ -1894,6 +1920,7 @@ void probe_prefill_kv_bridge(
                  <<" rows_copied="<<copied_rows
                  <<" padding_rows_skipped="<<(kBlockRows-valid_tokens)
                  <<" last_real_token_held_out="<<(seed_last_prompt?1:0)
+                 <<" first_prompt_replay="<<(seed_first_prompt?1:0)
                  <<" output_index="<<from
                  <<" decode_index="<<link.input_index
                  <<" quant_scale="<<qsrc.scaleOffsetEncoding.scale
@@ -1913,6 +1940,7 @@ void probe_prefill_kv_bridge(
              <<" copied_rows="<<copied_rows
              <<" next_decode_position="<<copied_rows
              <<" last_prompt_replay="<<(seed_last_prompt?1:0)
+             <<" first_prompt_replay="<<(seed_first_prompt?1:0)
              <<" copied_bytes="<<inserted
              <<" scratch_cache_bytes="<<scratch_bytes
              <<" prefill_kv_input_nonzero_bytes="<<prefill_input_nonzero
@@ -1947,11 +1975,23 @@ void execute_prefill_linked_decode(
     }
     if(first_pad==0)
         throw std::runtime_error("PREFILL_LINK_EMPTY_PROMPT");
-    const size_t first_position=first_pad-(options.prefill_seed_last_prompt?1:0);
-    const int32_t first_token=options.prefill_seed_last_prompt?
-        prompt[first_pad-1]:options.prefill_kv_token;
+    const size_t first_position=options.prefill_seed_first_prompt?0:
+        first_pad-(options.prefill_seed_last_prompt?1:0);
+    const int32_t first_token=options.prefill_seed_first_prompt?prompt[0]:
+        (options.prefill_seed_last_prompt?
+         prompt[first_pad-1]:options.prefill_kv_token);
     if(first_position>=4096 || first_token<0 || first_token>=262144)
         throw std::runtime_error("PREFILL_LINK_POSITION_OR_TOKEN_INVALID");
+    if(options.prefill_seed_first_prompt) {
+        if(prompt[0]==0)
+            throw std::runtime_error("PREFILL_FIRST_PROMPT_ID_IS_PADDING");
+        std::cout<<"PREFILL_FIRST_PROMPT_SEED: prompt_tokens="<<first_pad
+                 <<" replay_position=0"
+                 <<" replay_token="<<first_token
+                 <<" kv_rows_from_prefill=0"
+                 <<" all_KV_raw_zero=1 no_previous_attention_context=1\n"
+                 <<std::flush;
+    }
     if(options.prefill_seed_last_prompt) {
         if(first_pad<2 || prompt[first_pad-1]==0)
             throw std::runtime_error("PREFILL_LAST_PROMPT_TOKEN_INVALID");
@@ -2042,8 +2082,8 @@ void execute_prefill_linked_decode(
              <<" execute_ms="
              <<std::chrono::duration<double,std::milli>(stop-start).count()
              <<" independent_decode_reference_comparison=0\n"<<std::flush;
-    if(options.prefill_seed_last_prompt) {
-        // Independently compare all 30 last-token Decode KV slices with the
+    if(options.prefill_seed_last_prompt || options.prefill_seed_first_prompt) {
+        // Independently compare all 30 replayed-token Decode KV slices with the
         // last row of the Prefill-128 output blocks. This is an extra
         // cross-graph numerical diagnostic; do not assume bit-exactness
         // between distinct QNN kernels. Record differences honestly.
@@ -2086,7 +2126,9 @@ void execute_prefill_linked_decode(
             total+=link.channels;
             different+=mismatch;
             if(mismatch==0)++exact_tensors;
-            std::cout<<"PREFILL_LAST_PROMPT_KV_SLICE_COMPARE: "
+            std::cout<<(options.prefill_seed_first_prompt?
+                         "PREFILL_FIRST_PROMPT_KV_SLICE_COMPARE: ":
+                         "PREFILL_LAST_PROMPT_KV_SLICE_COMPARE: ")
                      <<"name="<<source_name
                      <<" kind="<<(link.key?"K":"V")
                      <<" bytes="<<link.channels
@@ -2211,7 +2253,9 @@ void execute_prefill_linked_decode(
                      <<" no_relabel_or_patch_applied=1"
                      <<" diagnostic_only=1\n"<<std::flush;
         }
-        std::cout<<"PREFILL_LAST_PROMPT_KV_COMPARE: tensors=30"
+        std::cout<<(options.prefill_seed_first_prompt?
+                     "PREFILL_FIRST_PROMPT_KV_COMPARE: tensors=30":
+                     "PREFILL_LAST_PROMPT_KV_COMPARE: tensors=30")
                  <<" compared_bytes="<<total
                  <<" mismatching_bytes="<<different
                  <<" exact_tensors="<<exact_tensors
@@ -2385,6 +2429,7 @@ void execute_prefill_linked_decode(
              <<" last_position="<<(first_position+options.prefill_kv_steps-1)
              <<" first_token="<<first_token
              <<" last_prompt_replayed="<<(options.prefill_seed_last_prompt?1:0)
+             <<" first_prompt_replayed="<<(options.prefill_seed_first_prompt?1:0)
              <<" int8_tie_policy="<<(options.prefill_allow_tie_lowest?"lowest-id-experimental":"stop")
              <<" all_KV_from_prefill_or_feedback_RAM=1"
              <<" all_nonKV_from_CPU=1"
@@ -2593,7 +2638,8 @@ int run_replay_jobs(const Options& options) {
             throw std::runtime_error("KV_PREFILL_PROBE_NEEDS_PREFILL_AND_DECODE");
         probe_prefill_kv_bridge(*src,*dst,options.cpu_prefill_tokens,
                                 options.prefill_kv_run ? &linked_cache_buffers : nullptr,
-                                options.prefill_seed_last_prompt);
+                                options.prefill_seed_last_prompt,
+                                options.prefill_seed_first_prompt);
     }
     // Execute the linked graph *after* checking all saved individual baselines.
     // The saved Head reference belongs to a different Decode step; do not
