@@ -257,3 +257,66 @@ CPU_AUX_REFERENCE_MATCH: mask_global qnn_input_index=27 bytes=4097
 CPU_AUX_ALL_MATCH: kind=mask tensors=2 bytes=8194
 CPU_MASK_STEP3_VERIFIED: outputs byte-identical to saved QNN inputs
 ```
+
+## Stage 5.4 — CPU Section1 → QNN Decode без промежуточных .raw (новый код)
+
+**Stage 5.3 подтверждён пользователем:** оба выхода `decode_mask`
+побайтово совпали с сохранёнными входами QNN Decode шага 3.
+Вместе с Stage 5.2 это шесть INT8 AUX-тензоров общей длиной
+`512+512+256+256+4097+4097 = 9730` байт.
+
+Добавлен модуль `src/cpu_aux.cpp` и новая опция `gemma4-qnn-run --jobs`.
+При `--cpu-aux-model ... --cpu-aux-pos N --cpu-aux-token ID` исполняются
+две именованные TFLite-сигнатуры `decode_rope` и `decode_mask` через
+установленную системную `libtensorflow-lite.so.2.14.1` (C ABI / `dlopen`).
+Выходы C API **не записываются в файлы**, а прямо подставляются в шесть
+QNN Decode input buffers, найденных по именам в метаданных QNN.
+Для безопасности перед заменой CPU-выходы обязательно проверяются
+побайтово против шести исходных сохранённых входов текущего Decode.
+Если есть несовпадение, исполнение NPU не начинается.
+
+Для первого теста оставляем другие 32 входа Decode (30 KV + два
+FLOAT32 embedding) из сохранённого списка и снова сверяем все 31
+выход Decode с оригинальным `qnn-net-run` эталоном.
+Остальные QNN-графы в jobs по-прежнему должны совпадать с эталонами.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+
+cd ~/gemma4_qnn_test
+export LD_LIBRARY_PATH="$PWD/sdk247"
+export ADSP_LIBRARY_PATH="$PWD/sdk247"
+set -o pipefail
+
+../gemma4-cli-stage1/build/gemma4-qnn-run \
+  --system "$PWD/sdk247/libQnnSystem.so" \
+  --backend "$PWD/sdk247/libQnnHtp.so" \
+  --jobs persistent_jobs_decode_prefill_head.txt \
+  --cpu-aux-model "$PWD/cpu_models/Section1_TFLiteModel_tf_lite_aux.tflite" \
+  --cpu-aux-pos 3 --cpu-aux-token 2 \
+  2>&1 | tee cpu_aux_qnn_decode.log
+```
+
+Ожидаем (пока на Q8B не проверено):
+
+```text
+CPU_AUX_SIGNATURE_OK: decode_rope outputs=4
+CPU_AUX_SIGNATURE_OK: decode_mask outputs=2
+CPU_AUX_QNN_REPLACED: tensors=6 bytes=9730 from=Section1_TFLite_2.14 verified_against_saved_decode=1
+ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors
+```
+
+Флаги `--cpu-aux-pos` и `--cpu-aux-token` обязательны, по умолчанию не
+подставляются. Для данного эталона пользователь уже получил побайтовое
+совпадение при `pos=3`, пробном непустом `token=2`. Это **не**
+доказательство идентичности реального ID токена шага 3,
+но достаточно для строгого сравнения шести входов и 31 выхода QNN.
+
+**Граница Stage 5.4:** CPU AUX замещает только входы **первого** Decode
+из jobs. В режиме `--kv-run-next` второй Decode пока использует
+восемь не-KV входов из следующего сохранённого списка; прямое
+питание от CPU AUX для следующего шага — отдельное развитие.
+Модель Section0 и Section2 не участвуют в этом тесте.
