@@ -102,6 +102,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 6.4 (Q8B подтверждён):** `CPU_FULL_PREFILL_DECODE_OK`, все 8 CPU non-KV входов Prefill + 8 Decode в одном процессе, все 62 выхода трёх QNN графов и шаг 4 Decode/LM Head побайтово совпали. **Stage 6.5 (пока не проверен):** [scripts/test_prefill_kv_bridge.sh](scripts/test_prefill_kv_bridge.sh) проверяет **30** именованных выходных Prefill K/V-срезов → входов Decode по metadata и квантованию, собирает K/V cache только для **17 настоящих токенов** в отдельных scratch RAM буферах, игнорирует 111 padded позиций. Настоящий Decode KV ещё не заменяется, независимые samples не смешиваются.
 
+**Stage 6.5 (подтверждён на Q8B):** все 30 Prefill K/V блоков (K strided, V contiguous) сопоставлены с Decode cache, 17 настоящих token slots записаны в scratch RAM, 111 padded slots проигнорированы. **Stage 6.6 (новый код, Q8B ещё не запускал):** [scripts/test_prefill_decode_link.sh](scripts/test_prefill_decode_link.sh) после побайтовой baseline-регрессии делает настоящий `Prefill K/V → Decode(pos17, probe token=568) → LM Head` в RAM. Строгие guards требуют нулевых 28 начальных Prefill K/V и совместимого INT8 zero-point. Probe token 568 не является доказанным следующим токеном именно Prefill; логиты связанного запуска не сравниваются с независимыми saved эталонами.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.

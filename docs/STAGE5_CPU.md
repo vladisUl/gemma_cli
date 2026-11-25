@@ -1343,3 +1343,95 @@ KV_PREFILL_STAGE6_5_OK: 30 source slices mapped, 17 valid token rows copied into
 или `KV_PREFILL_PROBE_QUANT_MISMATCH`, не переносить байты
 напрямую в настоящий cache: нужны сведения о масштабе
 квантования из QNN metadata или явная конверсия.
+
+## Stage 6.5 — успешно проверен на Q8B
+
+Пользователь подтвердил успешный `test_prefill_kv_bridge.sh`: 
+
+```text
+DECODE_NEXT_REFERENCE_MATCH: 31 output tensors byte-identical
+DECODE_NEXT_HEAD_REFERENCE_MATCH: 262144 logits bytes identical
+CPU_FULL_PREFILL_DECODE_OK: Prefill-128 eight CPU inputs, 3 QNN graphs 62 outputs, two Decode steps and LM Head byte-identical
+KV_PREFILL_STAGE6_5_OK: 30 source slices mapped, 17 valid token rows copied into scratch RAM, 111 padding rows excluded
+```
+
+Таким образом, Stage 6.5 подтвердил 30 метаданных K/V
+Prefill → Decode и перенос 17 не-padding строк в отдельные
+RAM-буферы без изменения рабочих Decode входов. В представленном
+хвосте лога **нет значения** `KV_PREFILL_SOURCE_CACHE_INFO:`
+`nonzero_bytes=...`, поэтому нельзя утверждать, что исходные
+28 Prefill cache действительно нулевые.
+
+## Stage 6.6 — первый настоящий Prefill KV → Decode(pos17) → LM Head
+
+**Экспериментальный код ещё не проверен на Q8B.**
+Добавлены опции `gemma4-qnn-run`:
+
+```text
+--prefill-kv-probe --prefill-kv-run --prefill-kv-token 568
+```
+
+В дополнение к четырём `--cpu-prefill-*` моделям/token file,
+обычным `--cpu-aux-model` и `--cpu-embed-section0/2`, и
+`--chain-decode-head`. Самостоятельная тестовая оболочка
+`scripts/test_prefill_decode_link.sh` задаёт параметры автоматически.
+
+Принцип работы:
+
+1. Старый baseline сначала выполняет три QNN графа (в безопасном
+   порядке Decode → Prefill → LM Head), проверяет все 62 output tensors.
+2. Stage 6.5 проверяет 30 Prefill K/V tensor links и квантование,
+   копирует 17 row в 30 отдельные нулевые scratch K/V буферы.
+   В режиме запуска проверяет, что **все 28 начальных входов Prefill
+   cache байтово нулевые** и что QNN signed INT8 cache имеет
+   offset=0; иначе немедленно отказывается строить фиктивный
+   fresh-prompt KV.
+3. Прежний двухшаговый Decode c KV-feedback и LM Head
+   по-прежнему сверяется с сохранёнными эталонами.
+4. Сразу после этого в отдельном тестовом запуске
+   **реально исполняется `qnn_partition_0`** с 30 scratch K/V
+   из Prefill и **новыми 8 CPU non-KV** из Section0/1/2
+   для `position=17, token=568`. Никаких сохранённых Decode
+   `input_buffers` этот вызов не читает и не заменяет;
+   единственное изменение — новые Decode `output_buffers`.
+5. `qnn_partition_1` (LM Head) исполняется на hidden output этого
+   связанного Decode. Печатает реальный INT8 `argmax`, но
+   **НЕ** сравнивает его с независимым Decode/LM Head sample
+   и не выдаёт его за ответ на исходный prompt.
+
+Token ID **568 — только явно выбранный probe token**, ранее
+полученный на независимом Decode sample. Наш `qnn_partition_2`
+Prefill контекст выдаёт 30 K/V output slices без LM Head logits;
+поэтому настоящий первый token ID после Prefill **пока не
+извлечён** из его финального скрытого состояния.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+bash scripts/test_prefill_decode_link.sh
+```
+
+Отдельный лог:
+`~/gemma4_qnn_test/cpu_prefill_link_stage6_6.log`.
+Искомые, пока не подтверждённые строки:
+
+```text
+PREFILL_LINK_INPUTS_READY: kv_from_prefill_ram=30 nonkv_from_cpu=8 position=17 input_token=568 saved_decode_inputs_used=0 fresh_prefill_initial_kv_zero=1
+PREFILL_LINK_DECODE_OK: graph=qnn_partition_0 outputs=31 position=17 input_token=568 ... independent_decode_reference_comparison=0
+PREFILL_LINK_HEAD_OK: logits_bytes=262144 linked_prefill_kv=1 no_saved_decode_reference_claim=1
+PREFILL_LINK_STAGE6_6_OK: Prefill 30 KV blocks (17 rows) -> real Decode(pos17, token568) -> real LM Head, no independent reference claim
+```
+
+В случае
+`PREFILL_LINK_REQUIRES_ZERO_INITIAL_28_KV`
+сначала разобраться с Prefill initial cache — не отключать
+это условие ради успешного сообщения. Если
+`PREFILL_LINK_NONZERO_QUANT_ZERO_POINT`, подобрать
+корректное квантованное значение нуля и подтвердить его.
+
+Stage 6.6 устанавливает возможность связанного выполнения NPU
+но ещё **не обеспечивает семантически корректную генерацию текста**:
+для неё потребуются реальный first-next token, tokenizer,
+выбор/сэмплинг ID и дальнейшие Decode-шаги без saved refs.
