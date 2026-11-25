@@ -432,6 +432,8 @@ struct Options {
     std::string kv_next_reference_dir, kv_next_head_reference_dir;
     std::string cpu_aux_model;
     std::string cpu_embed_section0, cpu_embed_section2;
+    std::string cpu_prefill_tokens, cpu_prefill_section0, cpu_prefill_section2;
+    std::string cpu_prefill_aux_model;
     bool inspect = false;
     bool check_inputs = false;
     bool chain_decode_head = false;
@@ -583,6 +585,10 @@ void usage(const char* executable) {
         << "  --cpu-embed-section0 FILE --cpu-embed-section2 FILE --cpu-embed-token ID\n"
         << "     replaces two FLOAT32 Decode embeddings with packed INT2/INT4 CPU results.\n"
         << "  Add --cpu-embed-next-token ID with --kv-run-next for the second Decode.\n"
+        << "  --cpu-prefill-tokens TOKENS_I32.raw --cpu-prefill-section0 MODEL0.tflite\n"
+        << "  --cpu-prefill-section2 MODEL2.tflite --cpu-prefill-aux-model MODEL1.tflite\n"
+        << "     computes all eight Prefill-128 non-KV inputs from CPU in RAM.\n"
+        << "     Strictly compares to original saved Prefill inputs before QNN.\n"
         << "No implicit tensor conversions or synthetic zero inputs.\n";
 }
 
@@ -635,6 +641,10 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--kv-next-reference-dir") options.kv_next_reference_dir = value;
         else if (arg == "--kv-next-head-reference-dir") options.kv_next_head_reference_dir = value;
         else if (arg == "--cpu-aux-model") options.cpu_aux_model = value;
+        else if (arg == "--cpu-prefill-tokens") options.cpu_prefill_tokens = value;
+        else if (arg == "--cpu-prefill-section0") options.cpu_prefill_section0 = value;
+        else if (arg == "--cpu-prefill-section2") options.cpu_prefill_section2 = value;
+        else if (arg == "--cpu-prefill-aux-model") options.cpu_prefill_aux_model = value;
         else if (arg == "--cpu-aux-pos") {
             if (options.cpu_aux_pos_set || value.empty() || value.front() == '-')
                 throw std::runtime_error("--cpu-aux-pos expects a single integer 0..4095");
@@ -740,6 +750,14 @@ Options parse_options(int argc, char** argv) {
         if (options.cpu_embed_next_token_set && (!full_embed || !options.kv_run_next))
             throw std::runtime_error(
                 "--cpu-embed-next-token requires both embedding models, first token and --kv-run-next");
+        const unsigned prefill_option_count =
+            static_cast<unsigned>(!options.cpu_prefill_tokens.empty()) +
+            static_cast<unsigned>(!options.cpu_prefill_section0.empty()) +
+            static_cast<unsigned>(!options.cpu_prefill_section2.empty()) +
+            static_cast<unsigned>(!options.cpu_prefill_aux_model.empty());
+        if (prefill_option_count != 0 && prefill_option_count != 4)
+            throw std::runtime_error(
+                "CPU Prefill requires all four --cpu-prefill-* options");
         if (!options.kv_next_list.empty() && !options.kv_feedback)
             throw std::runtime_error("--kv-next-list requires --kv-feedback-pos or --kv-auto-pos");
         if (options.kv_auto_pos && options.kv_next_list.empty())
@@ -768,7 +786,11 @@ Options parse_options(int argc, char** argv) {
         options.cpu_aux_next_token_set ||
         !options.cpu_embed_section0.empty() ||
         !options.cpu_embed_section2.empty() ||
-        options.cpu_embed_token_set || options.cpu_embed_next_token_set)
+        options.cpu_embed_token_set || options.cpu_embed_next_token_set ||
+        !options.cpu_prefill_tokens.empty() ||
+        !options.cpu_prefill_section0.empty() ||
+        !options.cpu_prefill_section2.empty() ||
+        !options.cpu_prefill_aux_model.empty())
         throw std::runtime_error("Chained/KV/CPU AUX options require --jobs");
     if (options.binary.empty() || options.system.empty())
         throw std::runtime_error("--binary and --system are required");
@@ -1465,6 +1487,101 @@ void apply_cpu_embeddings_decode(ReplayJob& decode, const Options& options,
              <<" verified_against_saved_decode=1\n"<<std::flush;
 }
 
+// Strict QNN metadata index and source reference validation for one CPU
+// generated Prefill-128 tensor. The original saved .raw is NEVER modified;
+// only the QNN in-memory vector is replaced after a byte-exact match.
+void install_cpu_prefill_tensor(
+    ReplayJob& prefill, size_t index, const std::string& required_name,
+    Qnn_DataType_t required_type,size_t required_bytes,
+    std::vector<uint8_t> generated) {
+    if(prefill.graph_name!="qnn_partition_2" ||
+       prefill.inputs.size()!=36 || prefill.input_buffers.size()!=36 ||
+       index>=prefill.inputs.size())
+        throw std::runtime_error("CPU_PREFILL_QNN_GRAPH_METADATA_MISMATCH");
+    const char* name=tensor_name(prefill.inputs[index]);
+    if(!name || required_name!=name ||
+       tensor_dtype(prefill.inputs[index])!=required_type ||
+       tensor_nbytes(prefill.inputs[index])!=required_bytes ||
+       prefill.input_buffers[index].size()!=required_bytes ||
+       generated.size()!=required_bytes)
+        throw std::runtime_error("CPU_PREFILL_INPUT_METADATA_MISMATCH: "+
+                                 required_name+" index="+std::to_string(index));
+    const auto& saved=prefill.input_buffers[index];
+    const auto diff=std::mismatch(generated.begin(),generated.end(),saved.begin());
+    if(diff.first!=generated.end())
+        throw std::runtime_error("CPU_PREFILL_INPUT_REFERENCE_MISMATCH: "+
+            required_name+" index="+std::to_string(index)+" first_byte="+
+            std::to_string(static_cast<size_t>(diff.first-generated.begin())));
+    prefill.input_buffers[index]=std::move(generated);
+    bind_raw(prefill.inputs[index],prefill.input_buffers[index]);
+    std::cout<<"CPU_PREFILL_INPUT_MATCH: "<<required_name
+             <<" qnn_index="<<index<<" bytes="<<required_bytes
+             <<" from_CPU=1\n"<<std::flush;
+}
+
+void apply_cpu_prefill(ReplayJob& prefill,const Options& options) {
+    if(prefill.graph_name!="qnn_partition_2" || prefill.inputs.size()!=36 ||
+       prefill.outputs.size()!=30)
+        throw std::runtime_error("CPU_PREFILL_REQUIRES_36_INPUT_30_OUTPUT_GRAPH");
+    const auto token_raw=read_file(options.cpu_prefill_tokens);
+    if(token_raw.size()!=128*sizeof(int32_t))
+        throw std::runtime_error("CPU_PREFILL_TOKENS_REQUIRE_512_BYTES");
+    std::vector<int32_t> tokens(128);
+    std::memcpy(tokens.data(),token_raw.data(),token_raw.size());
+    for(int32_t id:tokens)
+        if(id<0 || id>=262144)
+            throw std::runtime_error("CPU_PREFILL_TOKEN_OUT_OF_RANGE");
+    std::cout<<"CPU_PREFILL_INPUTS_BEGIN: positions=128 "
+             <<"source_tokens=verified_i32_512 from=Section0_Section1_Section2\n"
+             <<std::flush;
+
+    auto embed0=gemma4::compute_packed_prefill_embeddings(
+        options.cpu_prefill_section0,0,tokens);
+    install_cpu_prefill_tensor(prefill,32,"prefill_128_embeddings_0",
+                              QNN_DATATYPE_FLOAT_32,786432,std::move(embed0));
+    auto embed2=gemma4::compute_packed_prefill_embeddings(
+        options.cpu_prefill_section2,2,tokens);
+    install_cpu_prefill_tensor(prefill,7,"prefill_128_per_layer_embeddings_0",
+                              QNN_DATATYPE_FLOAT_32,4587520,std::move(embed2));
+
+    auto aux=gemma4::run_prefill_aux(options.cpu_prefill_aux_model,tokens);
+    if(aux.size()!=6)
+        throw std::runtime_error("CPU_PREFILL_AUX_EXPECTED_6_TENSORS");
+    struct AuxTarget {
+        const char* name;
+        size_t index;
+        size_t bytes;
+    };
+    const std::array<AuxTarget,6> spec{{
+        {"prefill_128_pos_emb_cos_0",3,65536},
+        {"prefill_128_pos_emb_sin_0",5,65536},
+        {"prefill_128_pos_emb_local_sin_0",6,32768},
+        {"prefill_128_pos_emb_local_cos_0",18,32768},
+        {"prefill_128_mask_local_0",21,540672},
+        {"prefill_128_mask_global_0",26,540672}
+    }};
+    size_t aux_bytes=0;
+    for(size_t i=0;i<spec.size();++i) {
+        if(aux[i].qnn_name!=spec[i].name)
+            throw std::runtime_error("CPU_PREFILL_AUX_OUTPUT_ORDER_MISMATCH");
+        aux_bytes+=aux[i].bytes.size();
+        install_cpu_prefill_tensor(prefill,spec[i].index,spec[i].name,
+              QNN_DATATYPE_SFIXED_POINT_8,spec[i].bytes,
+              std::move(aux[i].bytes));
+    }
+    if(aux_bytes!=1277952)
+        throw std::runtime_error("CPU_PREFILL_AUX_EXPECTED_1277952_BYTES");
+    // Rebind every QNN input after vector moves; 28 saved initial K/V
+    // buffers remain intact, while all 8 non-KV inputs come from CPU.
+    for(size_t i=0;i<prefill.inputs.size();++i)
+        bind_raw(prefill.inputs[i],prefill.input_buffers[i]);
+    std::cout<<"CPU_PREFILL_ALL_NONKV_QNN_REPLACED: tensors=8"
+             <<" embeddings_bytes=5373952 aux_bytes="<<aux_bytes
+             <<" total_bytes="<<(5373952+aux_bytes)
+             <<" kv_inputs_from_saved=28 verified_against_saved_qnn=1\n"
+             <<std::flush;
+}
+
 int run_replay_jobs(const Options& options) {
     auto jobs = parse_replay_jobs(options.jobs);
     // Check all files, all tensor sizes and graph metadata BEFORE NPU init.
@@ -1601,6 +1718,22 @@ int run_replay_jobs(const Options& options) {
         if (!decode) throw std::runtime_error("CPU_EMBED_MISSING_DECODE_JOB");
         apply_cpu_embeddings_decode(*decode, options,
                                     options.cpu_embed_token, "first");
+    }
+
+    if (!options.cpu_prefill_tokens.empty()) {
+        ReplayJob* prefill=nullptr;
+        for(auto& job:jobs) {
+            if(job->graph_name!="qnn_partition_2")continue;
+            if(prefill)
+                throw std::runtime_error("CPU_PREFILL_DUPLICATE_PREFILL_JOB");
+            prefill=job.get();
+        }
+        if(!prefill)throw std::runtime_error("CPU_PREFILL_JOB_NOT_FOUND");
+        // Keep Q8B's proven Decode-first loading order when multiple
+        // contexts are present; Prefill-only replay is also supported.
+        if(jobs.size()>1 && jobs.front()->graph_name!="qnn_partition_0")
+            throw std::runtime_error("CPU_PREFILL_MULTI_CONTEXT_NEEDS_DECODE_FIRST");
+        apply_cpu_prefill(*prefill,options);
     }
 
     QnnRuntime runtime(options.backend);
