@@ -129,3 +129,42 @@ PERSISTENT_THREE_VERIFIED: 3 graphs, 62 output tensors byte-identical
 - Пути из manifest разрешаются относительно **текущей рабочей директории**, обычно `~/gemma4_qnn_test`.
 - Для каждого контекста сохраняются исходный binary buffer и объект QNN System Metadata; по окончании работы все QNN context освобождаются, затем QNN device/backend.
 - Один вызов каждого графа не является тестом KV-cache feedback. Следующий этап после успешного совместного исполнения — persistent входные/выходные буферы, циклическая подача K/V-срезов, CPU LiteRT и tokenizer.
+
+## Stage 4: ошибка одновременной загрузки Prefill → Decode (Q8B)
+
+Проверка трёх контекстов (2026-11-25) остановилась при загрузке второго контекста:
+
+```text
+QNN_CONTEXT_READY: qnn_partition_2 load_ms=167.312
+fastrpc memory map ... length: 1887436800 failed
+Could not allocate persistent weights buffer!
+QNN_RUN_ERROR: contextCreateFromBinary(qnn_partition_0): QNN error 1002
+```
+
+При этом доступная RAM Linux — около **13 ГиБ**. Это ошибка отображения весов в DSP через FastRPC/SMMU; она **не доказывает**, что не хватает обычной RAM, и не указывает на ошибку вычислений Prefill или Decode. После отказа DSP также сообщил SSR, поэтому при следующих тестах возможны проблемы с состоянием DSP-сессии. Точный предел памяти/адресного пространства HTP пока неизвестен.
+
+Для диагностики порядка и общего объёма отображения добавлен [`scripts/test_persistent_order.sh`](../scripts/test_persistent_order.sh). Скрипт берёт уже валидированные пары входов и эталонов из `persistent_jobs_all3.txt`, созданного предыдущим тестом. Он принимает названия графов в порядке загрузки и вызывает существующий `gemma4-qnn-run --jobs`; модель не перекомпилируется, исходные тестовые файлы не меняются.
+
+**Следующий отдельный эксперимент**: загрузить большой Decode **первым**, а маленький LM Head — вторым:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+
+cd ~/gemma4_qnn_test
+bash ../gemma4-cli-stage1/scripts/test_persistent_order.sh decode head
+```
+
+Успех:
+
+```text
+QNN_CONTEXT_READY: qnn_partition_0
+QNN_CONTEXT_READY: qnn_partition_1
+PERSISTENT_CONTEXTS_READY: 2 graphs; one backend/device; all contexts alive
+ALL_JOBS_REFERENCES_MATCH: 2 graphs 32 output tensors
+PERSISTENT_ORDER_VERIFIED: decode_head graphs=2 outputs=32
+```
+
+Если не пройдёт, **не повторять автоматически**: прислать первую строку ошибки отображения/загрузки. Далее выборочно проверить `decode` отдельно либо меньшую пару `prefill head`, чтобы определить, связано ли ограничение с суммарным объёмом или крупным контекстом. Лог: `persistent_decode_head.log`.
+
+Обратите внимание: существующие `--jobs` / graphExecute работали с реальными входами; новый скрипт только собирает варианты manifest. Результат одновременной загрузки ещё не подтверждён.
