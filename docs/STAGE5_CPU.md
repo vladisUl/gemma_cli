@@ -1259,3 +1259,87 @@ Stage 6.5: определить правильную укладку 30 Prefill o
 в Decode K/V (слоты, слои, порядок K strided / V contiguous),
 инициализацию cache и позиции первого Decode; потом tokenizer
 и генерацию последовательных ID без saved QNN input.
+
+## Stage 6.4 на Q8B — полный CPU Prefill + Decode reference replay подтверждён
+
+Пользователь получил итоговую строку `CPU_FULL_PREFILL_DECODE_OK` и
+подтвердил отсутствие ошибок. В конце лога:
+
+```text
+DECODE_NEXT_REFERENCE_MATCH: 31 output tensors byte-identical
+CHAIN_DECODE_HEAD_OK: ... logits_bytes=262144 ... int8_argmax_id=568
+DECODE_NEXT_HEAD_REFERENCE_MATCH: 262144 logits bytes identical
+CPU_FULL_PREFILL_DECODE_OK: Prefill-128 eight CPU inputs, 3 QNN graphs 62 outputs, two Decode steps and LM Head byte-identical
+```
+
+Stage 6.4 прошёл: два embeddings Prefill (Section0 INT2, Section2 INT4)
+и шесть AUX tensors Prefill (Section1 RoPE/masks) вычисляются в RAM
+внутри `gemma4-qnn-run`, сравниваются побайтово с исходными QNN
+input RAW и передаются в Prefill NPU. Decode два шага с CPU non-KV
+и RAM feedback 30 K/V продолжает давать побайтово точные результаты.
+Все 3 QNN контекста живут одновременно. Важное ограничение:
+Prefill и Decode исполняются на отдельных сохранённых K/V samples;
+`argmax_id=568` не означает, что новая Prefill последовательность
+связана с этим Decode результатом.
+
+## Stage 6.5 — безопасная диагностика K/V Prefill → Decode в RAM
+
+**Код в GitHub, на Q8B ещё не проверен.** Добавлен
+`gemma4::update_kv_block` (`src/kv_cache.cpp`), который переносит
+первые `valid_rows` из выходного Prefill блока из
+`[1,1,channels,128]` для K или `[1,1,128,channels]` для V
+в cache `[1,1,channels,4096]` для K или
+`[1,1,4096,channels]` для V. K переносится по каналам (strided),
+V — подряд (contiguous). Позиции после `valid_rows` не трогаются.
+Расширены тесты `tests/kv_cache_test.cpp`: K/V layouts,
+соответствие однопозиционному update и обработка неверных размеров.
+
+Новый флаг `gemma4-qnn-run --prefill-kv-probe` работает
+**только как отдельный диагностический код** поверх полного
+проверенного реплея. Требует `--jobs` и все 4
+`--cpu-prefill-*` аргумента. После выполнения 3 QNN графов
+и проверки их 62 исходных output tensors:
+
+1. По подтверждённому Prefill token file вычисляет `valid_tokens=17`
+   и `padding_rows_ignored=111`, не угадывая позицию.
+2. Сверяет метаданные всех 30 Decode cache inputs с
+   30 Prefill output tensors `StatefulPartitionedCall_1_0..29`
+   по именам, типу, shape, размерам и INT8 scale/offset.
+3. Создаёт **30 отдельных нулевых RAM cache буферов**
+   размером `channels*4096` и переносит только 17 непустых
+   строк из сохранённых, уже byte-validated Prefill outputs.
+4. Проверяет каждый перенесённый байт через независимое чтение,
+   а также что слоты 17..4095 остались нулями.
+5. Выводит `KV_PREFILL_SOURCE_CACHE_INFO` — сколько из
+   **28 исходных Prefill K/V input** байтов были ненулевыми.
+   Это отдельное условие для настоящей инициализации cache.
+
+При любой неоднозначности или несовпадении scale/offset —
+**ошибка без изменения Decode input buffers**. Созданный cache
+пока находится только в scratch RAM, не сохраняется и не
+используется для NPU Decode. Это не proof correctness
+автономного Prefill→Decode; нужно отдельно проверить
+семантику исходных 28 cache inputs и следующий token ID.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+bash scripts/test_prefill_kv_bridge.sh
+```
+
+Лог: `~/gemma4_qnn_test/cpu_full_prefill_decode.log`.
+Ожидаемые, пока **не подтверждённые** метки:
+
+```text
+KV_PREFILL_SOURCE_CACHE_INFO: kv_inputs=28 bytes=... nonzero_bytes=... scratch_decode_cache_zero_initialized=1
+KV_PREFILL_PROBE_LINK_OK: output=StatefulPartitionedCall_1_0 ... rows_copied=17 padding_rows_skipped=111 ...
+KV_PREFILL_BRIDGE_PROBE_OK: tensors=30 layers=15 valid_tokens=17 padding_rows_ignored=111 next_decode_position=17 ... quantization_match=1 no_active_decode_mutation=1 NPU_decode_link_not_executed=1
+KV_PREFILL_STAGE6_5_OK: 30 source slices mapped, 17 valid token rows copied into scratch RAM, 111 padding rows excluded
+```
+
+Если появится `KV_PREFILL_PROBE_QUANT_ENCODING_UNSUPPORTED`
+или `KV_PREFILL_PROBE_QUANT_MISMATCH`, не переносить байты
+напрямую в настоящий cache: нужны сведения о масштабе
+квантования из QNN metadata или явная конверсия.

@@ -100,6 +100,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 6.3.1 (Q8B доказан):** все 6 Section1 Prefill RoPE/mask входов байт-в-байт совпали с QNN, включая исправление только 8103 causal-allow байт для 111 padding query rows. Вместе с Stage 6.2 это все 8 не-KV входов Prefill (6 651 904 байта). **Stage 6.4 (код в GitHub, ожидает Q8B):** `gemma4-qnn-run` рассчитывает все 8 Prefill non-KV непосредственно через CPU Section0/1/2 в одном процессе и байт-в-байт сравнивает перед передачей в QNN; [scripts/test_cpu_full_prefill_decode.sh](scripts/test_cpu_full_prefill_decode.sh) сохраняет также двухшаговую регрессию Decode/LM Head. 28 Prefill initial KV и 30 Decode initial KV всё ещё из независимых saved QNN samples; их реальное связывание — отдельный Stage 6.5.
 
+**Stage 6.4 (Q8B подтверждён):** `CPU_FULL_PREFILL_DECODE_OK`, все 8 CPU non-KV входов Prefill + 8 Decode в одном процессе, все 62 выхода трёх QNN графов и шаг 4 Decode/LM Head побайтово совпали. **Stage 6.5 (пока не проверен):** [scripts/test_prefill_kv_bridge.sh](scripts/test_prefill_kv_bridge.sh) проверяет **30** именованных выходных Prefill K/V-срезов → входов Decode по metadata и квантованию, собирает K/V cache только для **17 настоящих токенов** в отдельных scratch RAM буферах, игнорирует 111 padded позиций. Настоящий Decode KV ещё не заменяется, независимые samples не смешиваются.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.
