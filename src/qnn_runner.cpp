@@ -427,11 +427,13 @@ struct QnnRuntime {
 struct Options {
     std::string binary, backend, system, graph, input, output, reference;
     std::string input_list, inputs_dir, outputs_dir, reference_dir, jobs, kv_next_list;
+    std::string kv_next_reference_dir;
     bool inspect = false;
     bool check_inputs = false;
     bool chain_decode_head = false;
     bool kv_feedback = false;
     bool kv_auto_pos = false;
+    bool kv_run_next = false;
     uint32_t kv_feedback_pos = 0;
     uint32_t repeat = 1;
 };
@@ -554,6 +556,8 @@ void usage(const char* executable) {
         << "  Add --kv-feedback-pos N to update 30 K/V buffers in RAM (N=0..4095).\n"
         << "  Optional --kv-next-list FILE compares updated buffers with saved next-step caches.\n"
         << "  Or --kv-auto-pos with --kv-next-list to infer the changed KV slot.\n"
+        << "  Add --kv-run-next to execute Decode again with updated KV and next-step non-KV inputs.\n"
+        << "  Optional --kv-next-reference-dir Result_0 checks all 31 next Decode outputs.\n"
         << "No implicit tensor conversions or synthetic zero inputs.\n";
 }
 
@@ -571,6 +575,10 @@ Options parse_options(int argc, char** argv) {
         }
         if (arg == "--chain-decode-head") {
             options.chain_decode_head = true;
+            continue;
+        }
+        if (arg == "--kv-run-next") {
+            options.kv_run_next = true;
             continue;
         }
         if (arg == "--kv-auto-pos") {
@@ -599,6 +607,7 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--reference-dir") options.reference_dir = value;
         else if (arg == "--jobs") options.jobs = value;
         else if (arg == "--kv-next-list") options.kv_next_list = value;
+        else if (arg == "--kv-next-reference-dir") options.kv_next_reference_dir = value;
         else if (arg == "--kv-feedback-pos") {
             if (options.kv_feedback)
                 throw std::runtime_error("Choose --kv-auto-pos OR --kv-feedback-pos");
@@ -629,6 +638,10 @@ Options parse_options(int argc, char** argv) {
             throw std::runtime_error("--kv-next-list requires --kv-feedback-pos or --kv-auto-pos");
         if (options.kv_auto_pos && options.kv_next_list.empty())
             throw std::runtime_error("--kv-auto-pos requires --kv-next-list");
+        if (options.kv_run_next && (!options.kv_feedback || options.kv_next_list.empty()))
+            throw std::runtime_error("--kv-run-next requires --kv-auto-pos or --kv-feedback-pos, and --kv-next-list");
+        if (!options.kv_next_reference_dir.empty() && !options.kv_run_next)
+            throw std::runtime_error("--kv-next-reference-dir requires --kv-run-next");
         if (!options.binary.empty() || !options.graph.empty() ||
             !options.input.empty() || !options.output.empty() ||
             !options.reference.empty() || !options.input_list.empty() ||
@@ -638,7 +651,8 @@ Options parse_options(int argc, char** argv) {
             throw std::runtime_error("--jobs cannot be combined with single-graph options");
         return options;
     }
-    if (options.chain_decode_head || options.kv_feedback || !options.kv_next_list.empty())
+    if (options.chain_decode_head || options.kv_feedback || options.kv_run_next ||
+        !options.kv_next_list.empty() || !options.kv_next_reference_dir.empty())
         throw std::runtime_error("Chained/KV options require --jobs");
     if (options.binary.empty() || options.system.empty())
         throw std::runtime_error("--binary and --system are required");
@@ -1112,6 +1126,68 @@ void apply_kv_feedback(ReplayJob& decode, const std::vector<KvLink>& links,
     std::cout << "KV_NEXT_CACHE_MATCH: 30 cache tensors byte-identical\n" << std::flush;
 }
 
+// At this point all K/V inputs have been updated from the previous Decode
+// outputs and (when available) byte-verified against next-step saved inputs.
+// Replace ONLY the eight non-cache inputs (RoPE/masks/embeddings/per-layer)
+// with the next saved sample. Never replace the computed KV-cache buffers
+// with saved next-step files: that would bypass the feedback we want to test.
+void execute_next_decode(QnnRuntime& runtime,
+                         ReplayJob& decode,
+                         const std::vector<KvLink>& kv_links,
+                         const std::vector<fs::path>& next_files,
+                         const std::vector<fs::path>& next_refs) {
+    if (next_files.size() != decode.inputs.size() ||
+        kv_links.size() != 30)
+        throw std::runtime_error("Incomplete next-step Decode input metadata");
+    std::set<size_t> kv_indices;
+    for (const auto& link : kv_links) kv_indices.insert(link.input_index);
+    if (kv_indices.size() != 30 || decode.inputs.size() != 38 ||
+        decode.outputs.size() != 31)
+        throw std::runtime_error("Unexpected Decode I/O count in two-step replay");
+
+    size_t changed_non_kv = 0;
+    for (size_t i = 0; i < decode.inputs.size(); ++i) {
+        if (kv_indices.count(i)) continue;
+        auto next_input = read_file(next_files.at(i).string());
+        if (next_input.size() != tensor_nbytes(decode.inputs[i]))
+            throw std::runtime_error("Next Decode input size mismatch: " +
+                                     next_files.at(i).string());
+        decode.input_buffers[i] = std::move(next_input);
+        ++changed_non_kv;
+    }
+    // Rebind ALL 38 input pointers, including the 30 updated K/V buffers,
+    // in case replacing any non-KV vector caused its allocation to move.
+    for (size_t i = 0; i < decode.inputs.size(); ++i)
+        bind_raw(decode.inputs[i], decode.input_buffers[i]);
+
+    if (changed_non_kv != 8)
+        throw std::runtime_error("Expected 8 next-step non-KV inputs");
+    std::cout << "DECODE_NEXT_INPUTS_READY: kv_from_RAM=" << kv_links.size()
+              << " non_kv_from_saved_next=" << changed_non_kv
+              << "\n" << std::flush;
+    const auto start = std::chrono::steady_clock::now();
+    runtime.execute(decode.handle, decode.inputs, decode.outputs);
+    const auto stop = std::chrono::steady_clock::now();
+    std::cout << "DECODE_NEXT_EXECUTE_OK: graph=" << decode.graph_name
+              << " outputs=" << decode.outputs.size()
+              << " execute_ms="
+              << std::chrono::duration<double, std::milli>(stop - start).count()
+              << "\n" << std::flush;
+    if (next_refs.empty()) {
+        std::cout << "DECODE_NEXT_NOTE: no next-step graph reference was supplied; "
+                     "execution succeeded but outputs have not been compared\n";
+        return;
+    }
+    if (next_refs.size() != decode.outputs.size())
+        throw std::runtime_error("Missing next Decode graph references");
+    // Compare the full output tensors, not just KV slices. This includes
+    // the quantized 1536-byte hidden state destined for LM Head.
+    for (size_t i = 0; i < next_refs.size(); ++i)
+        compare_reference(decode.output_buffers[i], next_refs[i].string());
+    std::cout << "DECODE_NEXT_REFERENCE_MATCH: 31 output tensors byte-identical"
+              << "\n" << std::flush;
+}
+
 int run_replay_jobs(const Options& options) {
     auto jobs = parse_replay_jobs(options.jobs);
     // Check all files, all tensor sizes and graph metadata BEFORE NPU init.
@@ -1145,6 +1221,7 @@ int run_replay_jobs(const Options& options) {
 
     std::vector<KvLink> kv_links;
     std::vector<fs::path> next_cache_files;
+    std::vector<fs::path> next_decode_references;
     if (options.kv_feedback) {
         if (jobs.front()->graph_name != "qnn_partition_0")
             throw std::runtime_error("--kv-feedback-pos requires a Decode-first manifest");
@@ -1164,6 +1241,30 @@ int run_replay_jobs(const Options& options) {
                 if (!fs::is_regular_file(p) ||
                     fs::file_size(p) != tensor_nbytes(decode->inputs[link.input_index]))
                     throw std::runtime_error("Invalid next-sample KV file: " + p.string());
+            }
+            if (options.kv_run_next) {
+                // Validate all 38 next inputs before initializing the NPU.
+                for (size_t i = 0; i < decode->inputs.size(); ++i) {
+                    const auto& p = next_cache_files.at(i);
+                    if (!fs::is_regular_file(p) ||
+                        fs::file_size(p) != tensor_nbytes(decode->inputs[i]))
+                        throw std::runtime_error("Invalid next Decode input: " + p.string());
+                }
+            }
+            if (!options.kv_next_reference_dir.empty()) {
+                const fs::path refdir(options.kv_next_reference_dir);
+                if (!fs::is_directory(refdir))
+                    throw std::runtime_error("Next Decode Result_0 not found: " +
+                                             options.kv_next_reference_dir);
+                for (size_t i = 0; i < decode->outputs.size(); ++i) {
+                    const fs::path p = refdir / native_basename(decode->outputs[i],
+                                                                static_cast<uint32_t>(i));
+                    if (!fs::is_regular_file(p) ||
+                        fs::file_size(p) != tensor_nbytes(decode->outputs[i]))
+                        throw std::runtime_error("Invalid next Decode output reference: " +
+                                                 p.string());
+                    next_decode_references.push_back(p);
+                }
             }
         }
         std::cout << "KV_MAPPING_OK: 30 cache/slice links; pos="
@@ -1213,6 +1314,17 @@ int run_replay_jobs(const Options& options) {
             infer_decode_kv_position(*decode, kv_links, next_cache_files) :
             options.kv_feedback_pos;
         apply_kv_feedback(*decode, kv_links, position, next_cache_files);
+        if (options.kv_run_next) {
+            execute_next_decode(runtime, *decode, kv_links, next_cache_files,
+                                next_decode_references);
+            if (options.chain_decode_head) {
+                execute_chained_decode_head(runtime, *decode, *head, hidden_output_index);
+                std::cout << "DECODE_NEXT_HEAD_EXECUTE_OK: logits="
+                          << head->output_buffers[0].size()
+                          << "
+" << std::flush;
+            }
+        }
     }
     return 0;
 }
