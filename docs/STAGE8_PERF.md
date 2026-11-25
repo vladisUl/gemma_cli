@@ -410,8 +410,10 @@ python3 scripts/bench_stage8_2.py --mode profile \
 ```
 
 Or after the compatibility check, `--mode all` performs both
-in one session. The script always checks 2+2 and eight-step
-output equivalence before attempting the long trials. A/B runs
+in one session. The script always checks 2+2; MEMHANDLE probe and A/B modes additionally
+require exact eight-step RAW/MEMHANDLE output equivalence before long trials.
+The RAW-only `--mode profile` does not require a working RPCmem library
+or a MEMHANDLE registration, so profiling can be investigated separately. A/B runs
 use independent fresh-process QNN contexts with NO QNN profiler,
 but all same synthetic 256 Decode+Head steps, full KV feedback
 and identical model binaries. Profile runs sample individual
