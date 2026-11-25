@@ -1036,3 +1036,61 @@ PREFILL_AUX_ALL_MATCH: tensors=6 bytes=1277952 pos_start=0 time_step=0 verified_
 2 FLOAT32 Section0/2). Далее их связываем в один QNN runtime
 и отдельно решаем init 28 входных KV и переход 30 выходных
 Prefill slices к Decode KV cache.
+
+## Stage 6.3 — первый запуск на Q8B: расхождение mask_global у padding
+
+Новый CPU Section1 `prefill_mask_128` был вызван с исходной
+строго восстановленной последовательностью 128 ID и `time_step=0`.
+Runtime 2.14.1 создаёт обе маски. Сравнение `mask_global`
+с оригинальным QNN input[26] остановилось:
+
+```text
+CPU_OUTPUT: mask_global type=9 shape=[1,1,128,4224] bytes=540672
+CPU_RUN_ERROR: CPU_REFERENCE_MISMATCH: mask_global first_byte=75904
+```
+
+Оффсет 75904 = `17*4224+4096`: **строка 17, колонка 4096**.
+Это именно первая строка после 17 ненулевых Prefill токенов;
+остальные 111 ID восстановленного sample равны 0.
+Совпадение границы — сильный признак различий при обработке padding
+или исходного `input_tokens` маски, но **не доказанная причина**.
+RoPE был первым в порядке вызовов `test_cpu_prefill_aux.py`; раз
+вызов mask уже начался, все четыре RoPE сравнения прошли.
+Нельзя удалять `--expect` и объявлять успех, равно как копировать
+сохранённый `mask_global.raw` вместо CPU маски.
+
+Добавлен изолированный скрипт
+`scripts/diagnose_prefill_mask.py`: запускает только Section1
+`prefill_mask_128` через `gemma4-cpu-run`, перебирая небольшой
+контролируемый набор проб:
+
+- исходные 128 token IDs; и те же ID с заменой только suffix-паддинга
+  (`0` после 17-й позиции) на ненулевые probe-значения `2` или `1`;
+- значения `time_step` 0, 1, 17, 128.
+
+Для каждой пары параметров сравниваются **обе** маски с оригинальными
+QNN input[21] и input[26]. Отчёт:
+
+- точное число различающихся байтов;
+- первый отличающийся byte, row/column, actual/expected;
+- количество различий до padding, в колонках 0..4095 и 4096..4223;
+- пять ближайших к эталону проб и наличие/отсутствие полного совпадения.
+
+Замена суффикса на 2/1 — исключительно диагностический эксперимент:
+она **не исправляет настоящие ID Prefill и не меняет входы генерации**.
+Изменений в рабочий CPU→NPU код пока нет.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+python3 scripts/diagnose_prefill_mask.py \
+  2>&1 | tee ~/gemma4_prefill_mask_diagnostic.log
+```
+
+Искомые строки:
+`PREFILL_MASK_PADDING_BOUNDARY`, `PREFILL_MASK_PROBE`,
+`PREFILL_MASK_PROBE_RANK`, `PREFILL_MASK_DIAGNOSTIC_DONE`.
+Если `PREFILL_MASK_PROBE_EXACT` появится, необходимо понять
+почему исходный QNN sample использовал именно эту семантику маски.
+Если нет — изучить по отличиям actual/expected первую строку
+padding и проверить подготовку `time_step`/mask для sample.
