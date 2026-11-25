@@ -1900,11 +1900,12 @@ void execute_prefill_linked_decode(
         if(prompt[i]!=0 && first_pad!=kPositions)
             throw std::runtime_error("PREFILL_LINK_NONCONTIGUOUS_PADDING");
     }
+    if(first_pad==0)
+        throw std::runtime_error("PREFILL_LINK_EMPTY_PROMPT");
     const size_t first_position=first_pad-(options.prefill_seed_last_prompt?1:0);
     const int32_t first_token=options.prefill_seed_last_prompt?
         prompt[first_pad-1]:options.prefill_kv_token;
-    if(first_pad==0 || first_position>=4096 ||
-       first_token<0 || first_token>=262144)
+    if(first_position>=4096 || first_token<0 || first_token>=262144)
         throw std::runtime_error("PREFILL_LINK_POSITION_OR_TOKEN_INVALID");
     if(options.prefill_seed_last_prompt) {
         if(first_pad<2 || prompt[first_pad-1]==0)
@@ -1996,6 +1997,62 @@ void execute_prefill_linked_decode(
              <<" execute_ms="
              <<std::chrono::duration<double,std::milli>(stop-start).count()
              <<" independent_decode_reference_comparison=0\n"<<std::flush;
+    if(options.prefill_seed_last_prompt) {
+        // Independently compare all 30 last-token Decode KV slices with the
+        // last row of the Prefill-128 output blocks. This is an extra
+        // cross-graph numerical diagnostic; do not assume bit-exactness
+        // between distinct QNN kernels. Record differences honestly.
+        constexpr size_t kPrefillRows=128;
+        size_t total=0, different=0, exact_tensors=0;
+        std::set<size_t> seen_source;
+        for(size_t n=0;n<kv.size();++n) {
+            const auto& link=kv[n];
+            const std::string source_name=
+                "StatefulPartitionedCall_1_"+std::to_string(n);
+            size_t index=prefill.outputs.size();
+            for(size_t j=0;j<prefill.outputs.size();++j) {
+                const char* actual=tensor_name(prefill.outputs[j]);
+                if(actual && source_name==actual) {
+                    if(index!=prefill.outputs.size())
+                        throw std::runtime_error(
+                            "PREFILL_LAST_KV_DUPLICATE_SOURCE: "+source_name);
+                    index=j;
+                }
+            }
+            if(index==prefill.outputs.size() ||
+               !seen_source.insert(index).second)
+                throw std::runtime_error(
+                    "PREFILL_LAST_KV_SOURCE_MISSING: "+source_name);
+            const auto& source=prefill.output_buffers[index];
+            const auto& actual=decode.output_buffers[link.output_index];
+            if(source.size()!=static_cast<size_t>(link.channels)*kPrefillRows ||
+               actual.size()!=link.channels)
+                throw std::runtime_error(
+                    "PREFILL_LAST_KV_OUTPUT_SIZE_MISMATCH: "+source_name);
+            size_t mismatch=0;
+            for(size_t c=0;c<link.channels;++c) {
+                const size_t src_index=link.key?
+                    c*kPrefillRows+first_position:
+                    first_position*link.channels+c;
+                if(actual[c]!=source[src_index])++mismatch;
+            }
+            total+=link.channels;
+            different+=mismatch;
+            if(mismatch==0)++exact_tensors;
+            std::cout<<"PREFILL_LAST_PROMPT_KV_SLICE_COMPARE: "
+                     <<"name="<<source_name
+                     <<" kind="<<(link.key?"K":"V")
+                     <<" bytes="<<link.channels
+                     <<" mismatching_bytes="<<mismatch<<"\n"<<std::flush;
+        }
+        std::cout<<"PREFILL_LAST_PROMPT_KV_COMPARE: tensors=30"
+                 <<" compared_bytes="<<total
+                 <<" mismatching_bytes="<<different
+                 <<" exact_tensors="<<exact_tensors
+                 <<" bit_exact="<<(different==0?1:0)
+                 <<" position="<<first_position
+                 <<" numerical_equivalence_not_assumed=1\n"<<std::flush;
+    }
     execute_chained_decode_head(runtime,decode,head,hidden_index,true);
     std::cout<<"PREFILL_LINK_HEAD_OK: logits_bytes="<<head.output_buffers[0].size()
              <<" linked_prefill_kv=1"
