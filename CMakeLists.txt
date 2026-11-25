@@ -12,3 +12,14 @@ add_executable(gemma4-qnn-probe src/qnn_probe.cpp)
 target_include_directories(gemma4-qnn-probe PRIVATE "${QAIRT_ROOT}/include")
 target_link_libraries(gemma4-qnn-probe PRIVATE dl)
 target_compile_options(gemma4-qnn-probe PRIVATE -Wall -Wextra -Wpedantic)
+
+# Stage 2: QNN System metadata and raw single-graph execution.
+add_executable(gemma4-qnn-run src/qnn_runner.cpp)
+target_include_directories(gemma4-qnn-run PRIVATE "${QAIRT_ROOT}/include")
+target_link_libraries(gemma4-qnn-run PRIVATE dl)
+target_compile_options(gemma4-qnn-run PRIVATE -Wall -Wextra -Wpedantic)
+
+include(CTest)
+if(BUILD_TESTING)
+  add_test(NAME qnn_runner_help COMMAND gemma4-qnn-run --help)
+endif()
