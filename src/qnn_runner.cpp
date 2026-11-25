@@ -1208,6 +1208,22 @@ void execute_chained_decode_head(QnnRuntime& runtime,
               << " max_logit_q=" << max_value
               << " argmax_ties=" << ties << "\n" << std::flush;
     if (linked_prefill) {
+        std::ostringstream tied_ids;
+        size_t seen=0;
+        for(size_t i=0;i<logits.size();++i) {
+            const int q=logits[i]<128?static_cast<int>(logits[i]):
+                                          static_cast<int>(logits[i])-256;
+            if(q==max_value) {
+                tied_ids<<(seen?",":"")<<i;
+                ++seen;
+            }
+        }
+        if(seen!=ties)
+            throw std::runtime_error("CHAIN_LINKED_INT8_MAX_TIE_COUNT_INVALID");
+        std::cout<<"CHAIN_LINKED_INT8_MAX_TOKENS: max_logit_q="<<max_value
+                 <<" ties="<<ties
+                 <<" token_ids="<<tied_ids.str()
+                 <<" quantized_logits_only=1\n"<<std::flush;
         std::cout<<"CHAIN_NOTE: logits are from an experimental linked "
                     "Prefill-cache Decode, NOT from any saved Decode or "
                     "independent LM Head reference.\n";
