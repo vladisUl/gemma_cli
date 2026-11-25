@@ -126,6 +126,10 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 6.15 (код, ждёт Q8B):** [scripts/test_kv_histories.sh](scripts/test_kv_histories.sh) сравнивает два вызова *одного* Decode(pos16,token4368) и LM Head с одинаковыми 8 CPU non-KV входами. D: история KV (pos0..15) только из Decode; P: история KV (pos0..15) из Prefill. Сопоставляет скрытое состояние, 262144 INT8 логитов и максимальные ID, а Prefill не используется как ссылка на «истинные» значения. Новый граф и KV-эталоны не меняются, вся работа на отдельной памяти.
 
+**Stage 6.15 (Q8B выполнен):** при одинаковых Decode(pos16, token4368) и восьми non-KV входах различная история KV даёт 110940/147456 несовпадающих байт prefix KV, 1246/1536 hidden state, 224641/262144 INT8 logits; максимумы ID236743 (`▁`) vs ID236921 (`ь`). Исходный 17-токенный prompt заканчивался на `<|turn>model` и **не содержал завершающий `\\n`**. Поэтому эти ID ещё не являются началом ответа.
+
+**Stage 6.16 (код ожидает Q8B):** [scripts/test_correct_model_header.sh](scripts/test_correct_model_header.sh) использует официальный chat-template `<|turn>model\\n` и токен 107=LF. Он не переписывает Prefill и не редактирует RAW: запускает имеющийся Prefill→Decode(pos17,token107)→Head и печатает `STAGE6_16_FIRST_RESPONSE_TOKEN` — первую реальную позицию ответа pos18. Официальный [Gemma 4 template](https://huggingface.co/google/gemma-4-E2B-it/blob/main/chat_template.jinja). Запуск: `bash scripts/test_correct_model_header.sh`.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.
