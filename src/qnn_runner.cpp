@@ -1321,8 +1321,7 @@ int run_replay_jobs(const Options& options) {
                 execute_chained_decode_head(runtime, *decode, *head, hidden_output_index);
                 std::cout << "DECODE_NEXT_HEAD_EXECUTE_OK: logits="
                           << head->output_buffers[0].size()
-                          << "
-" << std::flush;
+                          << "\n" << std::flush;
             }
         }
     }
