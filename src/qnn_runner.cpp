@@ -766,7 +766,7 @@ std::vector<std::unique_ptr<ReplayJob>> parse_replay_jobs(const std::string& fil
     size_t number = 0;
     while (std::getline(stream, line)) {
         ++number;
-        const auto first = line.find_first_not_of(" \\t\\r");
+        const auto first = line.find_first_not_of(" \t\r");
         if (first == std::string::npos || line[first] == '#') continue;
         auto job = std::make_unique<ReplayJob>();
         std::istringstream input(line);
@@ -824,7 +824,7 @@ void prepare_replay_job(ReplayJob& job, const std::string& system_library) {
     }
     std::cout << "REPLAY_PREPARED: " << job.graph_name
               << " inputs=" << graph.num_inputs << " outputs=" << graph.num_outputs
-              << " binary_bytes=" << job.binary.size() << "\\n" << std::flush;
+              << " binary_bytes=" << job.binary.size() << "\n" << std::flush;
 }
 
 int run_replay_jobs(const Options& options) {
@@ -840,10 +840,10 @@ int run_replay_jobs(const Options& options) {
         std::cout << "QNN_CONTEXT_READY: " << job->graph_name
                   << " load_ms="
                   << std::chrono::duration<double, std::milli>(stop - start).count()
-                  << "\\n" << std::flush;
+                  << "\n" << std::flush;
     }
     std::cout << "PERSISTENT_CONTEXTS_READY: " << jobs.size()
-              << " graphs; one backend/device; all contexts alive\\n" << std::flush;
+              << " graphs; one backend/device; all contexts alive\n" << std::flush;
 
     size_t total_outputs = 0;
     for (auto& job : jobs) {
@@ -858,10 +858,10 @@ int run_replay_jobs(const Options& options) {
         std::cout << "PERSISTENT_GRAPH_OK: " << job->graph_name
                   << " outputs=" << job->outputs.size() << " execute_ms="
                   << std::chrono::duration<double, std::milli>(stop - start).count()
-                  << "\\n" << std::flush;
+                  << "\n" << std::flush;
     }
     std::cout << "ALL_JOBS_REFERENCES_MATCH: " << jobs.size()
-              << " graphs " << total_outputs << " output tensors\\n";
+              << " graphs " << total_outputs << " output tensors\n";
     return 0;
 }
 
