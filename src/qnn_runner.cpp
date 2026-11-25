@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
@@ -430,6 +431,7 @@ struct Options {
     bool check_inputs = false;
     bool chain_decode_head = false;
     bool kv_feedback = false;
+    bool kv_auto_pos = false;
     uint32_t kv_feedback_pos = 0;
     uint32_t repeat = 1;
 };
@@ -551,6 +553,7 @@ void usage(const char* executable) {
         << "  Add --chain-decode-head to execute LM Head again, directly using Decode hidden-state RAM.\n"
         << "  Add --kv-feedback-pos N to update 30 K/V buffers in RAM (N=0..4095).\n"
         << "  Optional --kv-next-list FILE compares updated buffers with saved next-step caches.\n"
+        << "  Or --kv-auto-pos with --kv-next-list to infer the changed KV slot.\n"
         << "No implicit tensor conversions or synthetic zero inputs.\n";
 }
 
@@ -568,6 +571,13 @@ Options parse_options(int argc, char** argv) {
         }
         if (arg == "--chain-decode-head") {
             options.chain_decode_head = true;
+            continue;
+        }
+        if (arg == "--kv-auto-pos") {
+            if (options.kv_feedback)
+                throw std::runtime_error("Choose --kv-auto-pos OR --kv-feedback-pos");
+            options.kv_feedback = true;
+            options.kv_auto_pos = true;
             continue;
         }
         if (arg == "--help" || arg == "-h") {
@@ -590,6 +600,8 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--jobs") options.jobs = value;
         else if (arg == "--kv-next-list") options.kv_next_list = value;
         else if (arg == "--kv-feedback-pos") {
+            if (options.kv_feedback)
+                throw std::runtime_error("Choose --kv-auto-pos OR --kv-feedback-pos");
             if (value.empty() || value.front() == '-')
                 throw std::runtime_error("--kv-feedback-pos must be 0..4095");
             size_t n = 0;
@@ -614,7 +626,9 @@ Options parse_options(int argc, char** argv) {
         if (options.system.empty() || options.backend.empty())
             throw std::runtime_error("--jobs needs --system and --backend");
         if (!options.kv_next_list.empty() && !options.kv_feedback)
-            throw std::runtime_error("--kv-next-list requires --kv-feedback-pos");
+            throw std::runtime_error("--kv-next-list requires --kv-feedback-pos or --kv-auto-pos");
+        if (options.kv_auto_pos && options.kv_next_list.empty())
+            throw std::runtime_error("--kv-auto-pos requires --kv-next-list");
         if (!options.binary.empty() || !options.graph.empty() ||
             !options.input.empty() || !options.output.empty() ||
             !options.reference.empty() || !options.input_list.empty() ||
@@ -1025,6 +1039,43 @@ std::vector<KvLink> decode_kv_links(const ReplayJob& decode) {
     return links;
 }
 
+uint32_t infer_decode_kv_position(
+    const ReplayJob& decode,
+    const std::vector<KvLink>& links,
+    const std::vector<fs::path>& next_files) {
+    if (next_files.size() != decode.inputs.size())
+        throw std::runtime_error("Missing next Decode paths for KV auto-position");
+    std::optional<size_t> inferred;
+    size_t changed_caches = 0;
+    for (const auto& link : links) {
+        const auto& before = decode.input_buffers.at(link.input_index);
+        const auto after = read_file(next_files.at(link.input_index).string());
+        std::optional<size_t> slot;
+        try {
+            slot = gemma4::find_changed_kv_slot(
+                before, after, link.channels, 4096,
+                link.key ? gemma4::KvLayout::Key : gemma4::KvLayout::Value);
+        } catch (const std::invalid_argument& ex) {
+            throw std::runtime_error("KV_AUTO_POS_MISMATCH: " + link.name +
+                                     ": " + ex.what());
+        }
+        if (!slot) continue;
+        ++changed_caches;
+        if (inferred && *inferred != *slot)
+            throw std::runtime_error("KV_AUTO_POS_MISMATCH: changes in different "
+                "slots across cache tensors; samples may not be consecutive: " +
+                link.name);
+        inferred = slot;
+    }
+    if (!inferred)
+        throw std::runtime_error("KV_AUTO_POS_AMBIGUOUS: no changed cache bytes");
+    std::cout << "KV_AUTO_POS_OK: pos=" << *inferred
+              << " changed_cache_tensors=" << changed_caches
+              << " total_cache_tensors=" << links.size()
+              << "\n" << std::flush;
+    return static_cast<uint32_t>(*inferred);
+}
+
 void apply_kv_feedback(ReplayJob& decode, const std::vector<KvLink>& links,
                        uint32_t pos, const std::vector<fs::path>& next_files) {
     size_t inserted = 0;
@@ -1116,7 +1167,9 @@ int run_replay_jobs(const Options& options) {
             }
         }
         std::cout << "KV_MAPPING_OK: 30 cache/slice links; pos="
-                  << options.kv_feedback_pos << "\n" << std::flush;
+                  << (options.kv_auto_pos ? std::string("auto") :
+                      std::to_string(options.kv_feedback_pos))
+                  << "\n" << std::flush;
     }
 
     QnnRuntime runtime(options.backend);
@@ -1155,8 +1208,12 @@ int run_replay_jobs(const Options& options) {
     // incorrectly compare it to the newly chained Head output.
     if (options.chain_decode_head)
         execute_chained_decode_head(runtime, *decode, *head, hidden_output_index);
-    if (options.kv_feedback)
-        apply_kv_feedback(*decode, kv_links, options.kv_feedback_pos, next_cache_files);
+    if (options.kv_feedback) {
+        const uint32_t position = options.kv_auto_pos ?
+            infer_decode_kv_position(*decode, kv_links, next_cache_files) :
+            options.kv_feedback_pos;
+        apply_kv_feedback(*decode, kv_links, position, next_cache_files);
+    }
     return 0;
 }
 
