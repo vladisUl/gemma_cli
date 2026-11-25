@@ -80,6 +80,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 5.7 (экспериментальный код, не проверен на Q8B):** обе исходные модели используют `EMBEDDING_LOOKUP v4`: Section0 — **INT2**, Section2 — 35 таблиц **INT4**, всё с 262144 row-scales. Добавлен [src/packed_embedder.cpp](src/packed_embedder.cpp), прямой `mmap`/unpack/dequantize/MUL/CONCATENATION без новых TFLite библиотек, и [scripts/test_packed_embedder.sh](scripts/test_packed_embedder.sh). Сначала тест совместимости на реальных моделях, затем обязательная побайтовая сверка с QNN embeddings.
 
+**Stage 5.7.1 (исправление после теста Q8B):** `gemma4-packed-embed` собирается, но Section0 после `MUL` завершался ошибкой из-за непереданного завершающего `RESHAPE`. Исправлено в [src/packed_embedder.cpp](src/packed_embedder.cpp), ожидается повторное испытание и последующая побайтовая проверка.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.
