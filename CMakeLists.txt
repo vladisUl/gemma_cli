@@ -15,7 +15,12 @@ target_compile_options(gemma4-qnn-probe PRIVATE -Wall -Wextra -Wpedantic)
 
 # Stage 2: QNN System metadata and raw single-graph execution.
 add_executable(gemma4-qnn-run src/qnn_runner.cpp)
-target_include_directories(gemma4-qnn-run PRIVATE "${QAIRT_ROOT}/include")
+# QAIRT System headers use includes such as "System/QnnSystemCommon.h".
+# The copied SDK layout keeps QNN under include/QNN, so we need both roots.
+target_include_directories(gemma4-qnn-run PRIVATE
+  "${QAIRT_ROOT}/include"
+  "${QAIRT_ROOT}/include/QNN"
+)
 target_link_libraries(gemma4-qnn-run PRIVATE dl)
 target_compile_options(gemma4-qnn-run PRIVATE -Wall -Wextra -Wpedantic)
 
