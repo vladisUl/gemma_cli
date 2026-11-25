@@ -447,6 +447,8 @@ struct Options {
     bool cpu_embed_token_set = false;
     bool cpu_embed_next_token_set = false;
     bool prefill_kv_probe = false;
+    bool prefill_kv_run = false;
+    bool prefill_kv_token_set = false;
     uint32_t kv_feedback_pos = 0;
     int32_t cpu_aux_pos = 0;
     int32_t cpu_aux_token = 0;
@@ -454,6 +456,7 @@ struct Options {
     int32_t cpu_aux_next_token = 0;
     int32_t cpu_embed_token = 0;
     int32_t cpu_embed_next_token = 0;
+    int32_t prefill_kv_token = 0;
     uint32_t repeat = 1;
 };
 
@@ -589,6 +592,9 @@ void usage(const char* executable) {
         << "  --prefill-kv-probe builds 30 padded-aware Decode KV caches in scratch RAM\n"
         << "     from verified Prefill-128 outputs; validates mapping and quantization.\n"
         << "     Does NOT replace actual Decode KV inputs or execute a linked Decode.\n"
+        << "  --prefill-kv-run --prefill-kv-token ID: separately run linked Decode+Head\n"
+        << "     with Prefill KV cache (17 tokens) and CPU non-KV for position 17.\n"
+        << "     Experimental: outputs are NOT compared to independent saved Decode.\n"
         << "  --cpu-prefill-tokens TOKENS_I32.raw --cpu-prefill-section0 MODEL0.tflite\n"
         << "  --cpu-prefill-section2 MODEL2.tflite --cpu-prefill-aux-model MODEL1.tflite\n"
         << "     computes all eight Prefill-128 non-KV inputs from CPU in RAM.\n"
@@ -614,6 +620,10 @@ Options parse_options(int argc, char** argv) {
         }
         if (arg == "--prefill-kv-probe") {
             options.prefill_kv_probe = true;
+            continue;
+        }
+        if (arg == "--prefill-kv-run") {
+            options.prefill_kv_run = true;
             continue;
         }
         if (arg == "--kv-run-next") {
@@ -653,6 +663,16 @@ Options parse_options(int argc, char** argv) {
         else if (arg == "--cpu-prefill-section0") options.cpu_prefill_section0 = value;
         else if (arg == "--cpu-prefill-section2") options.cpu_prefill_section2 = value;
         else if (arg == "--cpu-prefill-aux-model") options.cpu_prefill_aux_model = value;
+        else if (arg == "--prefill-kv-token") {
+            if (options.prefill_kv_token_set || value.empty() || value.front()=='-')
+                throw std::runtime_error("--prefill-kv-token requires ID 0..262143");
+            size_t end=0;
+            const auto id=std::stoul(value,&end);
+            if(end!=value.size() || id>=262144)
+                throw std::runtime_error("--prefill-kv-token out of range");
+            options.prefill_kv_token=static_cast<int32_t>(id);
+            options.prefill_kv_token_set=true;
+        }
         else if (arg == "--cpu-aux-pos") {
             if (options.cpu_aux_pos_set || value.empty() || value.front() == '-')
                 throw std::runtime_error("--cpu-aux-pos expects a single integer 0..4095");
@@ -770,6 +790,18 @@ Options parse_options(int argc, char** argv) {
             throw std::runtime_error(
                 "--prefill-kv-probe requires verified --cpu-prefill-tokens "
                 "and all three CPU model files");
+        if (options.prefill_kv_run &&
+            (!options.prefill_kv_probe || !options.prefill_kv_token_set ||
+             !options.chain_decode_head || options.cpu_aux_model.empty() ||
+             options.cpu_embed_section0.empty() ||
+             options.cpu_embed_section2.empty()))
+            throw std::runtime_error(
+                "--prefill-kv-run requires --prefill-kv-probe, --prefill-kv-token, "
+                "--chain-decode-head, --cpu-aux-model, "
+                "--cpu-embed-section0 and --cpu-embed-section2");
+        if (options.prefill_kv_token_set && !options.prefill_kv_run)
+            throw std::runtime_error(
+                "--prefill-kv-token only valid with --prefill-kv-run");
         if (!options.kv_next_list.empty() && !options.kv_feedback)
             throw std::runtime_error("--kv-next-list requires --kv-feedback-pos or --kv-auto-pos");
         if (options.kv_auto_pos && options.kv_next_list.empty())
@@ -790,7 +822,8 @@ Options parse_options(int argc, char** argv) {
             throw std::runtime_error("--jobs cannot be combined with single-graph options");
         return options;
     }
-    if (options.prefill_kv_probe || options.chain_decode_head ||
+    if (options.prefill_kv_probe || options.prefill_kv_run ||
+        options.prefill_kv_token_set || options.chain_decode_head ||
         options.kv_feedback || options.kv_run_next ||
         !options.kv_next_list.empty() || !options.kv_next_reference_dir.empty() ||
         !options.kv_next_head_reference_dir.empty() ||
@@ -1082,7 +1115,8 @@ size_t find_decode_head_link(const ReplayJob& decode, const ReplayJob& head) {
 void execute_chained_decode_head(QnnRuntime& runtime,
                                  ReplayJob& decode,
                                  ReplayJob& head,
-                                 size_t decode_output_index) {
+                                 size_t decode_output_index,
+                                 bool linked_prefill = false) {
     auto& hidden = decode.output_buffers.at(decode_output_index);
     if (hidden.size() != tensor_nbytes(head.inputs[0]))
         throw std::runtime_error("Chained hidden-state size changed");
@@ -1125,9 +1159,15 @@ void execute_chained_decode_head(QnnRuntime& runtime,
               << " int8_argmax_id=" << first_max
               << " max_logit_q=" << max_value
               << " argmax_ties=" << ties << "\n" << std::flush;
-    std::cout << "CHAIN_NOTE: logits are from the saved Decode sample, NOT the "
-                 "independent LM Head reference sample; do not compare them as "
-                 "if both samples were identical.\n";
+    if (linked_prefill) {
+        std::cout<<"CHAIN_NOTE: logits are from an experimental linked "
+                    "Prefill-cache Decode, NOT from any saved Decode or "
+                    "independent LM Head reference.\n";
+    } else {
+        std::cout << "CHAIN_NOTE: logits are from the saved Decode sample, NOT the "
+                     "independent LM Head reference sample; do not compare them as "
+                     "if both samples were identical.\n";
+    }
 }
 
 // These mapping indices come from original Gemma 4 Decode TFLite signature,
@@ -1602,7 +1642,8 @@ void apply_cpu_prefill(ReplayJob& prefill,const Options& options) {
 // source Prefill tensors or the independently verified original QNN samples.
 void probe_prefill_kv_bridge(
     const ReplayJob& prefill,const ReplayJob& decode,
-    const std::string& token_file) {
+    const std::string& token_file,
+    std::vector<std::vector<uint8_t>>* linked_caches = nullptr) {
     constexpr size_t kCapacity=4096,kBlockRows=128;
     if(prefill.graph_name!="qnn_partition_2" ||
        decode.graph_name!="qnn_partition_0" ||
@@ -1628,6 +1669,7 @@ void probe_prefill_kv_bridge(
     const auto links=decode_kv_links(decode);
     if(links.size()!=30)
         throw std::runtime_error("KV_PREFILL_PROBE_REQUIRES_30_KV_LINKS");
+    if(linked_caches)linked_caches->resize(decode.inputs.size());
 
     size_t prefill_input_kv=0,prefill_input_nonzero=0;
     uint64_t prefill_input_bytes=0;
@@ -1643,6 +1685,10 @@ void probe_prefill_kv_bridge(
     }
     if(prefill_input_kv!=28)
         throw std::runtime_error("KV_PREFILL_PROBE_EXPECTED_28_PREFILL_KV_INPUTS");
+    if(linked_caches && prefill_input_nonzero!=0)
+        throw std::runtime_error(
+            "PREFILL_LINK_REQUIRES_ZERO_INITIAL_28_KV: saved Prefill sample "
+            "has nonzero initial K/V; this is not a proven fresh prompt");
     std::cout<<"KV_PREFILL_SOURCE_CACHE_INFO: kv_inputs="<<prefill_input_kv
              <<" bytes="<<prefill_input_bytes
              <<" nonzero_bytes="<<prefill_input_nonzero
@@ -1688,6 +1734,12 @@ void probe_prefill_kv_bridge(
                 "KV_PREFILL_PROBE_SOURCE_SHAPE_MISMATCH: "+source_name);
         const auto& qsrc=tensor_quant(source);
         const auto& qdst=tensor_quant(target);
+        if(linked_caches &&
+           qdst.quantizationEncoding==QNN_QUANTIZATION_ENCODING_SCALE_OFFSET &&
+           qdst.scaleOffsetEncoding.offset!=0)
+            throw std::runtime_error(
+                "PREFILL_LINK_NONZERO_QUANT_ZERO_POINT: scratch byte zero is "
+                "not numerical zero for "+link.name);
         if(qsrc.quantizationEncoding!=QNN_QUANTIZATION_ENCODING_SCALE_OFFSET ||
            qdst.quantizationEncoding!=QNN_QUANTIZATION_ENCODING_SCALE_OFFSET)
             throw std::runtime_error(
@@ -1740,6 +1792,7 @@ void probe_prefill_kv_bridge(
                 "KV_PREFILL_PROBE_PADDING_WRITTEN: "+source_name);
         scratch_bytes+=scratch.size();
         inserted+=static_cast<size_t>(link.channels)*valid_tokens;
+        if(linked_caches)(*linked_caches)[link.input_index]=std::move(scratch);
         std::cout<<"KV_PREFILL_PROBE_LINK_OK: output="<<source_name
                  <<" decode_input="<<link.name
                  <<" type="<<(link.key?"K":"V")
@@ -1753,6 +1806,12 @@ void probe_prefill_kv_bridge(
     }
     if(seen.size()!=30)
         throw std::runtime_error("KV_PREFILL_PROBE_NOT_30_UNIQUE_OUTPUTS");
+    if(linked_caches) {
+        for(const auto& link:links)
+            if(linked_caches->at(link.input_index).size() !=
+               tensor_nbytes(decode.inputs.at(link.input_index)))
+                throw std::runtime_error("PREFILL_LINK_KV_BUFFER_INCOMPLETE");
+    }
     std::cout<<"KV_PREFILL_BRIDGE_PROBE_OK: tensors=30 layers=15"
              <<" valid_tokens="<<valid_tokens
              <<" padding_rows_ignored="<<(kBlockRows-valid_tokens)
@@ -1762,6 +1821,121 @@ void probe_prefill_kv_bridge(
              <<" prefill_kv_input_nonzero_bytes="<<prefill_input_nonzero
              <<" quantization_match=1 no_active_decode_mutation=1"
              <<" NPU_decode_link_not_executed=1\n"<<std::flush;
+}
+
+// Stage 6.6: one experimental Decode step using exactly 30 K/V scratch
+// buffers produced by Prefill-128, plus all 8 non-KV tensors recomputed for
+// token 568 (or another explicit probe ID) at position valid_tokens.
+//
+// CRITICAL: This does not reuse a single saved Decode input byte. The 28
+// original Prefill KV inputs must be all zero, and their QNN quantized-zero
+// offsets must be compatible (enforced in the mapping probe). It does not
+// compare linked Decode outputs to the independent saved Decode references.
+void execute_prefill_linked_decode(
+    QnnRuntime& runtime,const ReplayJob& prefill,ReplayJob& decode,
+    ReplayJob& head,size_t hidden_index,
+    const Options& options,
+    std::vector<std::vector<uint8_t>> scratch_caches) {
+    constexpr size_t kPositions=128;
+    const auto bytes=read_file(options.cpu_prefill_tokens);
+    if(bytes.size()!=kPositions*sizeof(int32_t))
+        throw std::runtime_error("PREFILL_LINK_TOKEN_BYTES_INVALID");
+    std::array<int32_t,kPositions> prompt{};
+    std::memcpy(prompt.data(),bytes.data(),bytes.size());
+    size_t first_pad=kPositions;
+    for(size_t i=0;i<kPositions;++i) {
+        if(prompt[i]==0 && first_pad==kPositions)first_pad=i;
+        if(prompt[i]!=0 && first_pad!=kPositions)
+            throw std::runtime_error("PREFILL_LINK_NONCONTIGUOUS_PADDING");
+    }
+    if(first_pad==0 || first_pad>=4096 || options.prefill_kv_token<0 ||
+       options.prefill_kv_token>=262144)
+        throw std::runtime_error("PREFILL_LINK_POSITION_OR_TOKEN_INVALID");
+    if(prefill.outputs.size()!=30 || scratch_caches.size()!=decode.inputs.size() ||
+       decode.outputs.size()!=31 || head.outputs.size()!=1)
+        throw std::runtime_error("PREFILL_LINK_GRAPH_METADATA_MISMATCH");
+    const auto kv=decode_kv_links(decode);
+    std::set<size_t> cache_indices;
+    for(const auto& link:kv) {
+        if(!cache_indices.insert(link.input_index).second ||
+           scratch_caches[link.input_index].size()!=
+               tensor_nbytes(decode.inputs[link.input_index]))
+            throw std::runtime_error("PREFILL_LINK_KV_INCOMPLETE");
+    }
+
+    // Both the embedding and Section1 RoPE/mask paths are direct CPU calls,
+    // deliberately without per-step reference samples. Every tensor is
+    // validated by original QNN metadata before the graph is executed.
+    std::set<size_t> nonkv_indices;
+    const auto assign=[&](const std::string& name,Qnn_DataType_t dtype,
+                          size_t expected,std::vector<uint8_t> data) {
+        size_t index=decode.inputs.size();
+        for(size_t i=0;i<decode.inputs.size();++i) {
+            const char* actual=tensor_name(decode.inputs[i]);
+            if(actual && name==actual) {
+                if(index!=decode.inputs.size())
+                    throw std::runtime_error("PREFILL_LINK_DUPLICATE_NAME: "+name);
+                index=i;
+            }
+        }
+        if(index==decode.inputs.size() || cache_indices.count(index) ||
+           !nonkv_indices.insert(index).second ||
+           tensor_dtype(decode.inputs[index])!=dtype ||
+           tensor_nbytes(decode.inputs[index])!=expected ||
+           data.size()!=expected)
+            throw std::runtime_error("PREFILL_LINK_NONKV_METADATA_INVALID: "+name);
+        scratch_caches[index]=std::move(data);
+        std::cout<<"PREFILL_LINK_NONKV_READY: name="<<name
+                 <<" qnn_index="<<index
+                 <<" bytes="<<expected<<"\n"<<std::flush;
+    };
+    assign("decode_embeddings_0",QNN_DATATYPE_FLOAT_32,6144,
+        gemma4::compute_packed_embedding(
+            options.cpu_embed_section0,0,options.prefill_kv_token));
+    assign("decode_per_layer_embeddings_0",QNN_DATATYPE_FLOAT_32,35840,
+        gemma4::compute_packed_embedding(
+            options.cpu_embed_section2,2,options.prefill_kv_token));
+    auto aux=gemma4::run_decode_aux(options.cpu_aux_model,
+        static_cast<int32_t>(first_pad),options.prefill_kv_token);
+    if(aux.size()!=6)
+        throw std::runtime_error("PREFILL_LINK_REQUIRES_SIX_SECTION1_TENSORS");
+    const std::array<size_t,6> expected_lengths{512,512,256,256,4097,4097};
+    // The original Section1 helper yields RoPE 4 + mask 2 in this order.
+    for(size_t j=0;j<aux.size();++j)
+        assign(aux[j].qnn_name,QNN_DATATYPE_SFIXED_POINT_8,
+               expected_lengths[j],std::move(aux[j].bytes));
+    if(cache_indices.size()!=30 || nonkv_indices.size()!=8)
+        throw std::runtime_error("PREFILL_LINK_REQUIRES_EXACTLY_38_INPUTS");
+    std::vector<Qnn_Tensor_t> linked_inputs=decode.inputs;
+    for(size_t i=0;i<linked_inputs.size();++i) {
+        if(scratch_caches[i].size()!=tensor_nbytes(linked_inputs[i]))
+            throw std::runtime_error("PREFILL_LINK_RAW_INPUT_INCOMPLETE: "+
+                                     std::to_string(i));
+        bind_raw(linked_inputs[i],scratch_caches[i]);
+    }
+    std::cout<<"PREFILL_LINK_INPUTS_READY: kv_from_prefill_ram=30"
+             <<" nonkv_from_cpu=8"
+             <<" position="<<first_pad
+             <<" input_token="<<options.prefill_kv_token
+             <<" saved_decode_inputs_used=0"
+             <<" fresh_prefill_initial_kv_zero=1\n"<<std::flush;
+
+    const auto start=std::chrono::steady_clock::now();
+    runtime.execute(decode.handle,linked_inputs,decode.outputs);
+    const auto stop=std::chrono::steady_clock::now();
+    // All 31 new output buffers now belong to the linked Decode. They
+    // must never be compared against independent saved Decode samples.
+    std::cout<<"PREFILL_LINK_DECODE_OK: graph="<<decode.graph_name
+             <<" outputs="<<decode.outputs.size()
+             <<" position="<<first_pad
+             <<" input_token="<<options.prefill_kv_token
+             <<" execute_ms="
+             <<std::chrono::duration<double,std::milli>(stop-start).count()
+             <<" independent_decode_reference_comparison=0\n"<<std::flush;
+    execute_chained_decode_head(runtime,decode,head,hidden_index,true);
+    std::cout<<"PREFILL_LINK_HEAD_OK: logits_bytes="<<head.output_buffers[0].size()
+             <<" linked_prefill_kv=1"
+             <<" no_saved_decode_reference_claim=1\n"<<std::flush;
 }
 
 int run_replay_jobs(const Options& options) {
@@ -1949,6 +2123,7 @@ int run_replay_jobs(const Options& options) {
     }
     std::cout << "ALL_JOBS_REFERENCES_MATCH: " << jobs.size()
               << " graphs " << total_outputs << " output tensors\n";
+    std::vector<std::vector<uint8_t>> linked_cache_buffers;
     if (options.prefill_kv_probe) {
         ReplayJob* src=nullptr;
         ReplayJob* dst=nullptr;
@@ -1963,7 +2138,8 @@ int run_replay_jobs(const Options& options) {
         }
         if(!src || !dst)
             throw std::runtime_error("KV_PREFILL_PROBE_NEEDS_PREFILL_AND_DECODE");
-        probe_prefill_kv_bridge(*src,*dst,options.cpu_prefill_tokens);
+        probe_prefill_kv_bridge(*src,*dst,options.cpu_prefill_tokens,
+                                options.prefill_kv_run ? &linked_cache_buffers : nullptr);
     }
     // Execute the linked graph *after* checking all saved individual baselines.
     // The saved Head reference belongs to a different Decode step; do not
@@ -1993,6 +2169,16 @@ int run_replay_jobs(const Options& options) {
                 }
             }
         }
+    }
+    if(options.prefill_kv_run) {
+        ReplayJob* prefill=nullptr;
+        for(auto& job:jobs)
+            if(job->graph_name=="qnn_partition_2")prefill=job.get();
+        if(!prefill || !decode || !head)
+            throw std::runtime_error("PREFILL_LINK_MISSING_GRAPH");
+        execute_prefill_linked_decode(
+            runtime,*prefill,*decode,*head,hidden_output_index,options,
+            std::move(linked_cache_buffers));
     }
     return 0;
 }
