@@ -139,6 +139,34 @@ def inspect(path):
                     print(f"TFLITE_GRAPH_OP: graph={g} name={name} version={version} count={count}")
 
                 tensors = fb.table_vector(graph, 0, limit=200000)
+                buffers = fb.table_vector(model, 4, limit=200000)
+                for op_number, op in enumerate(operators):
+                    opcode = fb.scalar(op, 0, "I", 0)
+                    if codes[opcode][0] != 7:
+                        continue
+                    inputs = fb.int_vector(op, 1)
+                    for slot, tid in enumerate(inputs):
+                        if tid < 0 or tid >= len(tensors):
+                            raise ValueError("Invalid embedding op tensor index")
+                        tensor = tensors[tid]
+                        dtype = fb.scalar(tensor, 1, "b", 0)
+                        shape = fb.int_vector(tensor, 0)
+                        buffer_index = fb.scalar(tensor, 2, "I", 0)
+                        if buffer_index >= len(buffers):
+                            raise ValueError("Invalid embedding tensor buffer index")
+                        buf = buffers[buffer_index]
+                        _, buffer_bytes = fb.vector(buf, 0)
+                        quant_field = fb.table_field(tensor, 4)
+                        scales = 0
+                        if quant_field is not None:
+                            _, scales = fb.vector(fb.indirect(quant_field), 2)
+                        print(
+                            f"TFLITE_EMBED_INPUT: graph={g} op={op_number} "
+                            f"slot={slot} name={fb.string(tensor,3)!r} "
+                            f"type={TYPES.get(dtype, f'TYPE_{dtype}')} "
+                            f"shape={shape} buffer_bytes={buffer_bytes} "
+                            f"quant_scales={scales}"
+                        )
                 for direction, field_index in (("input", 1), ("output", 2)):
                     for idx in fb.int_vector(graph, field_index):
                         if idx < 0 or idx >= len(tensors):
