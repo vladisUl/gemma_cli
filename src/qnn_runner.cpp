@@ -2137,7 +2137,10 @@ void execute_prefill_linked_decode(
                 }
                 if(best_row==first_position)++diagnostic_best_row_16;
                 if(best_row_diff==0)++diagnostic_exact_alternate_row;
-                const auto& expected_quant=tensor_quant(decode.outputs.at(link.output_index));
+                // Stage 6.5 already proved Prefill source quantization matches
+                // the Decode *input cache*. Do not assume an independent
+                // QNN slice output encoding when screening layer candidates.
+                const auto& expected_quant=tensor_quant(decode.inputs.at(link.input_index));
                 std::string best_source_name="(none)";
                 size_t best_source_diff=link.channels+1;
                 size_t compatible=0;
