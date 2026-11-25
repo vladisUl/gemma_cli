@@ -449,6 +449,7 @@ struct Options {
     bool prefill_kv_probe = false;
     bool prefill_kv_run = false;
     bool prefill_kv_token_set = false;
+    bool prefill_kv_steps_set = false;
     uint32_t kv_feedback_pos = 0;
     int32_t cpu_aux_pos = 0;
     int32_t cpu_aux_token = 0;
@@ -457,6 +458,7 @@ struct Options {
     int32_t cpu_embed_token = 0;
     int32_t cpu_embed_next_token = 0;
     int32_t prefill_kv_token = 0;
+    uint32_t prefill_kv_steps = 1;
     uint32_t repeat = 1;
 };
 
@@ -594,6 +596,9 @@ void usage(const char* executable) {
         << "     Does NOT replace actual Decode KV inputs or execute a linked Decode.\n"
         << "  --prefill-kv-run --prefill-kv-token ID: separately run linked Decode+Head\n"
         << "     with Prefill KV cache (17 tokens) and CPU non-KV for position 17.\n"
+        << "  Optional --prefill-kv-steps N (1..4): 2+ linked Decode steps using\n"
+        << "     previous Decode output KV feedback and prior LM Head INT8 argmax.\n"
+        << "     Probe token is NOT derived from Prefill logits; no tokenizer.\n"
         << "     Experimental: outputs are NOT compared to independent saved Decode.\n"
         << "  --cpu-prefill-tokens TOKENS_I32.raw --cpu-prefill-section0 MODEL0.tflite\n"
         << "  --cpu-prefill-section2 MODEL2.tflite --cpu-prefill-aux-model MODEL1.tflite\n"
@@ -672,6 +677,16 @@ Options parse_options(int argc, char** argv) {
                 throw std::runtime_error("--prefill-kv-token out of range");
             options.prefill_kv_token=static_cast<int32_t>(id);
             options.prefill_kv_token_set=true;
+        }
+        else if (arg == "--prefill-kv-steps") {
+            if(options.prefill_kv_steps_set || value.empty() || value.front()=='-')
+                throw std::runtime_error("--prefill-kv-steps must be 1..4");
+            size_t end=0;
+            const auto steps=std::stoul(value,&end);
+            if(end!=value.size() || steps<1 || steps>4)
+                throw std::runtime_error("--prefill-kv-steps must be 1..4");
+            options.prefill_kv_steps=static_cast<uint32_t>(steps);
+            options.prefill_kv_steps_set=true;
         }
         else if (arg == "--cpu-aux-pos") {
             if (options.cpu_aux_pos_set || value.empty() || value.front() == '-')
@@ -802,6 +817,9 @@ Options parse_options(int argc, char** argv) {
         if (options.prefill_kv_token_set && !options.prefill_kv_run)
             throw std::runtime_error(
                 "--prefill-kv-token only valid with --prefill-kv-run");
+        if (options.prefill_kv_steps_set && !options.prefill_kv_run)
+            throw std::runtime_error(
+                "--prefill-kv-steps only valid with --prefill-kv-run");
         if (!options.kv_next_list.empty() && !options.kv_feedback)
             throw std::runtime_error("--kv-next-list requires --kv-feedback-pos or --kv-auto-pos");
         if (options.kv_auto_pos && options.kv_next_list.empty())
@@ -823,7 +841,8 @@ Options parse_options(int argc, char** argv) {
         return options;
     }
     if (options.prefill_kv_probe || options.prefill_kv_run ||
-        options.prefill_kv_token_set || options.chain_decode_head ||
+        options.prefill_kv_token_set || options.prefill_kv_steps_set ||
+        options.chain_decode_head ||
         options.kv_feedback || options.kv_run_next ||
         !options.kv_next_list.empty() || !options.kv_next_reference_dir.empty() ||
         !options.kv_next_head_reference_dir.empty() ||
@@ -1946,6 +1965,134 @@ void execute_prefill_linked_decode(
     std::cout<<"PREFILL_LINK_HEAD_OK: logits_bytes="<<head.output_buffers[0].size()
              <<" linked_prefill_kv=1"
              <<" no_saved_decode_reference_claim=1\n"<<std::flush;
+
+    // Stage 6.7: deterministic, reference-free continuation of the exact
+    // Prefill-linked Decode state. The *first* input is still an explicit
+    // probe ID. Only subsequent IDs come from quantized LM Head argmax.
+    // Keep all KV in the same scratch RAM and never restore saved samples.
+    const auto next_argmax=[&](uint32_t executed_step) -> int32_t {
+        const auto& logits=head.output_buffers.at(0);
+        if(tensor_dtype(head.outputs.at(0))!=QNN_DATATYPE_SFIXED_POINT_8 ||
+           logits.size()!=262144)
+            throw std::runtime_error("PREFILL_LINK_GREEDY_LOGITS_METADATA_INVALID");
+        int best=-129;
+        int32_t id=0;
+        uint32_t ties=0;
+        for(size_t i=0;i<logits.size();++i) {
+            const int q=logits[i]<128?static_cast<int>(logits[i]):
+                                          static_cast<int>(logits[i])-256;
+            if(q>best) {
+                best=q;
+                id=static_cast<int32_t>(i);
+                ties=1;
+            } else if(q==best) ++ties;
+        }
+        std::cout<<"PREFILL_LINK_GREEDY_NEXT: executed_step="<<executed_step
+                 <<" token_id="<<id<<" max_logit_q="<<best
+                 <<" argmax_ties="<<ties
+                 <<" quantized_int8_argmax=1\n"<<std::flush;
+        if(ties!=1)
+            throw std::runtime_error(
+                "PREFILL_LINK_GREEDY_AMBIGUOUS_INT8_TIE: "
+                "cannot select a unique token from quantized logits");
+        return id;
+    };
+    if(options.prefill_kv_steps<1 || options.prefill_kv_steps>4)
+        throw std::runtime_error("PREFILL_LINK_STEPS_OUT_OF_RANGE");
+    if(first_pad+options.prefill_kv_steps>4096)
+        throw std::runtime_error("PREFILL_LINK_STEPS_EXCEED_KV_CAPACITY");
+    int32_t next_id=options.prefill_kv_token;
+    if(options.prefill_kv_steps>1)next_id=next_argmax(1);
+    for(uint32_t step=2;step<=options.prefill_kv_steps;++step) {
+        const size_t feedback_position=first_pad+step-2;
+        const size_t input_position=feedback_position+1;
+        size_t written=0;
+        for(const auto& link:kv) {
+            const auto& slice=decode.output_buffers.at(link.output_index);
+            auto& cache=scratch_caches.at(link.input_index);
+            if(slice.size()!=link.channels ||
+               cache.size()!=tensor_nbytes(decode.inputs.at(link.input_index)))
+                throw std::runtime_error(
+                    "PREFILL_LINK_FEEDBACK_METADATA_MISMATCH: "+link.name);
+            gemma4::update_kv_slot(
+                cache,slice,link.channels,4096,feedback_position,
+                link.key?gemma4::KvLayout::Key:gemma4::KvLayout::Value);
+            // Independently verify all inserted bytes in the 30 KV caches.
+            for(size_t c=0;c<link.channels;++c) {
+                const size_t dst=link.key?
+                    c*4096+feedback_position:feedback_position*link.channels+c;
+                if(cache[dst]!=slice[c])
+                    throw std::runtime_error(
+                        "PREFILL_LINK_FEEDBACK_VERIFY_FAILED: "+link.name);
+            }
+            written+=slice.size();
+        }
+        if(written!=9216)
+            throw std::runtime_error("PREFILL_LINK_FEEDBACK_EXPECTED_9216_BYTES");
+        std::cout<<"PREFILL_LINK_KV_FEEDBACK_OK: executed_step="<<(step-1)
+                 <<" position="<<feedback_position
+                 <<" cache_tensors="<<kv.size()
+                 <<" inserted_bytes="<<written
+                 <<" layout=K_strided,V_contiguous\n"<<std::flush;
+
+        // Re-create all eight CPU non-KV tensors for the new position and
+        // token, without reading the saved Decode input list.
+        nonkv_indices.clear();
+        assign("decode_embeddings_0",QNN_DATATYPE_FLOAT_32,6144,
+            gemma4::compute_packed_embedding(
+                options.cpu_embed_section0,0,next_id));
+        assign("decode_per_layer_embeddings_0",QNN_DATATYPE_FLOAT_32,35840,
+            gemma4::compute_packed_embedding(
+                options.cpu_embed_section2,2,next_id));
+        auto next_aux=gemma4::run_decode_aux(
+            options.cpu_aux_model,static_cast<int32_t>(input_position),next_id);
+        if(next_aux.size()!=6)
+            throw std::runtime_error(
+                "PREFILL_LINK_NEXT_AUX_COUNT_NOT_SIX");
+        for(size_t j=0;j<next_aux.size();++j)
+            assign(next_aux[j].qnn_name,QNN_DATATYPE_SFIXED_POINT_8,
+                   expected_lengths[j],std::move(next_aux[j].bytes));
+        if(nonkv_indices.size()!=8)
+            throw std::runtime_error("PREFILL_LINK_NEXT_NONKV_COUNT_NOT_EIGHT");
+        // Rebinding is required: changing std::vector storage invalidates
+        // the QNN raw client buffer pointer held by linked_inputs.
+        for(size_t i=0;i<linked_inputs.size();++i) {
+            if(scratch_caches[i].size()!=tensor_nbytes(linked_inputs[i]))
+                throw std::runtime_error(
+                    "PREFILL_LINK_NEXT_INPUT_SIZE_CHANGED: "+std::to_string(i));
+            bind_raw(linked_inputs[i],scratch_caches[i]);
+        }
+        std::cout<<"PREFILL_LINK_NEXT_INPUTS_READY: step="<<step
+                 <<" position="<<input_position
+                 <<" token="<<next_id
+                 <<" kv_from_feedback_ram=30"
+                 <<" nonkv_from_cpu=8"
+                 <<" saved_decode_inputs_used=0\n"<<std::flush;
+        const auto decode_start=std::chrono::steady_clock::now();
+        runtime.execute(decode.handle,linked_inputs,decode.outputs);
+        const auto decode_end=std::chrono::steady_clock::now();
+        std::cout<<"PREFILL_LINK_NEXT_DECODE_OK: step="<<step
+                 <<" position="<<input_position
+                 <<" input_token="<<next_id
+                 <<" outputs=31"
+                 <<" decode_ms="
+                 <<std::chrono::duration<double,std::milli>(
+                     decode_end-decode_start).count()
+                 <<" reference_comparison=0\n"<<std::flush;
+        execute_chained_decode_head(runtime,decode,head,hidden_index,true);
+        std::cout<<"PREFILL_LINK_NEXT_HEAD_OK: step="<<step
+                 <<" logits_bytes="<<head.output_buffers.at(0).size()
+                 <<" linked_KV_feedback=1"
+                 <<" independent_reference_comparison=0\n"<<std::flush;
+        if(step<options.prefill_kv_steps)next_id=next_argmax(step);
+    }
+    std::cout<<"PREFILL_LINK_MULTI_STEP_OK: steps="<<options.prefill_kv_steps
+             <<" first_position="<<first_pad
+             <<" last_position="<<(first_pad+options.prefill_kv_steps-1)
+             <<" first_token="<<options.prefill_kv_token
+             <<" all_KV_from_prefill_or_feedback_RAM=1"
+             <<" all_nonKV_from_CPU=1"
+             <<" independent_reference_claim=0\n"<<std::flush;
 }
 
 int run_replay_jobs(const Options& options) {
