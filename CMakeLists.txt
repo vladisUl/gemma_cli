@@ -28,3 +28,15 @@ include(CTest)
 if(BUILD_TESTING)
   add_test(NAME qnn_runner_help COMMAND gemma4-qnn-run --help)
 endif()
+
+
+# CPU KV-cache update primitive (no QNN dependency).
+add_library(gemma4-kv-cache STATIC src/kv_cache.cpp)
+target_include_directories(gemma4-kv-cache PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_compile_options(gemma4-kv-cache PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(gemma4-qnn-run PRIVATE gemma4-kv-cache)
+if(BUILD_TESTING)
+  add_executable(gemma4-kv-cache-test tests/kv_cache_test.cpp)
+  target_link_libraries(gemma4-kv-cache-test PRIVATE gemma4-kv-cache)
+  add_test(NAME kv_cache_slot_layout COMMAND gemma4-kv-cache-test)
+endif()
