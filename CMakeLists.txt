@@ -40,3 +40,8 @@ if(BUILD_TESTING)
   target_link_libraries(gemma4-kv-cache-test PRIVATE gemma4-kv-cache)
   add_test(NAME kv_cache_slot_layout COMMAND gemma4-kv-cache-test)
 endif()
+
+# Stage 5: check installed native TFLite C ABI without TensorFlow dev headers.
+add_executable(gemma4-cpu-abi src/cpu_abi_probe.cpp)
+target_link_libraries(gemma4-cpu-abi PRIVATE dl)
+target_compile_options(gemma4-cpu-abi PRIVATE -Wall -Wextra -Wpedantic)

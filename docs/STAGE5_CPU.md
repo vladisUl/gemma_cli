@@ -85,3 +85,47 @@ bash scripts/probe_cpu_native.sh 2>&1 | tee ~/gemma4_cpu_native.log
 If Section0/1/2 only exist on the WSL development machine, they must be
 transferred **once** to the Q8B (preferably under `~/gemma4_qnn_test/cpu_models`).
 Do not copy over, modify or re-export the three verified QNN context binaries.
+
+## Q8B native CPU check (2026-11-25)
+
+The board has `libtensorflow-lite.so.2.14.1` (ARM64, Ubuntu/Debian
+`libtensorflow-lite2.14.1:arm64`). Exports include
+`TfLiteInterpreterCreate` and `TfLiteInterpreterCreateWithSelectedOps`.
+No C or C++ TFLite headers were found under the scanned paths, and there were no
+`.tflite` source models anywhere under `/home/radxa`.
+
+**Tokenizer correction:** the 262144-vocabulary `tokenizer.json` reports
+`model.type=BPE`, not Unigram. It has Replace normalizer, Split
+pre-tokenizer, Sequence decoder and TemplateProcessing post-processor.
+A C++ tokenizer must implement these actual JSON-defined transforms;
+do not assume a classic SentencePiece Unigram model or use a generic
+`spm` tokenizer without equivalence tests.
+
+### Native C ABI probe
+
+Added `gemma4-cpu-abi` (C++17, `dlopen/dlsym`, no TensorFlow headers).
+It checks 27 required TFLite C API symbols, including *named signature
+runner* methods, and prints library version and missing functions.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+./build/gemma4-cpu-abi 2>&1 | tee ~/gemma4_cpu_abi.log
+```
+
+If all symbols are present, expect `CPU_C_ABI_READY: required=27 missing=0
+signature_runner_available=1`. Missing symbols produce `CPU_C_ABI_INCOMPLETE`
+and exit 1. **This only checks dynamic symbol availability.** Actual
+Section0/1/2 model loading, operators and tensor values require the model
+files and separate tests.
+
+The C signature-runner API exists in TensorFlow Lite 2.14 source; we must
+still check that this particular distro shared library exports its symbols.
+Reference: https://sources.debian.org/src/tensorflow/2.14.1%2Bdfsg-3.1/tensorflow/lite/c/c_api_signature_runner_test.cc
+
+**Remaining dependency:** source TFLite files Section0 (106959512 bytes),
+Section1 (85480 bytes), Section2 (1394630752 bytes) must be found on the
+development machine and copied to Q8B once. Their byte lengths are from
+the earlier model report; validate copies and avoid touching the three QNN
+context binaries.
