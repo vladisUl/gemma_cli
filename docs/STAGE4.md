@@ -291,3 +291,54 @@ set -o pipefail
 **Ограничение:** пока это обновление RAM после одного сохранённого Decode, а не следующий шаг
 модели. Для цикла генерации нужны локальные CPU-модели embeddings, per-layer embeddings, masks,
 RoPE, точный контроль позиции и выбранного токена.
+
+## Stage 4.3 — определение позиции по соседним состояниям Decode
+
+**Подтверждено на Q8B:** Stage 4.2, `KV_MAPPING_OK: 30 cache/slice links; pos=3`,
+`ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors`,
+`CHAIN_DECODE_HEAD_OK: ... int8_argmax_id=568`,
+`KV_FEEDBACK_OK: pos=3 cache_tensors=30 inserted_bytes=9216`.
+При этом **3 было демонстрационным значением**, а совпадение с кэшем следующего шага ещё не проверялось.
+
+В `gemma4-qnn-run` добавлен `--kv-auto-pos`, который используется **вместе**
+с `--kv-next-list FILE` (вместо `--kv-feedback-pos N`). Программа:
+1. Загружает оба набора сохранённых кэшей Decode и сравнивает их, определяя слот изменённых байтов для K (stride 4096) и V (строка длиной C=256/512).
+2. Отвергает входные пары, где изменены разные позиции либо вообще нет различий. Для разных тензоров допускаются неизменённые значения в обновлённом слоте.
+3. После исполнения NPU накладывает все 30 выходных K/V-срезов на исходные кэши по найденной позиции.
+4. Сравнивает **все 30 полных обновлённых кэшей** побайтово со входами сохранённого следующего Decode.
+
+Проверка `KV_AUTO_POS_OK` сама по себе не доказывает корректность; итогом должна быть
+`KV_NEXT_CACHE_MATCH: 30 cache tensors byte-identical`.
+
+Следующее действие на Q8B — **найти реальные сохранённые input-list** и выяснить, какие из них соответствуют последовательным шагам:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+
+cd ~/gemma4_qnn_test
+find . -maxdepth 3 -type f \
+  \( -iname '*decode*list*.txt' -o -iname '*decode*input*.txt' \) -print | sort
+```
+
+Если подтверждено, что `auto_decode_step4_list.txt` — **следующий шаг**
+относительно `auto_decode_step3_list.txt`, пример запуска:
+
+```bash
+cd ~/gemma4_qnn_test
+export LD_LIBRARY_PATH="$PWD/sdk247"
+export ADSP_LIBRARY_PATH="$PWD/sdk247"
+set -o pipefail
+../gemma4-cli-stage1/build/gemma4-qnn-run \
+  --system "$PWD/sdk247/libQnnSystem.so" \
+  --backend "$PWD/sdk247/libQnnHtp.so" \
+  --jobs persistent_jobs_decode_prefill_head.txt \
+  --kv-auto-pos --kv-next-list auto_decode_step4_list.txt \
+  2>&1 | tee kv_auto_pos.log
+```
+
+Не запускать это сравнение с двумя случайными шагами или результатами другой последовательности: при несовпадении оно сообщит `KV_AUTO_POS_MISMATCH` либо `KV_NEXT_MISMATCH`. Входные .raw/.bin на диске не изменяются.
+
+CPU CTest `kv_cache_slot_layout` теперь проверяет не только правильную раскладку и границы, но и определение изменённого слота, включая отказ при изменении двух позиций. Сборка и тест на Q8B ещё требуются.
