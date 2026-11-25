@@ -97,6 +97,14 @@ set -e
 
 if (( status != 0 )); then
   printf 'PERSISTENT_ORDER_FAILED: %s exit=%s log=%s\n' "$manifest_suffix" "$status" "$PWD/$LOG" >&2
+  if grep -Eq 'fastrpc memory map .*failed|Failed to map weights buffer|Could not allocate persistent weights buffer' "$LOG"; then
+    printf '%s\n' \
+      'HTP_WEIGHT_MAP_FAILED: FastRPC/SMMU rejected a persistent weights mapping.' \
+      'This does not by itself prove Linux RAM exhaustion. Check graph load order and DSP mapping limits.' >&2
+  fi
+  if grep -Fq 'SSR detected' "$LOG"; then
+    printf '%s\n' 'HTP_SSR_DETECTED: DSP reported a subsystem restart; do not automatically retry.' >&2
+  fi
   free -h >&2
   exit "$status"
 fi

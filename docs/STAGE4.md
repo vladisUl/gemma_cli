@@ -145,26 +145,29 @@ QNN_RUN_ERROR: contextCreateFromBinary(qnn_partition_0): QNN error 1002
 
 Для диагностики порядка и общего объёма отображения добавлен [`scripts/test_persistent_order.sh`](../scripts/test_persistent_order.sh). Скрипт берёт уже валидированные пары входов и эталонов из `persistent_jobs_all3.txt`, созданного предыдущим тестом. Он принимает названия графов в порядке загрузки и вызывает существующий `gemma4-qnn-run --jobs`; модель не перекомпилируется, исходные тестовые файлы не меняются.
 
-**Следующий отдельный эксперимент**: загрузить большой Decode **первым**, а маленький LM Head — вторым:
-
-```bash
-cd ~/gemma4-cli-stage1
-git pull --ff-only origin main
-
-cd ~/gemma4_qnn_test
-bash ../gemma4-cli-stage1/scripts/test_persistent_order.sh decode head
-```
-
-Успех:
+**Успешный эксперимент (2026-11-25):** Decode загружен первым, LM Head вторым, оба контекста одновременно активны, все 32 выхода идентичны эталонам:
 
 ```text
-QNN_CONTEXT_READY: qnn_partition_0
-QNN_CONTEXT_READY: qnn_partition_1
+QNN_CONTEXT_READY: qnn_partition_0 load_ms=344.451
+QNN_CONTEXT_READY: qnn_partition_1 load_ms=74.3263
 PERSISTENT_CONTEXTS_READY: 2 graphs; one backend/device; all contexts alive
+PERSISTENT_GRAPH_OK: qnn_partition_0 outputs=31 execute_ms=73.8492
+PERSISTENT_GRAPH_OK: qnn_partition_1 outputs=1 execute_ms=11.2431
 ALL_JOBS_REFERENCES_MATCH: 2 graphs 32 output tensors
 PERSISTENT_ORDER_VERIFIED: decode_head graphs=2 outputs=32
 ```
 
-Если не пройдёт, **не повторять автоматически**: прислать первую строку ошибки отображения/загрузки. Далее выборочно проверить `decode` отдельно либо меньшую пару `prefill head`, чтобы определить, связано ли ограничение с суммарным объёмом или крупным контекстом. Лог: `persistent_decode_head.log`.
+Результат доказывает, что Decode и LM Head могут сосуществовать на Q8B. Но **не доказывает**, что одновременно поместятся также и веса Prefill. Не интерпретировать один замер времени как устойчивый benchmark.
+
+**Следующий отдельный эксперимент:** проверить проблемную пару в обратном порядке — `Decode → Prefill`, без LM Head:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cd ~/gemma4_qnn_test
+bash ../gemma4-cli-stage1/scripts/test_persistent_order.sh decode prefill
+```
+
+При успехе ожидается `PERSISTENT_ORDER_VERIFIED: decode_prefill graphs=2 outputs=61`, что укажет на важность порядка размещения контекстов. Если вновь возникает FastRPC mapping error, не запускать автоматические повторы и сохранить `persistent_decode_prefill.log`; возможен общий лимит DSP mapping, который не измеряется через `free -h`.
 
 Обратите внимание: существующие `--jobs` / graphExecute работали с реальными входами; новый скрипт только собирает варианты manifest. Результат одновременной загрузки ещё не подтверждён.
