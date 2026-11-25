@@ -105,6 +105,28 @@ int main() {
     try {gemma4::update_kv_block(block_k,{1,2,3},3,6,0,4,2,KvLayout::Key);}
     catch(const std::invalid_argument&){thrown=true;}
     require(thrown,"Wrong Prefill K block length must be rejected");
+    // Linked Prefill-Decode proof: the first Decode slice must be written at
+    // absolute slot 2, the second at slot 3, preserving the Prefill prefix.
+    std::vector<uint8_t> running_k=assembled_k;
+    std::vector<uint8_t> running_v=assembled_v;
+    gemma4::update_kv_slot(running_k,{71,72,73},3,6,2,KvLayout::Key);
+    gemma4::update_kv_slot(running_v,{81,82,83},3,6,2,KvLayout::Value);
+    gemma4::update_kv_slot(running_k,{74,75,76},3,6,3,KvLayout::Key);
+    gemma4::update_kv_slot(running_v,{84,85,86},3,6,3,KvLayout::Value);
+    for(size_t c=0;c<3;++c) {
+        require(running_k[c*6]==assembled_k[c*6] &&
+                running_k[c*6+1]==assembled_k[c*6+1],
+                "Both KV feedback steps preserve Prefill K prefix");
+        require(running_k[c*6+2]==71+c &&
+                running_k[c*6+3]==74+c,
+                "Consecutive K feedback slots 2/3");
+        require(running_k[c*6+4]==0 &&
+                running_k[c*6+5]==0,
+                "No future K slot changed");
+    }
+    require(running_v==std::vector<uint8_t>({
+        10,20,30, 11,21,31, 81,82,83, 84,85,86, 0,0,0, 0,0,0
+    }),"Consecutive V feedback slots 2/3 with Prefill prefix retained");
     std::cout << "KV_CACHE_UNIT_TEST_OK: K/V layouts, bounds, inferred slot\n";
     return 0;
 }

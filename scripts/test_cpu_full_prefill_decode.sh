@@ -44,12 +44,25 @@ case "${GEMMA4_PREFILL_KV_RUN:-0}" in
         echo "CPU_FULL_PREFILL_ERROR: link run requires KV probe=1" >&2; exit 2
       fi
       PREFILL_KV_OPTIONS+=(--prefill-kv-run --prefill-kv-token 568)
+      case "${GEMMA4_PREFILL_KV_STEPS:-1}" in
+          1) ;;
+          2|3|4)
+            PREFILL_KV_OPTIONS+=(--prefill-kv-steps "${GEMMA4_PREFILL_KV_STEPS}")
+            ;;
+          *)
+            echo "CPU_FULL_PREFILL_ERROR: GEMMA4_PREFILL_KV_STEPS must be 1..4" >&2
+            exit 2
+            ;;
+      esac
       ;;
     *) echo "CPU_FULL_PREFILL_ERROR: GEMMA4_PREFILL_KV_RUN must be 0 or 1" >&2; exit 2 ;;
 esac
 LOG=cpu_full_prefill_decode.log
 if [[ "${GEMMA4_PREFILL_KV_RUN:-0}" == 1 ]]; then
   LOG=cpu_prefill_link_stage6_6.log
+  if [[ "${GEMMA4_PREFILL_KV_STEPS:-1}" != 1 ]]; then
+    LOG=cpu_prefill_multistep_stage6_7.log
+  fi
 fi
 "$ROOT/build/gemma4-qnn-run" \
     --system "$PWD/sdk247/libQnnSystem.so" \
@@ -94,4 +107,20 @@ if [[ "${GEMMA4_PREFILL_KV_RUN:-0}" == 1 ]]; then
     grep -Fq "$marker" "$LOG" || { echo "PREFILL_LINK_STAGE6_6_MISSING: $marker" >&2; exit 1; }
   done
   echo "PREFILL_LINK_STAGE6_6_OK: Prefill 30 KV blocks (17 rows) -> real Decode(pos17, token568) -> real LM Head, no independent reference claim"
+  if [[ "${GEMMA4_PREFILL_KV_STEPS:-1}" != 1 ]]; then
+    STEPS="${GEMMA4_PREFILL_KV_STEPS}"
+    for marker in \
+        "PREFILL_LINK_GREEDY_NEXT: executed_step=1 token_id=236778 max_logit_q=111 argmax_ties=1" \
+        "PREFILL_LINK_KV_FEEDBACK_OK: executed_step=1 position=17 cache_tensors=30 inserted_bytes=9216" \
+        "PREFILL_LINK_NEXT_INPUTS_READY: step=2 position=18 token=236778 kv_from_feedback_ram=30 nonkv_from_cpu=8 saved_decode_inputs_used=0" \
+        "PREFILL_LINK_NEXT_DECODE_OK: step=2 position=18 input_token=236778 outputs=31" \
+        "PREFILL_LINK_NEXT_HEAD_OK: step=2 logits_bytes=262144 linked_KV_feedback=1" \
+        "PREFILL_LINK_MULTI_STEP_OK: steps=${STEPS} first_position=17 last_position=$((17+STEPS-1)) first_token=568"; do
+      grep -Fq "$marker" "$LOG" || {
+        echo "PREFILL_LINK_MULTISTEP_MISSING_MARKER: $marker" >&2
+        exit 1
+      }
+    done
+    echo "PREFILL_LINK_MULTISTEP_STAGE6_7_OK: ${STEPS} Prefill-linked Decode steps with KV feedback and INT8 argmax, no saved Decode inputs"
+  fi
 fi
