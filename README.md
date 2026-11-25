@@ -146,6 +146,10 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 7.1 (код, ждёт Q8B):** [scripts/gemma4_bpe.py](scripts/gemma4_bpe.py) — stdlib-only кодировщик текста на основании того же BPE JSON, включая Unicode→byte fallback и merge priorities. Прежде чем принять произвольный текст, он требует точного совпадения 9 ID `Привет! Сколько будет 2+2?` и исходных 17 ID. Пример: `python3 scripts/gemma4_bpe.py --text 'Привет! Сколько будет 2+2?'`. Создание нового 512-byte Prefill ID RAW возможно только с `--output-new-raw путь` и эксклюзивным `xb` (никакой перезаписи эталонов). Добавлен быстрый unit-test [tests/test_bpe_stage7_unit.py](tests/test_bpe_stage7_unit.py). Ещё нет прямого подключения динамических RAW к QNN, поскольку текущий исполнитель строго сверяет Prefill inputs с оригинальным эталоном.
 
+**Stage 7.1 (Q8B подтверждён):** BPE успешно воспроизвёл исходные девять ID, новый запрос `Сколько будет 3 + 5?` кодируется в девять других ID; 9/9 CTest.
+
+**Stage 7.2 (код ожидает Q8B):** экспериментальный sample-free режим `--dynamic-prefill` в `gemma4-qnn-run`. QNN graph metadata читается из AOT бинарников, но старые input-list/Result_0 не читаются и не исполняются. Входы вычисляются заново CPU, Prefill KV копируется в чистый Decode KV, последний LF107 повторяется на Decode, затем Head + autoregressive generation до EOS или 16 токенов. Скрипт [scripts/test_dynamic_text_stage7_2.sh](scripts/test_dynamic_text_stage7_2.sh) сначала требует точного воспроизведения эталонных 9 ID и `2 + 2 будет **4**.`, только потом запускает произвольный вопрос. Старые reference-тесты Stage6 не изменены. Запуск после пересборки: `bash scripts/test_dynamic_text_stage7_2.sh 'Сколько будет 3 + 5?'`.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.
