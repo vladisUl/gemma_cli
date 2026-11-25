@@ -1704,3 +1704,95 @@ PREFILL_TIE_STAGE6_9_OK: first_generated_id=236921 tied_candidates=... experimen
 правильный tokenizer модели. В репозитории сейчас
 нет tokenizer/vocab файлов или реализации text decoding;
 только работу с integer token ID и QNN raw tensors проверяли.
+
+## Stage 6.9 — подтверждён на Q8B, включая идентификацию всех INT8 tied IDs
+
+Пользователь прислал успешный результат Stage 6.9:
+
+```text
+CHAIN_LINKED_INT8_MAX_TOKENS: max_logit_q=124 ties=1 token_ids=236888 quantized_logits_only=1
+PREFILL_LINK_NEXT_HEAD_OK: step=3 logits_bytes=262144 linked_KV_feedback=1 independent_reference_comparison=0
+PREFILL_LINK_MULTI_STEP_OK: steps=3 first_position=16 last_position=18 first_token=4368 last_prompt_replayed=1 int8_tie_policy=lowest-id-experimental all_KV_from_prefill_or_feedback_RAM=1 all_nonKV_from_CPU=1 independent_reference_claim=0
+PREFILL_TIE_STAGE6_9_OK: first_generated_id=236921 tied_candidates=152294,236787 experimental_selected=152294 third_decode_position=18 real_KV_feedback=1 not_FP32_greedy=1
+```
+
+Значит, модель от последнего реального prompt ID=4368 (pos16)
+выдала ID=236921, следующий LM Head на pos17 имеет
+**двух равных лидеров INT8: 152294 и 236787** (logit79).
+В эксперименте выбран min ID=152294 и на pos18 следующий
+LM Head дал **236888** (logit124, ties1). Это проверенный
+технический цикл, но **не** основание считать 152294
+FP32-максимумом: два ID имеют одинаковый INT8 logit.
+
+Самое важное: пользователь также выполнил
+`grep PREFILL_LAST_PROMPT_KV_COMPARE` на полном Stage 6.8 логе:
+
+```text
+PREFILL_LAST_PROMPT_KV_COMPARE: tensors=30 compared_bytes=9216 mismatching_bytes=6975 exact_tensors=0 bit_exact=0 position=16 numerical_equivalence_not_assumed=1
+```
+
+Из 9216 сравнённых K/V байт после **одного и того же**
+последнего токена 4368 отличаются 6975 (75.68%);
+ни один из 30 срезов не совпал побайтово.
+Это **существенное расхождение**, которое нельзя
+по умолчанию списывать на разницу округлений NPU.
+Возможные причины, пока не установленные: неправильная
+временная ось или layer mapping Prefill output, разные
+раскладки/квантование промежуточных операций, различие
+содержимого attention и KV между Prefill и Decode.
+Эти результаты не опровергают корректную передачу 30 RAM KV
+или успешное исполнение NPU, но **не доказывают**
+численную/семантическую эквивалентность Prefill vs
+пошагового Decode для этого prompt.
+
+## Stage 6.10 — диагностический анализ K/V расхождений по слоям/времени
+
+**Код в GitHub, ещё не проверен на Q8B.** Новый opt-in
+`gemma4-qnn-run --prefill-kv-diagnose` разрешён только с
+`--prefill-kv-run --prefill-seed-last-prompt`.
+В прежнем Stage 6.8 сохранённом linked-тесте, после
+получения pos16 Decode output K/V, для всех 30 пар
+Prefill slice vs Decode output проверяются:
+
+- знаковый INT8 |delta|=1, |delta|=2, |delta|>2,
+  сумма и максимум абсолютной разницы, доля точных байт
+  по полю `mismatched_bytes`;
+- поиск лучшей строки (временной позиции) 0..127
+  в **том же** Prefill tensor по числу равных байт;
+- поиск лучшего другого Prefill output с **той же K/V
+  формой, числом каналов и точными scale/offset QNN cache**;
+- агрегаты: сколько пар имеют лучшую строку pos16,
+  сколько имеют лучший источник с ожидаемым именем,
+  сколько имеют точное совпадение при альтернативной
+  строке или источнике.
+
+Не выполняются перемаркировка слоёв, сдвиг или копирование
+«лучшей» строки в настоящий K/V: диагностика только читает
+готовые 30 Prefill outputs и 30 Decode slices.
+Сохраняются проверенные ранние Stage 5.9/6.4/6.6/6.8.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+bash scripts/test_prefill_kv_diagnostics.sh
+```
+
+Лог:
+`~/gemma4_qnn_test/cpu_prefill_kv_diagnostic_stage6_10.log`.
+Ожидаемые, **ещё не подтверждённые на Q8B** маркеры:
+
+```text
+PREFILL_KV_DIAG_TENSOR: mapped_output=StatefulPartitionedCall_1_0 ...
+... (30 lines: signed differences, best row and matching layer)
+PREFILL_KV_DIAG_SUMMARY: tensors=30 compared_bytes=9216 mismatched_bytes=... best_same_tensor_row_is_expected=... best_compatible_layer_is_expected=... exact_some_same_tensor_row=... exact_some_compatible_layer=... no_relabel_or_patch_applied=1 diagnostic_only=1
+PREFILL_LAST_PROMPT_KV_COMPARE: tensors=30 compared_bytes=9216 mismatching_bytes=...
+PREFILL_KV_STAGE6_10_OK: all 30 KV tensors inspected; original reference data unchanged
+```
+
+Не заявлять о полноценной корректной генерации текста до
+разбора причины 75.68% cross-graph KV divergence,
+подтверждения модели/токенизатора и стратегии работы с
+INT8 ties. Успех `PREFILL_KV_STAGE6_10_OK` означает лишь
+получение всех диагностик, а не устранение расхождения.
