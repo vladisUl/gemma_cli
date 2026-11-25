@@ -62,11 +62,19 @@ case "${GEMMA4_PREFILL_KV_RUN:-0}" in
       ;;
     *) echo "CPU_FULL_PREFILL_ERROR: GEMMA4_PREFILL_KV_RUN must be 0 or 1" >&2; exit 2 ;;
 esac
+case "${GEMMA4_PREFILL_KV_DIAGNOSE:-0}" in
+    0) ;;
+    1) PREFILL_KV_OPTIONS+=(--prefill-kv-diagnose) ;;
+    *) echo "CPU_FULL_PREFILL_ERROR: GEMMA4_PREFILL_KV_DIAGNOSE must be 0 or 1" >&2; exit 2 ;;
+esac
 LOG=cpu_prefill_first_token_stage6_8.log
 if [[ "${GEMMA4_PREFILL_KV_RUN:-0}" == 1 ]]; then
   LOG=cpu_prefill_first_token_stage6_8.log
   if [[ "${GEMMA4_PREFILL_KV_STEPS:-1}" != 1 ]]; then
     LOG=cpu_prefill_multistep_stage6_7.log
+  fi
+  if [[ "${GEMMA4_PREFILL_KV_DIAGNOSE:-0}" == 1 ]]; then
+    LOG=cpu_prefill_kv_diagnostic_stage6_10.log
   fi
 fi
 "$ROOT/build/gemma4-qnn-run" \
