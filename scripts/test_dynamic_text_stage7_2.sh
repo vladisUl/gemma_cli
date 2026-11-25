@@ -10,6 +10,20 @@ fi
 TEXT="Сколько будет 3 + 5?"
 if [[ $# -ge 1 ]]; then TEXT="$1"; fi
 cd "$WORK"
+RUNNER="$ROOT/build/gemma4-qnn-run"
+if [[ ! -x "$RUNNER" ]]; then
+  echo "STAGE7_2_RUNNER_NOT_BUILT: $RUNNER" >&2
+  exit 2
+fi
+if ! RUNNER_HELP="$("$RUNNER" --help 2>&1)"; then
+  echo "STAGE7_2_RUNNER_HELP_FAILED: rebuild gemma4-qnn-run" >&2
+  exit 2
+fi
+if [[ "$RUNNER_HELP" != *"--dynamic-prefill"* ]]; then
+  echo "STAGE7_2_STALE_BINARY: --dynamic-prefill missing. Run cmake --build build -j2 successfully before this test." >&2
+  exit 2
+fi
+echo "STAGE7_2_RUNNER_READY: dynamic_prefill_flag=1"
 for f in \
   "$PWD/sdk247/libQnnSystem.so" "$PWD/sdk247/libQnnHtp.so" \
   "$PWD/persistent_jobs_decode_prefill_head.txt" \

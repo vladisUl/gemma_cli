@@ -212,10 +212,10 @@ void run_stage7_2_dynamic(
     bool eos=false;
     for(uint32_t step=1;step<=options.dynamic_max_tokens;++step) {
         std::set<size_t> nonkv_indexes;
-        nonkv_indexes.insert(nonk(
+        nonkv_indexes.insert(nonkv(
             "decode_embeddings_0",QNN_DATATYPE_FLOAT_32,6144,
             gemma4::compute_packed_embedding(options.dynamic_section0,0,token)));
-        nonkv_indexes.insert(nonk(
+        nonkv_indexes.insert(nonkv(
             "decode_per_layer_embeddings_0",QNN_DATATYPE_FLOAT_32,35840,
             gemma4::compute_packed_embedding(options.dynamic_section2,2,token)));
         const auto next_aux=gemma4::run_decode_aux(
@@ -224,10 +224,10 @@ void run_stage7_2_dynamic(
             throw std::runtime_error("DYNAMIC_DECODE_AUX_NOT_SIX");
         const std::array<size_t,6> aux_bytes{512,512,256,256,4097,4097};
         for(size_t i=0;i<next_aux.size();++i)
-            nonkv_indexes.insert(nonk(next_aux[i].qnn_name,
+            nonkv_indexes.insert(nonkv(next_aux[i].qnn_name,
                 QNN_DATATYPE_SFIXED_POINT_8,aux_bytes[i],
                 std::vector<uint8_t>(next_aux[i].bytes)));
-        if(nonk_indexes.size()!=8 || nonkv_indexes.size()+kv_indexes.size()!=38)
+        if(nonkv_indexes.size()!=8 || nonkv_indexes.size()+kv_indexes.size()!=38)
             throw std::runtime_error("DYNAMIC_DECODE_INPUTS_INCOMPLETE");
         for(size_t i=0;i<decode->inputs.size();++i)
             bind_raw(decode->inputs[i],decode->input_buffers[i]);
