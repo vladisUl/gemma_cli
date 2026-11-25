@@ -60,3 +60,10 @@ target_include_directories(gemma4-cpu-aux PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/sr
 target_link_libraries(gemma4-cpu-aux PRIVATE dl)
 target_compile_options(gemma4-cpu-aux PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(gemma4-qnn-run PRIVATE gemma4-cpu-aux)
+
+# Experimental zero-TFLite-runtime INT2/INT4 mmap decode embedding lookup.
+add_executable(gemma4-packed-embed src/packed_embedder.cpp)
+target_compile_options(gemma4-packed-embed PRIVATE -Wall -Wextra -Wpedantic)
+if(BUILD_TESTING)
+  add_test(NAME packed_embedder_help COMMAND gemma4-packed-embed --help)
+endif()
