@@ -263,6 +263,38 @@ struct Model {
                 produced[out[0]]=std::move(v);
                 ++mulCount;
                 std::cout<<"PACKED_EMBED_MUL: scalar="<<factor<<"\n";
+            } else if(code==22) {
+                // RESHAPE must forward the actual FLOAT32 embedding data.
+                // The first RESHAPE in both models is on the INT32 token
+                // selection path and can safely be ignored for a valid token.
+                // Section0's final RESHAPE follows MUL and supplies the
+                // signature output tensor; ignoring it dropped that output.
+                require(in.size()>=1 && out.size()==1,
+                        "unexpected RESHAPE signature");
+                const auto value=produced.find(in[0]);
+                if (value!=produced.end()) {
+                    require(tensorType(in[0])==0 && tensorType(out[0])==0,
+                            "embedding RESHAPE must preserve FLOAT32 dtype");
+                    const auto targetShape=f.ints(tensors.at(
+                        static_cast<size_t>(out[0])),0);
+                    size_t elements=1;
+                    for (int32_t dim:targetShape) {
+                        require(dim>0 && elements<=std::numeric_limits<size_t>::max()/
+                                                   static_cast<size_t>(dim),
+                                "invalid target embedding RESHAPE dimension");
+                        elements*=static_cast<size_t>(dim);
+                    }
+                    require(elements==value->second.size(),
+                            "embedding RESHAPE changes element count");
+                    produced[out[0]]=value->second;
+                    std::cout<<"PACKED_EMBED_RESHAPE: elements="<<elements
+                             <<" output_tensor="<<out[0]<<"\n";
+                } else {
+                    // Token-side RESHAPE; this helper already accepts only
+                    // validated single-token IDs in [0, 262143].
+                    require(tensorType(in[0])==2 && tensorType(out[0])==2,
+                            "unexpected uncomputed non-token RESHAPE");
+                }
             } else if(code==2 && section==2) {
                 require(in.size()==35&&out.size()==1,"expected CONCATENATION of 35 vectors");
                 const size_t optionsField=f.field(op,4);
@@ -290,7 +322,7 @@ struct Model {
             } else {
                 // Restrict the ignored subgraph to token-range guards and
                 // identity reshaping. This path handles only valid token IDs.
-                require(code==62||code==58||code==86||code==123||code==22,
+                require(code==62||code==58||code==86||code==123,
                         "unknown or unsupported TFLite op in decode model");
                 require(opVersion(op)==1,"unexpected guard/reshape operator version");
             }
