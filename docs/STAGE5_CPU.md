@@ -1621,3 +1621,86 @@ EOS handling и полноценный sampler. Текущий linked first-toke
 тест вычисляет только реальный кандидат для **этого** prompt
 и сравнивает K/V численно. Не выдавать новый ID за готовый
 читаемый текст без декодирования SentencePiece/tokenizer.
+
+## Stage 6.8 — на Q8B получен первый prompt-conditioned token ID
+
+Пользователь прислал окончание успешного `test_prefill_first_token.sh`:
+
+```text
+PREFILL_LINK_NEXT_INPUTS_READY: step=2 position=17 token=236921 kv_from_feedback_ram=30 nonkv_from_cpu=8 saved_decode_inputs_used=0
+PREFILL_LINK_NEXT_DECODE_OK: step=2 position=17 input_token=236921 outputs=31 decode_ms=64.8482 reference_comparison=0
+CHAIN_DECODE_HEAD_OK: ... logits_bytes=262144 head_execute_ms=11.5586 int8_argmax_id=152294 max_logit_q=79 argmax_ties=2
+PREFILL_LINK_NEXT_HEAD_OK: step=2 logits_bytes=262144 linked_KV_feedback=1 independent_reference_comparison=0
+PREFILL_LINK_MULTI_STEP_OK: steps=2 first_position=16 last_position=17 first_token=4368 last_prompt_replayed=1 all_KV_from_prefill_or_feedback_RAM=1 all_nonKV_from_CPU=1 independent_reference_claim=0
+PREFILL_FIRST_TOKEN_STAGE6_8_OK: last_prompt_id=4368 replay_pos=16 first_generated_id=236921 next_decode_pos=17 saved_decode_inputs_used=0
+```
+
+**Факт:** replay last prompt token4368 в pos16 с KV Prefill
+позиций0..15 сгенерировал по unique INT8 argmax
+**первый токен236921**; следующий Decode в pos17
+успешно исполнился именно с236921 и RAM KV-feedback.
+Его LM Head выдал `max_logit_q=79, argmax_ties=2`,
+первый ID в QNN массиве среди лидеров — **152294**;
+второй ID в предоставленном хвосте лога не указан.
+Нельзя утверждать, что 152294 — единственно правильный
+следующий ID: INT8 квантование стёрло порядок двух максимумов.
+
+**Недостающая часть лога:** пользователь не прислал
+`PREFILL_LAST_PROMPT_KV_COMPARE: ... mismatching_bytes=...`;
+скрипт Stage6.8 проверяет наличие строки, но не требует
+`bit_exact=1`. Для оценки cross-graph equivalence
+нужно изучить точную строку и побайтовые различия.
+
+## Stage 6.9 — диагностика неоднозначных INT8 логитов
+
+**Новый код в GitHub, ожидает проверки на Q8B.**
+Теперь связанный LM Head на каждом шаге выводит
+`CHAIN_LINKED_INT8_MAX_TOKENS: max_logit_q=... ties=... token_ids=...`,
+включая все ID, которые разделяют максимальный quantized logit.
+
+В `gemma4-qnn-run --jobs` добавлен
+`--prefill-tie-policy stop|lowest-id`:
+
+- `stop` (по умолчанию): при `argmax_ties>1` прекращаем
+  автопродолжение, оставляя оба ID диагностике;
+- `lowest-id`: явный экспериментальный tie-break,
+  который выбирает наименьший ID и пишет
+  `PREFILL_LINK_TIE_RESOLUTION: ...
+  experimental_arbitrary_tiebreak=1 no_FP32_ordering_claim=1`.
+  Это **не FP32 greedy**, и не следует использовать его
+  для заявления о качестве ответа модели.
+
+Новый `scripts/test_prefill_int8_tie.sh` повторяет
+успешный Stage6.8 с `--prefill-kv-steps 3`,
+`--prefill-seed-last-prompt` и
+`--prefill-tie-policy lowest-id`. По логу проверяет
+обе tied candidates у pos17, их порядок, выбранный
+минимальный ID, 30 K/V feedback slots из pos17 и
+реальный Decode+LM Head pos18, не читая saved Decode
+inputs. Изолированный лог:
+`~/gemma4_qnn_test/cpu_prefill_tie_stage6_9.log`.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+bash scripts/test_prefill_int8_tie.sh
+```
+
+Искомые, пока не проверенные строки:
+
+```text
+PREFILL_LINK_GREEDY_CANDIDATES: executed_step=2 max_logit_q=79 ties=2 candidate_token_ids=152294,...
+PREFILL_LINK_TIE_RESOLUTION: executed_step=2 policy=lowest-id chosen_token_id=152294 ... experimental_arbitrary_tiebreak=1 no_FP32_ordering_claim=1
+PREFILL_LINK_NEXT_DECODE_OK: step=3 position=18 ...
+PREFILL_LINK_NEXT_HEAD_OK: step=3 logits_bytes=262144 ...
+PREFILL_LINK_MULTI_STEP_OK: steps=3 first_position=16 last_position=18 first_token=4368 last_prompt_replayed=1 int8_tie_policy=lowest-id-experimental ...
+PREFILL_TIE_STAGE6_9_OK: first_generated_id=236921 tied_candidates=... experimental_selected=... third_decode_position=18 ...
+```
+
+Строгая семантическая корректность generation пока не установлена:
+нужно оценить `PREFILL_LAST_PROMPT_KV_COMPARE` и подключить
+правильный tokenizer модели. В репозитории сейчас
+нет tokenizer/vocab файлов или реализации text decoding;
+только работу с integer token ID и QNN raw tensors проверяли.

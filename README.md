@@ -108,6 +108,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 6.7 (Q8B подтверждён):** Prefill KV → Decode(pos17, пробный token568) → LM Head argmax236778 → KV feedback в RAM → Decode(pos18, token236778) → LM Head argmax236862, все 8 non-KV CPU. **Stage 6.8 (новый код, ждёт Q8B):** [scripts/test_prefill_first_token.sh](scripts/test_prefill_first_token.sh) исключает пробный token568 — копирует в Decode первые 16 K/V Prefill rows, повторяет последний реальный ID `4368` на позиции `16`, получает **первый token-кандидат prompt** через LM Head, сравнивает все 30 K/V slices с последней строкой Prefill и подаёт новый ID в Decode(pos17). Результат ещё не проверен на плате и не является текстовой CLI генерацией без tokenizer.
 
+**Stage 6.8 (Q8B подтверждён):** первый token ID из оригинального 17-token prompt получен повтором последнего ID4368 на позиции16 из 16 строк Prefill KV: **236921** (уникальный INT8 максимум), затем реальный Decode(pos17, token236921) в RAM. Его LM Head вернул `max_logit_q=79`, `argmax_ties=2`, первый ID152294 — не единственный максимум. **Stage 6.9 (новый код, ожидает Q8B):** `CHAIN_LINKED_INT8_MAX_TOKENS` теперь показывает все связанные ID, флаг `--prefill-tie-policy stop|lowest-id` разделяет строгую остановку и явно экспериментальный tie-break; [scripts/test_prefill_int8_tie.sh](scripts/test_prefill_int8_tie.sh) проверяет третий Decode(pos18) с полным RAM KV feedback. Не забудьте изучить `PREFILL_LAST_PROMPT_KV_COMPARE` из полного лога — в присланном хвосте этой строки нет. Tokenizer ещё не интегрирован.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.
