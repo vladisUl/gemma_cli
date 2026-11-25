@@ -1208,6 +1208,12 @@ void apply_kv_feedback(ReplayJob& decode, const std::vector<KvLink>& links,
 // Replace ONLY the eight non-cache inputs (RoPE/masks/embeddings/per-layer)
 // with the next saved sample. Never replace the computed KV-cache buffers
 // with saved next-step files: that would bypass the feedback we want to test.
+// CPU Section1 helper is defined below the two-step replay function.
+void apply_cpu_aux_decode(ReplayJob& decode,
+                          const std::string& model_file,
+                          int32_t position, int32_t token_id,
+                          const std::string& scope);
+
 void execute_next_decode(QnnRuntime& runtime,
                          ReplayJob& decode,
                          const std::vector<KvLink>& kv_links,
