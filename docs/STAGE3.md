@@ -1,8 +1,8 @@
-# Stage 3 — произвольные входы/выходы QNN Decode (первый smoke test)
+# Stage 3 — Decode и Prefill-128 (прямой QNN, сверка с qnn-net-run)
 
 **Уже доказано на Q8B:** LM Head (`qnn_partition_1`) исполняется напрямую через `QnnGraph_execute` и выдаёт **262144/262144 идентичных байта** с `qnn-net-run`. Для проверенного шага 17: загрузка контекста 81.007 мс, один вызов execute 12.716 мс. Это результаты **одного** шага, не скорость генерации.
 
-**Новая функциональность Stage 3 пока не проверена на плате.** Добавлен режим `gemma4-qnn-run`, принимающий 38 и больше входных тензоров, выполняющий граф один раз и сохраняющий **каждый** выход с именем `<tensor_name>_native.raw`. Сверку делает с прежними папками `Result_0` от `qnn-net-run`.
+**Decode на Q8B проверен (2026-11-25):** пользовательский тест завершился строками `REFERENCE_MATCH: 1536 bytes identical` и `ALL_REFERENCES_MATCH: 31 output tensors`. Это означает побайтовое совпадение всех 31 выходов Decode с результатами `qnn-net-run` для того же набора входов. Prefill-128 — следующая проверка. Добавлен режим `gemma4-qnn-run`, принимающий 38 и больше входных тензоров, выполняющий граф один раз и сохраняющий **каждый** выход с именем `<tensor_name>_native.raw`. Сверку делает с прежними папками `Result_0` от `qnn-net-run`.
 
 ## 1. Обновить и собрать на Q8B
 
@@ -94,3 +94,49 @@ LIST="$PWD/auto_decode_step3_list.txt"
 ## Что не реализовано
 
 Это ещё **не** `gemma4-cli` с автогенерацией текста. Нет длительно живущих трёх контекстов, динамического KV-cache, CPU LiteRT embedder/AUX, SentencePiece и интерактивного чата. После подтверждения `Decode 38 → 31` следующим шагом будет `Prefill 36 → 30`, затем единый persistent-executor и локальный CPU pipeline.
+
+
+## 6. Проверить Prefill-128: 36 входов → 30 выходов
+
+**Новый скрипт:** [`scripts/test_prefill.sh`](../scripts/test_prefill.sh). Для него не требуется переделывать C++: текущий `gemma4-qnn-run` уже поддерживает произвольное число тензоров.
+
+Выполнить на Q8B после `git pull --ff-only` и сборки:
+
+```bash
+cd ~/gemma4-cli-stage1
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQAIRT_ROOT="$HOME/qairt247-headers"
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+
+cd ~/gemma4_qnn_test
+find . -maxdepth 3 -type f \( -name '*prefill*list*.txt' -o -name '*prefill*input*.txt' \) -print | sort
+find . -maxdepth 4 -type d -iname '*prefill*' -print | sort
+```
+
+Нужно выбрать сохранённый **Prefill input-list** (или папку 36 входных файлов) и соответствующий ему **эталонный `Result_0`**, полученный при вызове `qnn-net-run` **с точно теми же входами**. Автоматически подбирать несовместимые результаты по имени каталога нельзя. Все относительные пути в списке входов трактуются относительно `~/gemma4_qnn_test`.
+
+```bash
+# Внимание: заменить на существующие реальные пути из find.
+LIST='ПУТЬ_К_PREFILL_INPUT_LIST.txt'
+REF='ПУТЬ_К_ЭТАЛОНУ/Result_0'
+
+bash ../gemma4-cli-stage1/scripts/test_prefill.sh "$LIST" "$REF"
+```
+
+Скрипт выполняет два этапа:
+
+1. `--check-inputs`: сверяет все 36 входов по QNN System metadata, без NPU.
+2. `QnnGraph_execute` графа `qnn_partition_2` с сохранением всех 30 выходов и обязательным побайтовым сравнением с эталоном.
+
+Искомый успешный финал:
+
+```text
+INPUTS_VALIDATED: 36 tensors; no NPU execution
+QNN_MULTI_EXECUTE_OK: qnn_partition_2 inputs=36 outputs=30 ...
+ALL_REFERENCES_MATCH: 30 output tensors
+PREFILL_VERIFIED: 30/30 outputs byte-identical
+```
+
+Файлы результатов сохраняются в `~/gemma4_qnn_test/direct_result_prefill_128/Result_0/`, лог — в `~/gemma4_qnn_test/prefill_reference_test.log`. При несовпадении хотя бы одного байта скрипт завершается ошибкой, не выдавая `PREFILL_VERIFIED`.
+
+Если сохранённого входного списка или эталона нет, сначала найдите их; **не создавайте нулевые входы и не сравнивайте с другим шагом**. Скрипт не меняет три QNN-бинарника.
