@@ -78,12 +78,21 @@ class Stage8Unit(unittest.TestCase):
                             {"steps": 1, "ids": [236778], "stop_reason": "limit"})
 
     def test_median_not_mean(self):
-        sample = [{"npu_prefill_ms": 1.0}, {"npu_prefill_ms": 2.0},
-                  {"npu_prefill_ms": 99.0}]
-        # Full median_metrics needs the standard complete row layout.
+        # parse_benchmark returns QNN-internal measurements; run_once adds
+        # process-level durations before median_metrics is called. Mimic
+        # the complete production records, including these four fields.
         baseline = parse_benchmark(fake_log(), RESPONSE)
+        baseline.update({
+            "bpe_wall_ms": 120.0,
+            "qnn_process_wall_ms": 800.0,
+            "decoder_wall_ms": 90.0,
+            "user_request_wall_ms": 1010.0,
+        })
         runs = [dict(baseline, npu_prefill_ms=i) for i in (1.0, 2.0, 99.0)]
-        self.assertEqual(median_metrics(runs)["npu_prefill_ms"], 2.0)
+        summary = median_metrics(runs)
+        self.assertEqual(summary["npu_prefill_ms"], 2.0)
+        self.assertEqual(summary["bpe_wall_ms"], 120.0)
+        self.assertEqual(summary["user_request_wall_ms"], 1010.0)
 
 
 if __name__ == "__main__":
