@@ -44,6 +44,28 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 Этот режим не загружает `libQnnHtp.so` и не вызывает инференс. Если не сработал, приложите лог `lm_head_metadata.log`; пока не переходите к следующему тесту.
 
+## Проверенный результат на Radxa Q8B (2026-11-25)
+
+Сборка Stage 2 прошла с GCC 15.2.0 и заголовками QAIRT 2.47; `ctest` — **1/1 passed**. На реальной плате получен результат режима `--inspect` для `qnn_partition_1_1.bin`:
+
+```text
+BINARY /home/radxa/gemma4_qnn_test/qnn_partition_1_1.bin bytes=405118976
+QNN_META_OK: graphs=1
+GRAPH qnn_partition_1 inputs=1 outputs=1
+  input[0] LanguageModel_decode_graph_LanguageModel_transformer_stack_transformer_transformer_final_norm_composite_quantized sfix8 shape=[1,1,1536] bytes=1536 scale=0.4921325445 offset=10
+  output[0] StatefulPartitionedCall_30 sfix8 shape=[1,1,262144] bytes=262144 scale=0.2333765179 offset=1
+```
+
+Это подтверждает **только чтение метаданных QNN System**. `QnnGraph_execute` ещё не проверен на этом этапе. Не следует путать смещение QNN (offset=+1) с TFLite zero point (-1).
+
+Перед вызовом LM Head найдите сохранённый вход **от того же тестового запуска** (он должен быть 1536 байт):
+
+```sh
+find ~/gemma4_qnn_test -type f -name '*.raw' -size 1536c -print
+```
+
+Если вход хранится только в WSL, ищите там среди артефактов теста; копируйте нужный файл на Radxa через `scp`. По одному лишь размеру нельзя определить, какой файл является настоящим входом LM Head. Эталонные 262144 байта logits также должны соответствовать **этому же входу**.
+
 ## Тест 2: LM Head на NPU
 
 Используйте **именно сохранённый вход LM Head** из уже удачного запуска `qnn-net-run`. Это сырой квантованный тензор, а не текст и не float32 embeddings. Никаких нулевых заглушек.
