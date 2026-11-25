@@ -941,6 +941,10 @@ int run_replay_jobs(const Options& options) {
     ReplayJob* head = nullptr;
     size_t hidden_output_index = 0;
     if (options.chain_decode_head) {
+        // For this Q8B smoke test, use the already verified Decode-first load order.
+        // Prefill-first previously failed mapping the large Decode weights buffer.
+        if (jobs.front()->graph_name != "qnn_partition_0")
+            throw std::runtime_error("--chain-decode-head requires a Decode-first jobs manifest on Q8B");
         for (auto& job : jobs) {
             if (job->graph_name == "qnn_partition_0") {
                 if (decode) throw std::runtime_error("Duplicate Decode job in --jobs");
