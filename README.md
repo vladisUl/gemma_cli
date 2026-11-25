@@ -88,6 +88,8 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 5.9 (Q8B подтверждён, 25.11.2026):** оба последовательных Decode получают все **8 non-KV CPU входов** напрямую в RAM (Section1 9730 байт + Section0/2 41984 байта), 30 K/V между шагами обновляются через CPU feedback; второй Decode 31/31 выходов и LM Head 262144/262144 байта совпали с QNN reference. **Stage 6.0** готовит Prefill-128: по QNN metadata у него 36 входов — 28 K/V и 8 non-KV. Добавлен [scripts/probe_prefill_metadata.py](scripts/probe_prefill_metadata.py) для проверки исходных CPU prefill-сигнатур и размеров сохранённых QNN входов перед соединением Prefill→Decode. Это пока диагностика, не автономная генерация.
 
+**Stage 6.0 подтверждён на Q8B:** 36 входов Prefill-128 = 28 K/V + 8 non-KV, метаданные всех трёх исходных CPU-моделей доступны. **Stage 6.1 (новый код, ещё не проверен):** [scripts/recover_prefill_tokens.py](scripts/recover_prefill_tokens.py) однократно сканирует INT2 таблицу и проверяет 128 сохранённых Prefill embeddings по 6144 байт каждый, чтобы определить реальные 128 token IDs без догадок и без изменения входных эталонов.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.

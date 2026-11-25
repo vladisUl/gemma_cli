@@ -828,3 +828,68 @@ python3 scripts/probe_prefill_metadata.py \
 Section0/Section2 embeddings для 128 token IDs и строго проверить
 результаты с сохранённым QNN input list. Текущий Stage 6.0
 **не доказал** автоматическую связку Prefill→Decode.
+
+## Stage 6.0 на Q8B — метаданные Prefill подтверждены
+
+Пользователь получил:
+
+```text
+PREFILL_QNN_LIST_OK: inputs=36 non_kv=8 kv=28 source=prefill_real_input_list.txt
+PREFILL_INTERFACE_PROBE_OK: metadata inspection completed
+```
+
+Имена и типы CPU-сигнатур в полном логе пока не передавались.
+Скрипт проверил, что исходные Section0/1/2 модели присутствуют и
+что восемь сохранённых non-KV Prefill входов имеют размеры из QNN-метаданных.
+
+## Stage 6.1 — извлечение 128 token IDs из сохранённого Prefill
+
+Для оригинального `prefill_real_input_list.txt` создан
+`scripts/recover_prefill_tokens.py`. Сначала берёт
+`prefill_128_embeddings_0` QNN input index 32, FLOAT32
+`[1,128,1536]` (786432 байта). Каждый из 128 рядов —
+одна строка embeddings от Section0.
+
+Кандидаты ID по каждому ряду подбираются по знакам первых 32 FLOAT32:
+из оригинальной INT2-таблицы [262144,1536] формируется
+компактная 64-битная подпись знаков (нулевой, положительный,
+отрицательный). По всей таблице делается **один проход**,
+по 8 упакованных байт на строку, сразу для всех искомых
+подписей — без 128 отдельных полнословарных переборов.
+
+Затем **каждый** кандидат проходит через уже побайтово проверенный
+`gemma4-packed-embed --section 0`; сравнение должно дать
+точное совпадение всех **6144 байт** с сохранённой строкой.
+Если у одного ряда нет **ровно одного** подходящего ID, скрипт
+останавливается. Даже при повторяющихся токенах проверяются
+все 128 позиций; промежуточные выходы кешируются в RAM.
+
+Только после 128 успешных сверок будет создан
+`~/gemma4_qnn_test/derived_prefill_128_token_ids_i32.raw`
+размером 512 байт (128 × little-endian INT32). Существующий
+несовпадающий файл **никогда не перезаписывается**.
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+python3 scripts/recover_prefill_tokens.py \
+  2>&1 | tee ~/gemma4_prefill_tokens_stage6_1.log
+```
+
+Искомые результаты:
+
+```text
+PREFILL_TOKEN_SEARCH_READY: rows=128 ...
+PREFILL_TOKEN_REFERENCE_MATCH: position=0 token=... bytes=6144
+...
+PREFILL_TOKEN_REFERENCE_MATCH: position=127 token=... bytes=6144
+PREFILL_TOKENS_SAVED: .../derived_prefill_128_token_ids_i32.raw bytes=512
+PREFILL_TOKENS_VERIFIED: count=128 unique=... reference_bytes=786432 ...
+```
+
+Код Stage 6.1 ещё не проверялся на Q8B. Следующий этап
+после подтверждения ID — разобрать полноценные Prefill-подписи
+CPU Section1, вычислить 128 эмбеддингов Section0/2 одним проходом
+и строго сравнить все восемь входов Prefill. Первые 28 KV
+входов Prefill останутся отдельным вопросом, как и
+перенос его 30 выходов к начальному состоянию Decode.
