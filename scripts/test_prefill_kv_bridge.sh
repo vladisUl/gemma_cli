@@ -17,7 +17,7 @@ if [[ "$LINKS" != 30 ]]; then
     echo "KV_PREFILL_PROBE_ERROR: expected 30 mappings; got $LINKS" >&2
     exit 1
 fi
-grep -Fq 'KV_PREFILL_BRIDGE_PROBE_OK: tensors=30 layers=15 valid_tokens=17 padding_rows_ignored=111 next_decode_position=17' "$LOG" || {
+grep -Fq 'KV_PREFILL_BRIDGE_PROBE_OK: tensors=30 layers=15 valid_tokens=17 padding_rows_ignored=111 copied_rows=17 next_decode_position=17 last_prompt_replay=0' "$LOG" || {
     echo "KV_PREFILL_PROBE_ERROR: missing strict block bridge marker" >&2
     exit 1
 }
