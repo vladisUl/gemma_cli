@@ -5,6 +5,9 @@
 set -euo pipefail
 # Explicit self-contained opt-in for experimental prompt-last seed.
 export GEMMA4_PREFILL_KV_PROBE=1 GEMMA4_PREFILL_KV_RUN=1
+# This standalone test already passes --prefill-kv-steps 2 explicitly.
+# Prevent an inherited stage-6.7 environment value from duplicating the CLI flag.
+export GEMMA4_PREFILL_KV_STEPS=1
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="${GEMMA4_TEST_ROOT:-$HOME/gemma4_qnn_test}"
 if [[ ! -d "$WORK" ]]; then
