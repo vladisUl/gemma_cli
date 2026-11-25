@@ -213,6 +213,8 @@ PERSISTENT_ORDER_VERIFIED: decode_prefill_head graphs=3 outputs=62
 
 **Важно:** проверенные отдельные Decode и LM Head относятся к разным сохранённым шагам генерации. Следовательно, новая выходная последовательность логитов НЕ должна автоматически сравниваться с ранее сохранённым `real_result_head_17`: это был бы неверный эталон. Успех `CHAIN_DECODE_HEAD_OK` пока означает корректное исполнение связки и совместимость метаданных, а не точность полного текстового ответа.
 
+Для этого режима используйте **именно** `persistent_jobs_decode_prefill_head.txt`, который создал предыдущий успешный `test_persistent_order.sh decode prefill head`, а не старый `persistent_jobs_all3.txt` с проблемным порядком загрузки `Prefill → Decode`.
+
 На Q8B:
 
 ```bash
@@ -228,7 +230,7 @@ set -o pipefail
 ../gemma4-cli-stage1/build/gemma4-qnn-run \
   --system "$PWD/sdk247/libQnnSystem.so" \
   --backend "$PWD/sdk247/libQnnHtp.so" \
-  --jobs persistent_jobs_all3.txt \
+  --jobs persistent_jobs_decode_prefill_head.txt \
   --chain-decode-head 2>&1 | tee chain_decode_head.log
 ```
 
