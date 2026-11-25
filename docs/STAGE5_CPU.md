@@ -1987,3 +1987,65 @@ Prefill и Decode получает одинаковые смысловые CPU-�
 Если `AC>0`, нужно локализовать конкретный вход, проверить
 маски/RoPE/эмбеддинги, прежде чем обвинять NPU kernels.
 `_OK` означает только завершение диагностического режима.
+
+
+## Stage 6.13 — Q8B подтверждён
+
+Для всех 8 не-KV входов первого токена `AB_mismatches=0`,
+`AC_mismatches=0`, `BC_mismatches=0`: всего 51714 байт
+совпали побайтово. Два хвоста маски (Prefill columns 4097..4223)
+по 127 байт замаскированы. Stage6.12: Prefill-A/B KV row0 совпадают
+0/9216 mismatches, но Prefill/Decode расходятся на 5449/9216.
+Причина не во входных CPU embeds/RoPE/masks сравнимых областей.
+
+## Stage 6.14 — Decode-only prompt (код, ждёт Q8B)
+
+**Цель:** проверить, возможно ли автономно построить prompt KV-cache
+только графом Decode, не используя Prefill KV. Это обходное решение
+текущего несовпадения двух NPU-графов, а не исправление их численных
+различий. Prefill-128 выполняется только для проверок и диагностики.
+
+Из Stage6.11 используем уже исполненный Decode(pos0,BOS2,30
+нулевых K/V). Затем выполняем позиции 1..16 с реальными ID
+из исходного 512-байтового `derived_prefill_128_token_ids_i32.raw`:
+- 2 embedding tensor per token через CPU packed Section0/2.
+- 6 AUX tensor per token через TFLite Section1 с соответствующими
+  position и token ID.
+- 30 полных cache tensor в отдельных scratch buffers; после каждого
+  QNN Decode новый KV slice вставляется в cache правильной позиции,
+  проверяются все 9216 байт вставки.
+- Для каждой позиции диагностическое сравнение slice с Prefill output
+  row той же позиции (Prefill значения НЕ попадают в Decode cache).
+- После pos16 последний Decode hidden-state передаётся в LM Head.
+  Выводится INT8 max и множество совпадающих максимальных token IDs,
+  без произвольного tie-break и без заявления о FP32 ранжировании.
+
+Бинарники, оригинальные reference input/output buffers, RAW и токеновый
+файл не изменяются. Итоговые `DECODE_ONLY_STAGE6_14_OK` и
+`DECODE_ONLY_FIRST_GENERATION_CANDIDATES` означают работающий цикл
+инференса без Prefill для заданного prompt; не доказывают
+семантическую корректность текста или равенство исходному LiteRT-LM.
+
+Команда на Q8B:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+bash scripts/test_decode_only_prompt.sh
+```
+
+Лог: `~/gemma4_qnn_test/cpu_decode_only_prompt_stage6_14.log`.
+
+Основные маркеры:
+- `DECODE_ONLY_BEGIN`
+- 16 x `DECODE_ONLY_STEP_OK`
+- 17 x `DECODE_ONLY_KV_POSITION`
+- `DECODE_ONLY_PROMPT_KV_READY` (17*30 = 510 KV slices)
+- `DECODE_ONLY_FIRST_GENERATION_CANDIDATES`
+- `DECODE_ONLY_STAGE6_14_OK`
+
+В первую очередь сравнить token candidates с историческими
+референсами, но НЕ приравнивать совпадение INT8 argmax к
+доказательству полной генерации текста.

@@ -118,6 +118,10 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 6.13 (код, ожидает Q8B):** [scripts/test_prefill_first_inputs.sh](scripts/test_prefill_first_inputs.sh) побайтово проверяет 8 не-KV входов первого BOS (Prefill-A / Prefill-B / Decode-C), где A=Prefill(BOS-only), B=Prefill(17 tokens), C=Decode(pos0,нулевой KV). Сравниваются embeddings, per-layer embeddings, global/local RoPE и первые 4097 столбцов global/local mask; оставшиеся 127 столбцов маски Prefill учитываются отдельно. 30 выходных KV Stage 6.12 по-прежнему сравниваются. Только диагностика, без редактирования RAW, QNN contexts или KV.
 
+**Stage 6.13 (Q8B подтверждён):** все 8 входов Prefill(A)/Prefill(B)/Decode(C) в сопоставимых областях совпадают побайтово: 0/51714 отличий, два дополнительных Prefill mask tails (по 127) замаскированы. Причина 5449/9216 несовпадающих KV на pos0 находится не в этих восьми CPU-входах.
+
+**Stage 6.14 (код, ожидает Q8B):** [scripts/test_decode_only_prompt.sh](scripts/test_decode_only_prompt.sh) проходит весь 17-токенный prompt через Decode-only (pos0 из Stage6.11, затем 16 вызовов Decode с CPU embeddings/AUX и 30 K/V-кэшами из результатов только Decode). Prefill KV только для диагностики каждой позиции, не для входов. Последний hidden state подаётся в LM Head; все кандидаты максимума INT8 логитов выводятся без принудительного tie-break. Это диагностический путь к возможному CLI без Prefill; семантическая корректность пока не доказана.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.
