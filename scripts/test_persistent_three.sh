@@ -25,16 +25,16 @@ EOF
 
 if (( $# != 0 )); then usage >&2; exit 2; fi
 
-REPO_DIR="$(cd -- "$(dirname -- "\${BASH_SOURCE[0]}")/.." && pwd)"
-MODEL_DIR="\${GEMMA4_MODEL_DIR:-$HOME/gemma4_qnn_test}"
-RUNNER="\${GEMMA4_QNN_RUNNER:-$REPO_DIR/build/gemma4-qnn-run}"
-PREFILL_LIST="\${PREFILL_LIST:-prefill_real_input_list.txt}"
-PREFILL_REF="\${PREFILL_REF:-result_prefill_real_prompt/Result_0}"
-DECODE_LIST="\${DECODE_LIST:-auto_decode_step3_list.txt}"
-DECODE_REF="\${DECODE_REF:-auto_result_decode_3/Result_0}"
-HEAD_INPUT="\${HEAD_INPUT:-real_result_decode_17/Result_0/LanguageModel_decode_graph_LanguageModel_transformer_stack_transformer_transformer_final_norm_composite_quantized_native.raw}"
-HEAD_REF="\${HEAD_REF:-real_result_head_17/Result_0}"
-LOG="\${PERSISTENT_THREE_LOG:-persistent_three.log}"
+REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+MODEL_DIR="${GEMMA4_MODEL_DIR:-$HOME/gemma4_qnn_test}"
+RUNNER="${GEMMA4_QNN_RUNNER:-$REPO_DIR/build/gemma4-qnn-run}"
+PREFILL_LIST="${PREFILL_LIST:-prefill_real_input_list.txt}"
+PREFILL_REF="${PREFILL_REF:-result_prefill_real_prompt/Result_0}"
+DECODE_LIST="${DECODE_LIST:-auto_decode_step3_list.txt}"
+DECODE_REF="${DECODE_REF:-auto_result_decode_3/Result_0}"
+HEAD_INPUT="${HEAD_INPUT:-real_result_decode_17/Result_0/LanguageModel_decode_graph_LanguageModel_transformer_stack_transformer_transformer_final_norm_composite_quantized_native.raw}"
+HEAD_REF="${HEAD_REF:-real_result_head_17/Result_0}"
+LOG="${PERSISTENT_THREE_LOG:-persistent_three.log}"
 
 fail() {
   printf 'PERSISTENT_THREE_ERROR: %s\n' "$*" >&2
@@ -109,7 +109,7 @@ set +e
   --system "$PWD/sdk247/libQnnSystem.so" \
   --backend "$PWD/sdk247/libQnnHtp.so" \
   --jobs "$MANIFEST" 2>&1 | tee "$LOG"
-status=\${PIPESTATUS[0]}
+status=${PIPESTATUS[0]}
 set -e
 
 if (( status != 0 )); then
