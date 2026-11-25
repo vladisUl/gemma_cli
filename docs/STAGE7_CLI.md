@@ -44,8 +44,9 @@ python3 scripts/gemma4_cli.py
 # Вы> /exit
 ```
 
-`--max-tokens` defaults to 32, allowed range 1–32, consistent with the
-existing `--dynamic-max-tokens` QNN flag. The result is explicitly marked
+`--max-tokens` defaults to 128, allowed range 1–256, consistent with the
+existing `--dynamic-max-tokens` QNN flag (Stage 7.5). Short questions
+still stop at EOS before the length limit; longer requests can run longer. The result is explicitly marked
 incomplete when QNN stops at the limit or an ambiguous INT8 max. An
 ambiguous argmax ID is **never** inserted into the user-visible text.
 
@@ -124,3 +125,36 @@ python3 scripts/gemma4_cli.py --text 'Что ты умеешь?' --tie-policy lo
 
 **Status:** Stage7.4 source committed but not yet compiled or NPU-tested
 on Q8B; previous Stage7.3 behavior was confirmed on device.
+
+## Stage 7.4 — Q8B confirmed; Stage 7.5 response length
+
+Stage 7.4 ran on Radxa Dragon Q8B. The default safe `stop` policy
+and experimental `lowest-id` policy both worked. `Что ты умеешь?`
+returned the same response under each policy but stopped at the previous
+32-token limit, **not** at an INT8 tie. During interactive testing,
+`привет` and a request for a cat poem each required one explicit
+lowest-ID resolution; the cat poem also stopped at the 32-token limit.
+
+Stage 7.5 increases the maximum Decode predictions per question
+from 32 to 256, with a frontend default of 128. The C++ sample-free
+dynamic QNN loop already enforces its 4096-row KV-cache capacity,
+and EOS and INT8-tie policies stay unchanged. This change does NOT
+extend the 128-token **input Prefill** limit, support multiple prior
+turns, or preserve QNN contexts between questions.
+
+Example:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+python3 scripts/gemma4_cli.py --text 'Придумай одно четверостишие про кота.' --max-tokens 128
+python3 scripts/gemma4_cli.py --text 'Что ты умеешь?' --max-tokens 128
+# Only when explicitly accepting experimental quantized tie-breaks:
+python3 scripts/gemma4_cli.py --text 'Придумай одно четверостишие про кота.' --max-tokens 128 --tie-policy lowest-id
+```
+
+There is no guarantee that 128 tokens will be enough for every answer,
+nor that an arbitrary open-ended response will be semantically correct.
+Status: source committed, Q8B compilation and run pending.

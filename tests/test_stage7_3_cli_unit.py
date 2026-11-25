@@ -154,6 +154,33 @@ class Stage73Unit(unittest.TestCase):
         with self.assertRaisesRegex(GenerationParseError, "Unreported"):
             parse_dynamic(log, VOCAB)
 
+    def test_reject_more_than_256_generations(self):
+        import subprocess
+        runner = Path(__file__).resolve().parents[1] / "scripts/gemma4_cli.py"
+        result = subprocess.run(
+            [sys.executable, str(runner), "--max-tokens", "257",
+             "--text", "sample"],
+            capture_output=True, text=True, check=False
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("between 1 and 256", result.stderr)
+
+    def test_reject_zero_generations(self):
+        import subprocess
+        runner = Path(__file__).resolve().parents[1] / "scripts/gemma4_cli.py"
+        result = subprocess.run(
+            [sys.executable, str(runner), "--max-tokens", "0",
+             "--text", "sample"],
+            capture_output=True, text=True, check=False
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("between 1 and 256", result.stderr)
+
+    def test_default_generations_128(self):
+        from gemma4_cli import DEFAULT_MAX_TOKENS, MAX_GENERATION_TOKENS
+        self.assertEqual(DEFAULT_MAX_TOKENS, 128)
+        self.assertEqual(MAX_GENERATION_TOKENS, 256)
+
 
 if __name__ == "__main__":
     unittest.main()

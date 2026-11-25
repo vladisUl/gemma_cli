@@ -617,7 +617,7 @@ void usage(const char* executable) {
         << "  --dynamic-prefill: sample-free QNN inference; requires --jobs,\n"
         << "     --dynamic-prompt-tokens FILE --dynamic-section0 MODEL0\n"
         << "     --dynamic-section1 MODEL1 --dynamic-section2 MODEL2\n"
-        << "     optional --dynamic-max-tokens N (1..32, default 16).\n"
+        << "     optional --dynamic-max-tokens N (1..256, default 16).\n"
         << "  --dynamic-tie-policy stop|lowest-id (default stop):\n"
         << "     lowest-id is EXPERIMENTAL, quantized-tie only, no FP32 claim.\n"
         << "  --prefill-stop-on-eos: LF107 continuation; EOS ids 1,106,50 stop.\n"
@@ -755,11 +755,11 @@ Options parse_options(int argc, char** argv) {
         }
         else if (arg == "--dynamic-max-tokens") {
             if(value.empty() || value.front()=='-')
-                throw std::runtime_error("--dynamic-max-tokens expects 1..32");
+                throw std::runtime_error("--dynamic-max-tokens expects 1..256");
             size_t consumed=0;
             const auto num=std::stoul(value,&consumed);
-            if(consumed!=value.size() || num<1 || num>32)
-                throw std::runtime_error("--dynamic-max-tokens must be 1..32");
+            if(consumed!=value.size() || num<1 || num>256)
+                throw std::runtime_error("--dynamic-max-tokens must be 1..256");
             options.dynamic_max_tokens=static_cast<uint32_t>(num);
         }
         else if (arg == "--cpu-prefill-tokens") options.cpu_prefill_tokens = value;

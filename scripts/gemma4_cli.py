@@ -25,6 +25,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_WORK = Path.home() / "gemma4_qnn_test"
+DEFAULT_MAX_TOKENS = 128
+MAX_GENERATION_TOKENS = 256
 
 
 class CliError(RuntimeError):
@@ -148,8 +150,8 @@ def generate(text, work, runner, max_tokens, tie_policy='stop'):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--text", help="One-shot question; omit for terminal loop")
-    parser.add_argument("--max-tokens", type=int, default=32,
-                        help="Max QNN Decode predictions per question, 1..32")
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
+                        help="Max QNN Decode predictions per question, 1..256; default 128")
     parser.add_argument("--tie-policy", choices=("stop", "lowest-id"),
                         default="stop",
                         help="INT8 max tie: stop (default), or experimental lowest-id; "
@@ -158,8 +160,8 @@ def main():
     parser.add_argument("--runner", type=Path,
                         default=ROOT / "build/gemma4-qnn-run")
     args = parser.parse_args()
-    if not 1 <= args.max_tokens <= 32:
-        parser.error("--max-tokens must be between 1 and 32")
+    if not 1 <= args.max_tokens <= MAX_GENERATION_TOKENS:
+        parser.error("--max-tokens must be between 1 and 256")
     work = args.workdir.expanduser().resolve()
     runner = args.runner.expanduser().resolve()
     if not work.is_dir():
