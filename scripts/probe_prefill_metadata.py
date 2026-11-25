@@ -50,8 +50,7 @@ def alias_info(fb, graph, alias):
 
 def inspect_model(path, section):
     if not path.is_file():
-        print(f"PREFILL_CPU_MODEL_MISSING: section={section} path={path}")
-        return False
+        raise ValueError(f"PREFILL_CPU_MODEL_MISSING: section={section} path={path}")
     with path.open("rb") as stream:
         with mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as mm:
             if mm[4:8] != b"TFL3":
@@ -107,15 +106,15 @@ def inspect_saved_list(path):
                                  f"expected {expected_name!r}")
         else:
             filename = entry
-        path = pathlib.Path(filename)
-        if not path.is_file():
-            raise ValueError(f"Missing saved QNN Prefill input[{index}]: {path}")
-        n = path.stat().st_size
+        input_path = pathlib.Path(filename)
+        if not input_path.is_file():
+            raise ValueError(f"Missing saved QNN Prefill input[{index}]: {input_path}")
+        n = input_path.stat().st_size
         if n != expected_size:
             raise ValueError(f"QNN Prefill input[{index}] wrong byte count: "
                              f"expected {expected_size}, actual {n}")
         print(f"PREFILL_QNN_NONKV: index={index} name={expected_name} "
-              f"bytes={n} file={path}", flush=True)
+              f"bytes={n} file={input_path}", flush=True)
         count += 1
     print(f"PREFILL_QNN_LIST_OK: inputs={len(entries)} "
           f"non_kv={count} kv={len(entries)-count} "
