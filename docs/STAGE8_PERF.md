@@ -92,4 +92,85 @@ keeping the normal generation path unchanged. The labels are
 `BENCH8_METADATA`, `BENCH8_PREFILL`, `BENCH8_FIRST_TOKEN`,
 `BENCH8_STEP` and the existing `CHAIN_DECODE_HEAD_OK`.
 
-No numerical speed claim is made until measured on the Q8B.
+## Measured baseline: Dragon Q8B, 2026-11-25
+
+The hardware run reported `STAGE8_OK` and a successful full golden
+regression (`2 + 2 будет **4**.`, nine exact IDs, EOS106).
+All 14 CTest cases passed after the Stage 8 unit-test fixture fix.
+Exact saved local report path:
+
+`/home/radxa/gemma4_qnn_test/bench_stage8_20261125_184428_kjg2ps6_/summary.json`
+
+Conditions: prompt `Что ты умеешь?`, **13 actual Prefill tokens**
+(excludes final LF replayed by Decode), graph fixed at 128 positions;
+three independent fresh-process runs, no added warm-up;
+64 predicted text tokens, `stop_reason=limit` for every run;
+safe default INT8 tie policy. The output did not reach EOS, so it is
+a speed baseline, not evidence of answer completion.
+
+| Run | NPU Prefill (ms) | Text tok/s | QNN-jobs TTFT (ms) | Full request wall (ms) |
+|---|---:|---:|---:|---:|
+| 1 | 60.72 | 11.02 | 1362.68 | 8557.59 |
+| 2 | 59.64 | 11.83 | 1339.19 | 8113.35 |
+| 3 | 56.31 | 11.84 | 1348.78 | 8104.60 |
+| **Median** | **59.64** | **11.83** | **1348.78** | **8113.35** |
+
+Median component details:
+
+| Metric | Value |
+|---|---:|
+| BPE Python startup, tokenizer JSON + encoding | 950.05 ms |
+| QNN metadata / allocation | 459.13 ms |
+| CPU Prefill input construction | 36.54 ms |
+| QNN backend and three context loads | 703.28 ms |
+| Blocking Prefill graphExecute | 59.64 ms |
+| Prefill-to-Decode KV bridge | 1.81 ms |
+| Effective Prefill (13 real tokens) | 217.99 tok/s |
+| Nominal 128 graph-position throughput | 2146.37 pos/s |
+| CPU + NPU effective Prefill | 135.16 tok/s |
+| TTFT from QNN jobs start, includes context loading | 1348.78 ms |
+| First Decode iteration | 85.80 ms |
+| 64 Decode iterations including CPU, Head and KV | 5408.05 ms |
+| 64 Decode graphExecute calls | 4147.85 ms |
+| 64 LM Head graphExecute calls | 713.60 ms |
+| User-visible text generation | 11.83 tok/s |
+| NPU Decode + Head graphExecute only | 13.17 steps/s |
+| Decode iterations after first | 11.84 steps/s |
+
+Per iteration from median summed wall times: Decode NPU ≈64.81 ms,
+LM Head ≈11.15 ms, CPU/other ≈8.54 ms; approximately 77% of
+iteration wall time is in NPU Decode, 13% in Head. Note these are
+ratios of marginal medians, not a breakdown of one exact run.
+
+### LiteRT-LM figures supplied for comparison
+
+The user measured the same E2B model through standard LiteRT-LM.
+The reported figures (independent test; methodology may differ) were:
+
+| Backend | Init (s) | TTFT (s) | Prefill tok/s | Decode tok/s |
+|---|---:|---:|---:|---:|
+| GPU | 4.308 | 0.811 | 340.807 | 16.698 |
+| CPU | 10.593 | 0.635 | 429.293 | 25.704 |
+| CPU YNNPACK | 8.270 | 0.480 | 577.284 | 27.689 |
+| Our QNN HTP | included in individual timings | 1.349 from jobs start | 217.99 effective over 13 tokens | 11.83 |
+
+Raw decode throughput QNN vs LiteRT GPU is about 0.71×;
+vs CPU about 0.46×; vs CPU YNNPACK about 0.43×.
+These comparisons should **not** be interpreted as
+matched-hardware, matched-prompt, matched-sampling benchmarks without
+confirming the measurement method, model quantization and runtime
+settings.
+
+In particular, the QNN TTFT 1.349 s includes 0.459 s metadata
+and 0.703 s context loading. Their difference (~0.186 s) is only
+an inferred after-init estimate, not an independent warm TTFT sample.
+QNN Prefill throughput uses just 13 genuine tokens despite running
+all 128 graph positions: 2146 nominal padded positions/s is NOT
+2146 real input tokens/s.
+
+Next benchmark questions: NPU/DSP clocks and thermal behavior;
+constant-token-length workload; context-load removal for interactive
+use; NPU Decode graph latency (~64.8ms per token) versus Head (~11.2ms)
+and CPU input prep (~8.5ms). Do not optimize BPE and claim that will
+remove the dominant Decode graphExecute latency.
+
