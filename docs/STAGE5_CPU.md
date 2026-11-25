@@ -2157,3 +2157,70 @@ grep -E 'STAGE6_17_|PREFILL_LINK_GREEDY_CANDIDATES|QNN_RUN_ERROR' \
 
 При ошибке не удалять лог: до неё могут быть
 `PREFILL_LINK_GREEDY_CANDIDATES` с достоверными tied IDs.
+
+
+## Stage 6.17 — реальное Q8B продолжение: «2 + 2»
+
+При правильном заголовке `<|turn>model\n` четыре
+следующие предсказания из persistent QNN Decode → Head
+оказались однозначными (ties=1 на каждом шаге):
+- ID236778: `2`, INT8 max119, response position18;
+- ID900: `▁+`, INT8 max111, response position19;
+- ID236743: `▁`, INT8 max111, response position20;
+- ID236778: `2`, INT8 max110, response position21.
+
+Текстовая предварительная сборка: `2 + 2`.
+Это не весь ответ и ещё не гарантия корректности дальнейшей
+генерации, но впервые подтверждено многошаговое содержательное
+текстовое продолжение с правильным Gemma4 chat template.
+
+## Stage 6.18 — EOS-aware генерация до 16 шагов (код, ждёт Q8B)
+
+Из официальной `google/gemma-4-E2B-it/generation_config.json`:
+`eos_token_id = [1, 106, 50]` (ID106 — end-of-turn).
+Добавлен CLI-флаг `--prefill-stop-on-eos`, который разрешает
+`--prefill-kv-steps 2..16` **только** для `--prefill-kv-token 107`
+после Prefill prompt; политика tie должна быть stop, не lowest-id.
+Ранее поддерживавшиеся 1..4 шага остаются доступными без нового флага.
+
+После каждого LM Head включая последний шаг сканируется весь
+INT8 словарь, фиксируются `ties` и уникальный
+`PREFILL_LINK_GREEDY_CANDIDATES`. При неоднозначном INT8
+максимуме процесс останавливается с ошибкой без выбора ID.
+Если уникальный следующий ID — 1, 106 или 50,
+печатается `PREFILL_LINK_STOP_EOS` с идентификатором и
+позиционной меткой; этот EOS **не подаётся в Decode**.
+При 16 NPU шагах без EOS — `PREFILL_LINK_STOP_LIMIT`
+(`generation_complete=0`). Итого `PREFILL_LINK_MULTI_STEP_OK`
+всегда содержит реально выполненное количество шагов
+(1..16), `requested_steps` и `eos_stop`.
+
+Диагностический скрипт:
+`scripts/test_correct_header_generation_eos.sh`.
+Он проверяет прежние strict references, canonical LF,
+первые четыре известных token ID, а также согласованность
+числа `CHAIN_DECODE_HEAD_OK` и
+`PREFILL_LINK_GREEDY_CANDIDATES`, формирует строки
+`STAGE6_18_GENERATED_TOKEN`, `STAGE6_18_TEXT_PREVIEW`,
+`STAGE6_18_STOP_REASON` и `STAGE6_18_OK`.
+Special EOS не включается в видимый текст ответа;
+остальные ID декодируются по BPE словарю (preview, не
+полноценная реализация кодировщика).
+Тест Q8B ещё не запускался.
+
+Команды на Q8B:
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+bash -n scripts/test_correct_header_generation_eos.sh
+bash scripts/test_correct_header_generation_eos.sh
+grep -E 'STAGE6_18_|PREFILL_LINK_STOP_(EOS|LIMIT)|PREFILL_LINK_GREEDY_CANDIDATES|QNN_RUN_ERROR' \
+  ~/gemma4_qnn_test/cpu_correct_header_generation_stage6_18.log
+```
+
+Если остановка произошла при неоднозначности INT8, раннее
+`PREFILL_LINK_GREEDY_CANDIDATES` в логе остаётся и
+поддерживает дальнейшую диагностику, а `_OK` не печатается.

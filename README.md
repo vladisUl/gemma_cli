@@ -134,6 +134,10 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 6.17 (код ожидает Q8B):** [scripts/test_correct_header_generation.sh](scripts/test_correct_header_generation.sh) продолжает исправленный Stage6.16 до 4 последовательных вызовов Decode (pos17..20), 30 KV feedback в RAM, проверяет неизменность эталонов, печатает raw BPE токены, `STAGE6_17_TEXT_PREVIEW`. На шагах 1..3 INT8 максимумы должны быть уникальны: при tie исполнитель по умолчанию останавливается, не выбирая token ID произвольно. Запуск: `bash scripts/test_correct_header_generation.sh`.
 
+**Stage 6.17 (Q8B подтверждён):** после canonical `<|turn>model\\n`, QNN persistent Decode+Head последовательно дал четыре уникальных INT8 argmax token ID: `236778, 900, 236743, 236778`, BPE preview `2 + 2`. Все 30 KV из NPU Decode feedback и восемь новых CPU non-KV на каждый шаг; никаких принудительных tie-break.
+
+**Stage 6.18 (код, ожидает Q8B):** [scripts/test_correct_header_generation_eos.sh](scripts/test_correct_header_generation_eos.sh) расширяет эту цепочку до 16 Decode шагов с `--prefill-stop-on-eos`. Для `google/gemma-4-E2B-it` официальная [generation_config.json](https://huggingface.co/google/gemma-4-E2B-it/blob/main/generation_config.json) указывает EOS ID `[1,106,50]`. При прогнозировании любого из них NPU цикл завершается **до подачи EOS обратно в Decode**. При неоднозначном INT8 максимуме штатный `stop` останавливает процесс с диагностикой кандидатов. В логе `STAGE6_18_GENERATED_TOKEN`, `STAGE6_18_TEXT_PREVIEW`, `STAGE6_18_STOP_REASON`. Без изменения QNN-контекстов/RAW, ранее работающие Stage6.1–6.17 не меняются по поведению. Запуск после пересборки: `bash scripts/test_correct_header_generation_eos.sh`.
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.

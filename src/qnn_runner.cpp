@@ -458,6 +458,7 @@ struct Options {
     bool compare_kv_histories = false;
     bool prefill_tie_policy_set = false;
     bool prefill_allow_tie_lowest = false;
+    bool prefill_stop_on_eos = false;
     bool prefill_kv_diagnose = false;
     uint32_t kv_feedback_pos = 0;
     int32_t cpu_aux_pos = 0;
@@ -605,9 +606,10 @@ void usage(const char* executable) {
         << "     Does NOT replace actual Decode KV inputs or execute a linked Decode.\n"
         << "  --prefill-kv-run --prefill-kv-token ID: separately run linked Decode+Head\n"
         << "     with Prefill KV cache (17 tokens) and CPU non-KV for position 17.\n"
-        << "  Optional --prefill-kv-steps N (1..4): 2+ linked Decode steps using\n"
+        << "  Optional --prefill-kv-steps N (1..4; up to 16 with EOS-stop):\n"
         << "     previous Decode output KV feedback and prior LM Head INT8 argmax.\n"
         << "     Probe token is NOT derived from Prefill logits; no tokenizer.\n"
+        << "  --prefill-stop-on-eos: LF107 continuation; EOS ids 1,106,50 stop.\n"
         << "  --prefill-tie-policy stop|lowest-id (default stop): print all tied\n"
         << "     INT8 max IDs; lowest-id allows an EXPERIMENTAL tie-break only.\n"
         << "  --prefill-seed-last-prompt instead of --prefill-kv-token: replays the\n"
@@ -653,6 +655,10 @@ Options parse_options(int argc, char** argv) {
         }
         if (arg == "--prefill-kv-probe") {
             options.prefill_kv_probe = true;
+            continue;
+        }
+        if (arg == "--prefill-stop-on-eos") {
+            options.prefill_stop_on_eos = true;
             continue;
         }
         if (arg == "--prefill-kv-run") {
@@ -744,11 +750,11 @@ Options parse_options(int argc, char** argv) {
         }
         else if (arg == "--prefill-kv-steps") {
             if(options.prefill_kv_steps_set || value.empty() || value.front()=='-')
-                throw std::runtime_error("--prefill-kv-steps must be 1..4");
+                throw std::runtime_error("--prefill-kv-steps must be 1..16");
             size_t end=0;
             const auto steps=std::stoul(value,&end);
-            if(end!=value.size() || steps<1 || steps>4)
-                throw std::runtime_error("--prefill-kv-steps must be 1..4");
+            if(end!=value.size() || steps<1 || steps>16)
+                throw std::runtime_error("--prefill-kv-steps must be 1..16");
             options.prefill_kv_steps=static_cast<uint32_t>(steps);
             options.prefill_kv_steps_set=true;
         }
@@ -927,6 +933,17 @@ Options parse_options(int argc, char** argv) {
         if (options.compare_kv_histories && !options.decode_only_prompt)
             throw std::runtime_error(
                 "--compare-kv-histories requires --decode-only-prompt");
+        if(options.prefill_stop_on_eos &&
+           (!options.prefill_kv_run || !options.prefill_kv_token_set ||
+            options.prefill_kv_token!=107 ||
+            options.prefill_kv_steps<2 || options.prefill_allow_tie_lowest ||
+            options.prefill_seed_last_prompt || options.prefill_seed_first_prompt))
+            throw std::runtime_error(
+                "--prefill-stop-on-eos requires --prefill-kv-run, "
+                "--prefill-kv-token 107, 2..16 steps, non-arbitrary tie policy");
+        if(options.prefill_kv_steps>4 && !options.prefill_stop_on_eos)
+            throw std::runtime_error(
+                "More than 4 --prefill-kv-steps requires --prefill-stop-on-eos");
         if (!options.kv_next_list.empty() && !options.kv_feedback)
             throw std::runtime_error("--kv-next-list requires --kv-feedback-pos or --kv-auto-pos");
         if (options.kv_auto_pos && options.kv_next_list.empty())
@@ -952,7 +969,7 @@ Options parse_options(int argc, char** argv) {
         options.prefill_seed_last_prompt || options.prefill_seed_first_prompt ||
         options.prefill_bos_only_compare || options.prefill_first_input_compare ||
         options.decode_only_prompt || options.compare_kv_histories ||
-        options.prefill_tie_policy_set ||
+        options.prefill_tie_policy_set || options.prefill_stop_on_eos ||
         options.prefill_kv_diagnose || options.chain_decode_head ||
         options.kv_feedback || options.kv_run_next ||
         !options.kv_next_list.empty() || !options.kv_next_reference_dir.empty() ||
@@ -2384,10 +2401,22 @@ void execute_prefill_linked_decode(
                  <<" quantized_int8_argmax=1\n"<<std::flush;
         return id;
     };
-    if(options.prefill_kv_steps<1 || options.prefill_kv_steps>4)
+    if(options.prefill_kv_steps<1 || options.prefill_kv_steps>16)
         throw std::runtime_error("PREFILL_LINK_STEPS_OUT_OF_RANGE");
     if(first_position+options.prefill_kv_steps>4096)
         throw std::runtime_error("PREFILL_LINK_STEPS_EXCEED_KV_CAPACITY");
+    uint32_t executed_steps=1;
+    bool eos_stop=false;
+    const auto stop_if_eos=[&](int32_t id,uint32_t prediction_step)->bool {
+        if(!options.prefill_stop_on_eos || (id!=1 && id!=106 && id!=50))
+            return false;
+        std::cout<<"PREFILL_LINK_STOP_EOS: prediction_step="<<prediction_step
+                 <<" predicted_position="<<(first_position+prediction_step)
+                 <<" eos_id="<<id
+                 <<" not_submitted_to_decode=1"
+                 <<" generation_complete=1\n"<<std::flush;
+        return true;
+    };
     int32_t next_id=first_token;
     if(options.prefill_seed_last_prompt) {
         next_id=next_argmax(1);
@@ -2396,8 +2425,11 @@ void execute_prefill_linked_decode(
                  <<" replayed_last_prompt_position="<<first_position
                  <<" quantized_greedy=1 independent_reference_claim=0\n"
                  <<std::flush;
-    } else if(options.prefill_kv_steps>1)next_id=next_argmax(1);
-    for(uint32_t step=2;step<=options.prefill_kv_steps;++step) {
+    } else if(options.prefill_kv_steps>1) {
+        next_id=next_argmax(1);
+        eos_stop=stop_if_eos(next_id,1);
+    }
+    for(uint32_t step=2;step<=options.prefill_kv_steps && !eos_stop;++step) {
         const size_t feedback_position=first_position+step-2;
         const size_t input_position=feedback_position+1;
         size_t written=0;
@@ -2474,19 +2506,29 @@ void execute_prefill_linked_decode(
                      decode_end-decode_start).count()
                  <<" reference_comparison=0\n"<<std::flush;
         execute_chained_decode_head(runtime,decode,head,hidden_index,true);
+        executed_steps=step;
         std::cout<<"PREFILL_LINK_NEXT_HEAD_OK: step="<<step
                  <<" logits_bytes="<<head.output_buffers.at(0).size()
                  <<" linked_KV_feedback=1"
                  <<" independent_reference_comparison=0\n"<<std::flush;
-        if(step<options.prefill_kv_steps)next_id=next_argmax(step);
+        if(options.prefill_stop_on_eos || step<options.prefill_kv_steps) {
+            next_id=next_argmax(step);
+            eos_stop=stop_if_eos(next_id,step);
+        }
     }
-    std::cout<<"PREFILL_LINK_MULTI_STEP_OK: steps="<<options.prefill_kv_steps
+    if(options.prefill_stop_on_eos && !eos_stop)
+        std::cout<<"PREFILL_LINK_STOP_LIMIT: executed_steps="<<executed_steps
+                 <<" requested_steps="<<options.prefill_kv_steps
+                 <<" generation_complete=0\n"<<std::flush;
+    std::cout<<"PREFILL_LINK_MULTI_STEP_OK: steps="<<executed_steps
              <<" first_position="<<first_position
-             <<" last_position="<<(first_position+options.prefill_kv_steps-1)
+             <<" last_position="<<(first_position+executed_steps-1)
              <<" first_token="<<first_token
              <<" last_prompt_replayed="<<(options.prefill_seed_last_prompt?1:0)
              <<" first_prompt_replayed="<<(options.prefill_seed_first_prompt?1:0)
              <<" int8_tie_policy="<<(options.prefill_allow_tie_lowest?"lowest-id-experimental":"stop")
+             <<" requested_steps="<<options.prefill_kv_steps
+             <<" eos_stop="<<(eos_stop?1:0)
              <<" all_KV_from_prefill_or_feedback_RAM=1"
              <<" all_nonKV_from_CPU=1"
              <<" independent_reference_claim=0\n"<<std::flush;
