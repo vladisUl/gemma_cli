@@ -448,3 +448,24 @@ DECODE_NEXT_HEAD_REFERENCE_MATCH: 262144 logits bytes identical
 обязан остаться успешным. Если новая сверка не пройдёт, не изменять исходные
 `.raw` и не считать несоответствие доказательством ошибки кэша без изучения
 источника эталонов. QAIRT-инференс на Q8B для нового режима пока не выполнен.
+
+## Stage 4.4: окончательная побайтовая проверка на Q8B (2026-11-25)
+
+На плате подтверждён **полный успех** запуска с обоими эталонными каталогами:
+
+```text
+PERSISTENT_CONTEXTS_READY: 3 graphs; one backend/device; all contexts alive
+ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors
+KV_AUTO_POS_OK: pos=3 changed_cache_tensors=30 total_cache_tensors=30
+KV_FEEDBACK_OK: pos=3 cache_tensors=30 inserted_bytes=9216
+KV_NEXT_CACHE_MATCH: 30 cache tensors byte-identical
+DECODE_NEXT_INPUTS_READY: kv_from_RAM=30 non_kv_from_saved_next=8
+DECODE_NEXT_EXECUTE_OK: graph=qnn_partition_0 outputs=31 execute_ms=74.9764
+DECODE_NEXT_REFERENCE_MATCH: 31 output tensors byte-identical
+DECODE_NEXT_HEAD_EXECUTE_OK: logits=262144
+DECODE_NEXT_HEAD_REFERENCE_MATCH: 262144 logits bytes identical
+```
+
+Доказано, что второй Decode использует 30 K/V-кэшей, рассчитанных нашим CPU-кодом в RAM, а не загружает готовые кэши шага 4. Все 31 выход второго Decode совпали с эталоном `auto_result_decode_4`, все 262144 байта второго LM Head — с `auto_result_head_4`. Контексты QNN загружены один раз в порядке Decode → Prefill → LM Head.
+
+**Граница результата:** 8 остальных входов второго Decode по-прежнему читаются из сохранённых файлов. Полноценная генерация потребует локальных CPU embeddings, per-layer embeddings, masks, RoPE и SentencePiece. Продолжение в [Stage 5 CPU](STAGE5_CPU.md).
