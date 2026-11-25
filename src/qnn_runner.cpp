@@ -461,6 +461,8 @@ struct Options {
     bool prefill_stop_on_eos = false;
     bool dynamic_prefill = false;
     bool dynamic_benchmark = false;
+    bool dynamic_bench_fixed_steps_set = false;
+    uint32_t dynamic_bench_fixed_steps = 0;
     bool dynamic_tie_policy_set = false;
     bool dynamic_allow_tie_lowest = false;
     std::string dynamic_prompt_tokens,dynamic_section0,dynamic_section1,dynamic_section2;
@@ -621,6 +623,9 @@ void usage(const char* executable) {
         << "     optional --dynamic-max-tokens N (1..256, default 16).\n"
         << "  --dynamic-benchmark: Stage 8.0 per-phase steady_clock timings;\n"
         << "     no additional model executions or warm-up steps.\n"
+        << "  --dynamic-bench-fixed-steps N (1..256): Stage 8.1 synthetic\n"
+        << "     fixed-token throughput: always update KV, ignore model EOS/ties.\n"
+        << "     Requires --dynamic-prefill --dynamic-benchmark; NOT normal text.\n"
         << "  --dynamic-tie-policy stop|lowest-id (default stop):\n"
         << "     lowest-id is EXPERIMENTAL, quantized-tie only, no FP32 claim.\n"
         << "  --prefill-stop-on-eos: LF107 continuation; EOS ids 1,106,50 stop.\n"
@@ -760,6 +765,19 @@ Options parse_options(int argc, char** argv) {
             options.dynamic_tie_policy_set=true;
             options.dynamic_allow_tie_lowest=(value=="lowest-id");
         }
+        else if (arg == "--dynamic-bench-fixed-steps") {
+            if(options.dynamic_bench_fixed_steps_set ||
+               value.empty() || value.front()=='-')
+                throw std::runtime_error(
+                    "--dynamic-bench-fixed-steps expects 1..256 exactly once");
+            size_t consumed=0;
+            const auto count=std::stoul(value,&consumed);
+            if(consumed!=value.size() || count<1 || count>256)
+                throw std::runtime_error(
+                    "--dynamic-bench-fixed-steps must be 1..256");
+            options.dynamic_bench_fixed_steps_set=true;
+            options.dynamic_bench_fixed_steps=static_cast<uint32_t>(count);
+        }
         else if (arg == "--dynamic-max-tokens") {
             if(value.empty() || value.front()=='-')
                 throw std::runtime_error("--dynamic-max-tokens expects 1..256");
@@ -884,6 +902,13 @@ Options parse_options(int argc, char** argv) {
         if (options.system.empty() || options.backend.empty())
             throw std::runtime_error("--jobs needs --system and --backend");
         if(options.dynamic_prefill) {
+            if(options.dynamic_bench_fixed_steps_set &&
+               (!options.dynamic_benchmark ||
+                options.dynamic_tie_policy_set ||
+                options.dynamic_max_tokens!=16))
+                throw std::runtime_error(
+                    "--dynamic-bench-fixed-steps requires --dynamic-benchmark, "
+                    "no --dynamic-tie-policy, and default --dynamic-max-tokens");
             if(options.dynamic_prompt_tokens.empty() ||
                options.dynamic_section0.empty() ||
                options.dynamic_section1.empty() ||
@@ -908,6 +933,9 @@ Options parse_options(int argc, char** argv) {
             throw std::runtime_error("--dynamic-tie-policy requires --dynamic-prefill");
         if(options.dynamic_benchmark)
             throw std::runtime_error("--dynamic-benchmark requires --dynamic-prefill");
+        if(options.dynamic_bench_fixed_steps_set)
+            throw std::runtime_error(
+                "--dynamic-bench-fixed-steps requires --dynamic-prefill");
         if(!options.dynamic_prompt_tokens.empty() ||
            !options.dynamic_section0.empty() ||
            !options.dynamic_section1.empty() ||
@@ -1040,7 +1068,7 @@ Options parse_options(int argc, char** argv) {
         return options;
     }
     if (options.dynamic_prefill || options.dynamic_tie_policy_set ||
-        options.dynamic_benchmark ||
+        options.dynamic_benchmark || options.dynamic_bench_fixed_steps_set ||
         !options.dynamic_prompt_tokens.empty() ||
         !options.dynamic_section0.empty() || !options.dynamic_section1.empty() ||
         !options.dynamic_section2.empty() || options.dynamic_max_tokens!=16 ||

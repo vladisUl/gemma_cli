@@ -227,6 +227,116 @@ void run_stage7_2_dynamic(
         decode->input_buffers[found]=std::move(value);
         return found;
     };
+    // Stage 8.1: fixed-length SYNTHETIC load test. Each QNN graph is executed
+    // for the same real inputs as Stage 7.x, but after the header LF107,
+    // force token ID 236778 ("2") on EVERY subsequent Decode position.
+    // This isolates graph/KV costs with 256 steps independent of EOS/ties.
+    // IMPORTANT: This branch is opt-in and never renders generated text.
+    if(options.dynamic_bench_fixed_steps_set) {
+        constexpr int32_t fixed_token=236778;
+        const uint32_t steps=options.dynamic_bench_fixed_steps;
+        if(seed_pos+steps>4096)
+            throw std::runtime_error("BENCH81_KV_CAPACITY_EXCEEDED");
+        const auto workload_start=std::chrono::steady_clock::now();
+        double cpu_total=0,decode_total=0,head_call_total=0;
+        double feedback_total=0,steps_total=0,first_step_ms=0;
+        const auto ms=[](auto end,auto begin)->double {
+            return std::chrono::duration<double,std::milli>(end-begin).count();
+        };
+        std::cout<<"BENCH81_MODE: requested_steps="<<steps
+                 <<" prefill_tokens="<<seed_pos
+                 <<" decode_first_token="<<seed
+                 <<" decode_replay_token="<<fixed_token
+                 <<" context_capacity=4096"
+                 <<" synthetic_fixed_input=1 no_eos_stop=1"
+                 <<" no_argmax_tie_stop=1 kv_feedback_each_step=1"
+                 <<" excludes_context_load_from_decode_rate=1\n"<<std::flush;
+        for(uint32_t step=1;step<=steps;++step) {
+            const size_t pos=seed_pos+(step-1);
+            const int32_t input_token=(step==1)?seed:fixed_token;
+            const auto t0=std::chrono::steady_clock::now();
+            std::set<size_t> nonkv_indexes;
+            nonkv_indexes.insert(nonkv(
+                "decode_embeddings_0",QNN_DATATYPE_FLOAT_32,6144,
+                gemma4::compute_packed_embedding(
+                    options.dynamic_section0,0,input_token)));
+            nonkv_indexes.insert(nonkv(
+                "decode_per_layer_embeddings_0",QNN_DATATYPE_FLOAT_32,35840,
+                gemma4::compute_packed_embedding(
+                    options.dynamic_section2,2,input_token)));
+            const auto aux=gemma4::run_decode_aux(
+                options.dynamic_section1,static_cast<int32_t>(pos),input_token);
+            if(aux.size()!=6)
+                throw std::runtime_error("BENCH81_DECODE_AUX_NOT_SIX");
+            const std::array<size_t,6> aux_bytes{512,512,256,256,4097,4097};
+            for(size_t i=0;i<aux.size();++i)
+                nonkv_indexes.insert(nonkv(
+                    aux[i].qnn_name,QNN_DATATYPE_SFIXED_POINT_8,
+                    aux_bytes[i],std::vector<uint8_t>(aux[i].bytes)));
+            if(nonkv_indexes.size()!=8 ||
+               nonkv_indexes.size()+kv_indexes.size()!=38)
+                throw std::runtime_error("BENCH81_DECODE_INPUTS_INCOMPLETE");
+            for(size_t i=0;i<decode->inputs.size();++i)
+                bind_raw(decode->inputs[i],decode->input_buffers[i]);
+            const auto t1=std::chrono::steady_clock::now();
+            runtime.execute(decode->handle,decode->inputs,decode->outputs);
+            const auto t2=std::chrono::steady_clock::now();
+            execute_chained_decode_head(runtime,*decode,*head,hidden,true);
+            const auto t3=std::chrono::steady_clock::now();
+            size_t feedback_bytes=0,cache_updates=0;
+            for(const auto& link:links) {
+                const auto& slice=decode->output_buffers[link.output_index];
+                auto& cache=decode->input_buffers[link.input_index];
+                gemma4::update_kv_slot(
+                    cache,slice,link.channels,4096,pos,
+                    link.key?gemma4::KvLayout::Key:
+                             gemma4::KvLayout::Value);
+                feedback_bytes+=slice.size();
+                ++cache_updates;
+            }
+            if(feedback_bytes!=9216 || cache_updates!=30)
+                throw std::runtime_error("BENCH81_KV_FEEDBACK_INVALID");
+            const auto t4=std::chrono::steady_clock::now();
+            const double cpu=ms(t1,t0),dec=ms(t2,t1);
+            const double head_call=ms(t3,t2),feedback=ms(t4,t3);
+            const double total=ms(t4,t0);
+            cpu_total+=cpu;
+            decode_total+=dec;
+            head_call_total+=head_call;
+            feedback_total+=feedback;
+            steps_total+=total;
+            if(step==1)first_step_ms=total;
+            std::cout<<"BENCH81_STEP: step="<<step
+                     <<" pos="<<pos<<" input_token="<<input_token
+                     <<" cpu_nonkv_ms="<<cpu
+                     <<" npu_decode_ms="<<dec
+                     <<" head_call_ms="<<head_call
+                     <<" kv_feedback_ms="<<feedback
+                     <<" step_wall_ms="<<total
+                     <<" kv_updated=1 kv_tensors=30"
+                     <<" kv_slice_bytes="<<feedback_bytes
+                     <<" no_sample_logits_used=1\n"<<std::flush;
+        }
+        const double workload_wall_ms=ms(
+            std::chrono::steady_clock::now(),workload_start);
+        std::cout<<"BENCH81_OK: executed_steps="<<steps
+                 <<" kv_updates="<<steps
+                 <<" kv_tensors_per_step=30"
+                 <<" last_written_pos="<<(seed_pos+steps-1)
+                 <<" fixed_token="<<fixed_token
+                 <<" prefill_tokens="<<seed_pos
+                 <<" cpu_nonkv_total_ms="<<cpu_total
+                 <<" npu_decode_total_ms="<<decode_total
+                 <<" head_call_total_ms="<<head_call_total
+                 <<" kv_feedback_total_ms="<<feedback_total
+                 <<" measured_steps_total_ms="<<steps_total
+                 <<" first_step_ms="<<first_step_ms
+                 <<" decode_steps_per_s="<<(steps_total>0?1000.0*steps/steps_total:0.0)
+                 <<" workload_wall_ms="<<workload_wall_ms
+                 <<" synthetic_not_text_generation=1\n"<<std::flush;
+        return;
+    }
+
     size_t executed=0,produced=0,tie_resolutions=0;
     int32_t token=seed;
     size_t position=seed_pos;

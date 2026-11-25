@@ -174,3 +174,86 @@ use; NPU Decode graph latency (~64.8ms per token) versus Head (~11.2ms)
 and CPU input prep (~8.5ms). Do not optimize BPE and claim that will
 remove the dominant Decode graphExecute latency.
 
+
+
+## Stage 8.1 — 256 exact Decode steps with KV feedback (synthetic load test)
+
+Stage 8.1 is implemented in the **existing** sample-free dynamic path
+behind an opt-in flag: `--dynamic-bench-fixed-steps N` (1..256),
+which additionally requires `--dynamic-prefill --dynamic-benchmark`.
+Normal user-facing inference and Stage 8.0 stay unchanged.
+
+**Method:** use the normal BPE prompt and Prefill-128 once; use its KV
+for the first Decode token (the chat-header LF, token 107), and then
+feed a deterministic token ID **236778** (the known BPE token for "2")
+at every later Decode iteration, irrespective of predicted token IDs.
+The head graph runs at **every** step, but EOS and ties are ignored.
+Every iteration updates **all 30 KV slices** in the SAME live Decode
+KV buffers, INCLUDING the last step. Only the new slot is modified
+on the host; QNN continues to receive the complete declared KV RAW
+inputs. `BENCH81_STEP` verifies all 30 slices, exactly 9216 feedback
+bytes per step, input ID and next KV position.
+
+The benchmark is an **artificial, fixed-length workload**, **NOT**
+semantic text generation, a faithful FP32 sampler, or a standalone
+warm-start inference. It is intended to isolate the cost of
+`CPU non-KV → QNN Decode → QNN LM Head → KV update` while the three
+AOT contexts stay loaded for all 256 measured steps.
+
+No extra warm-up iterations are inserted into the measured process.
+Before measuring, a golden run in a separate process must reproduce
+the exact nine tokens and `2 + 2 будет **4**.` including EOS106.
+That golden run can still change OS caches and NPU clock state;
+the following measured processes start with their own fresh QNN
+contexts and are not cold boots.
+
+### Run on the Q8B
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+python3 scripts/bench_stage8_1.py --runs 3 --steps 256 \
+  --text 'Что ты умеешь?'
+```
+
+The output contains three `STAGE81_RUN` lines, a table of medians,
+`STAGE81_OK`, and a unique `summary.json` and per-run logs under
+`~/gemma4_qnn_test/bench_stage8_1_.../`. Do not present synthetic
+`decode_steps_per_s` as natural-language text tokens/s; it is the
+rate of completed Decode+Head+KV update iterations.
+
+Per-step timings use host `steady_clock`:
+- `cpu_nonkv_ms`: packed embeddings + TFLite auxiliary outputs +
+  metadata validation and binding of buffers
+- `npu_decode_ms`: blocking QNN Decode `graphExecute`
+- `head_call_ms`: full Head call, including NPU execution and
+  diagnostic argmax/log output
+- `head_execute_ms`: strictly the LM Head graphExecute, from the
+  existing `CHAIN_DECODE_HEAD_OK` marker
+- `kv_feedback_ms`: copy/update **all 30 output cache slices**
+  into the new token slot
+- `step_wall_ms`: sum of CPU, Decode, Head and feedback before
+  benchmark logging (no AOT load included)
+
+Both full-loop step/s and NPU-only graphExecute step/s are printed.
+NPU graph times are synchronous host API durations, not HTP cycle
+counters. `steps_after_first_per_s` is separately provided.
+
+### Comparison against LiteRT-LM
+
+The user's LiteRT-LM 0.19.1 E2B YNNPACK benchmark is
+`prefill_tokens=256`, `decode_tokens=256`,
+`max_num_tokens=1024`, 8 CPU threads, MTP disabled; measured
+27.689 decoded tok/s. In Stage 8.0 our natural-greedy sample-free
+QNN ran 64 text tokens from a **13-token** Prefill context at
+11.83 tok/s, with cache capacity 4096.
+
+Stage 8.1 now controls the number of Decode steps (256) and ensures
+complete KV feedback, but still uses fixed AOT Prefill-128 and cache
+capacity 4096. The data stream is synthetic fixed token 236778;
+LiteRT-LM measures normal decode from 256 Prefill tokens. Therefore
+Stage 8.1 is NOT yet a matched 256/256/1024 comparison.
+Future Stage 8.2 would require a correct, validated 256-token
+Prefill and a matching QNN Decode AOT with 1024 KV capacity.
