@@ -150,6 +150,10 @@ export ADSP_LIBRARY_PATH="$PWD/sdk247"
 
 **Stage 7.2 (код ожидает Q8B):** экспериментальный sample-free режим `--dynamic-prefill` в `gemma4-qnn-run`. QNN graph metadata читается из AOT бинарников, но старые input-list/Result_0 не читаются и не исполняются. Входы вычисляются заново CPU, Prefill KV копируется в чистый Decode KV, последний LF107 повторяется на Decode, затем Head + autoregressive generation до EOS или 16 токенов. Скрипт [scripts/test_dynamic_text_stage7_2.sh](scripts/test_dynamic_text_stage7_2.sh) сначала требует точного воспроизведения эталонных 9 ID и `2 + 2 будет **4**.`, только потом запускает произвольный вопрос. Старые reference-тесты Stage6 не изменены. Запуск после пересборки: `bash scripts/test_dynamic_text_stage7_2.sh 'Сколько будет 3 + 5?'`.
 
+**Stage 7.2 (Q8B подтверждён):** sample-free dynamic QNN inference работает! Самостоятельно проверены 9 ID и `2 + 2 будет **4**.` на свежих CPU Prefill/Decode входах, без sample/raw reference. Новый пользовательский запрос `Сколько будет 3 + 5?` сгенерировал `3 + 5 = **8**`, закончил токеном EOS106, все 9 INT8 максимумов однозначны.
+
+**Stage 7.3 (код ожидает Q8B):** простая терминальная команда [scripts/gemma4_cli.py](scripts/gemma4_cli.py). Пример: `python3 scripts/gemma4_cli.py --text 'Сколько будет 3 + 5?'` или без `--text` для цикла ввода `Вы>`. Python BPE запускается **до** загрузки QNN, а парсер `scripts/gemma4_decode_log.py` — **после** освобождения контекстов; так BPE JSON не занимает память одновременно с QNN. Выводится лишь сам ответ и заметка при лимите/INT8 tie. В случае QNN ошибки исходный диагностический лог сохраняется уникальным именем; файлы образцов и AOT не меняются. **Пока каждый вопрос запускает новый процесс QNN и чистый KV-cache**, беседа с историей ещё не поддерживается. До полноценного постоянного CLI нужны persistent runtime и многоходовой диалог. Детали [docs/STAGE7_CLI.md](docs/STAGE7_CLI.md).
+
 ## Дорожная карта
 
 1. **Stage 1 — backend/context smoke test** (исходный код). Выявить несовместимости C API с QAIRT 2.47, проверить время загрузки контекста.

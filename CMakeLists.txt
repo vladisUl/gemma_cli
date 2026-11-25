@@ -100,6 +100,15 @@ if(BUILD_TESTING)
       COMMAND "${Python3_EXECUTABLE}"
               "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gemma4_bpe.py"
               --help)
+    add_test(NAME gemma4_cli_help
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gemma4_cli.py" --help)
+    add_test(NAME gemma4_decode_log_help
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/scripts/gemma4_decode_log.py" --help)
+    add_test(NAME gemma4_decode_log_unit
+      COMMAND "${Python3_EXECUTABLE}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_stage7_3_cli_unit.py")
     add_test(NAME prefill_padding_unit
       COMMAND "${Python3_EXECUTABLE}"
               "${CMAKE_CURRENT_SOURCE_DIR}/scripts/test_prefill_padding_unit.py")
