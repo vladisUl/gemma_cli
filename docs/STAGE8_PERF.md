@@ -637,3 +637,55 @@ preserve diagnostics before a normal reboot. Only after verifying
 stability consider the established RAW path, not another MEMHANDLE
 trial. Qualcomm FastRPC daemon documentation explains SSR/PDR
 re-attachment and diagnostic logging.
+
+### STAGE82_KERNEL_TIMELINE_2026_11_25
+
+Kernel journal and read-only remoteproc status from the Q8B were
+provided after the Stage 8.2.1 probe. They **correct** the prior
+overly strong inference that the ~20:04 one-MEMHANDLE probe itself
+proved a fresh hardware CDSP crash:
+
+- **2026-11-25 12:54:33**: `qcom,fastrpc-cb ... compute-cb@2`
+  reported `failed to map buffer, fd = 22`; kernel
+  `qcom_q6v5_pas` immediately reported a fatal CDSP exception
+  (`EX:kernel:0x1:HAP_par_thread_:...`).
+  `remoteproc1` reported `crash detected in cdsp`, handled
+  `crash #1`, recovered and announced `cdsp is now up`
+  **in the same second**.
+- **2026-11-25 20:04:04**: `compute-cb@2` reported several
+  `unmmap pt fd = 21..26, 0x000000000 error` messages.
+  In the supplied journal excerpt there was **no new**
+  `crash detected in cdsp`, `handling crash`, or
+  `recovering cdsp` event around that probe.
+- At the time status was inspected, both `remoteproc0/adsp`
+  and `remoteproc1/cdsp` reported **state: running**,
+  `recovery: enabled`.
+
+At ~20:04 the MEMHANDLE QNN userspace trace **did** report
+`DspTransport call failed`, `Failed to connect to the skel`,
+`SSR detected` and `QNN error 1003`. That is evidence of
+broken **FastRPC/QNN transport or session state**, but the
+kernel excerpt does not establish a new physical CDSP subsystem
+restart at that time. Kernel `unmmap` messages could arise during
+cleanup and do not by themselves establish a leaked mapping or a
+causal DMA fault. Likewise boot-time `no reserved DMA memory for
+FASTRPC` is a driver initialization message, **not independently
+proof** that RPCmem is unsupported; the RAW path works and
+`QnnMem_register` had succeeded with 30 buffers.
+
+Working hypothesis remains **memory registration / DSP DMA
+mapping / transport interaction**, with root cause unproven.
+Do not run further MEMHANDLE trials yet. Keep the confirmed
+RAW benchmark and BASIC profile baselines. Preserve complete
+kernel logs near **12:54:33** and **20:04:04**, plus the failing
+QNN userspace log, before any reboot. Read-only commands:
+
+```bash
+sudo journalctl -k -b --since '2026-11-25 12:53:30' \
+  --until '2026-11-25 12:55:30' --no-pager
+sudo journalctl -k -b --since '2026-11-25 20:03:00' \
+  --until '2026-11-25 20:05:30' --no-pager
+```
+
+This amendment changes **documentation only**; no modified AOT,
+QNN runner behavior, memory-allocation parameters, or DSP reset.
