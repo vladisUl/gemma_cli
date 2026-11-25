@@ -236,3 +236,58 @@ set -o pipefail
 
 Ожидаются уже проверенные строки `ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors`, а затем `CHAIN_DECODE_HEAD_OK: ... hidden_bytes=1536 logits_bytes=262144`. Этот режим **не генерирует текст** и пока не обновляет KV-cache между шагами; для этого потребуется CPU LiteRT и токенизатор на Radxa.
 
+
+## Stage 4.2 — обновление KV-cache в RAM (проверка на Q8B впереди)
+
+На Q8B уже подтверждена связка `Decode → LM Head`:
+`CHAIN_METADATA_OK`, `ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors`,
+`CHAIN_DECODE_HEAD_OK: ... hidden_bytes=1536 logits_bytes=262144 ... head_execute_ms=9.6176 int8_argmax_id=568 argmax_ties=1`.
+
+Добавлен необязательный флаг `--kv-feedback-pos N` для `gemma4-qnn-run --jobs`.
+После независимой проверки всех графов он **изменяет 30 входных K/V-кэшей Decode непосредственно в RAM**
+на основании 30 выходных K/V-срезов Decode.
+
+- Для K: форма кэша `[1,1,C,4096]`, среза `[1,1,C,1]`; запись по адресу `cache[c*4096 + N]`.
+- Для V: форма кэша `[1,1,4096,C]`, среза `[1,1,1,C]`; запись `cache[N*C + c]`.
+- `C` равен 256 или 512; `N` — позиция 0..4095, **не обязательно совпадает с цифрой в имени тестового файла**.
+- Сопоставление слоёв восстанавливается из оригинальной TFLite Decode signature и имён QNN `StatefulPartitionedCall_0..29`; исполнитель сверяет имена, типы, формы и количество всех 30 пар.
+- Буферы находятся в памяти процесса, исходные `.raw` и `.bin` не изменяются.
+
+Добавлены `src/kv_cache.h`, `src/kv_cache.cpp` и `tests/kv_cache_test.cpp`.
+Синтетический CPU-тест раскладки K/V прошёл при локальной компиляции; полная сборка с QAIRT на Q8B ещё не проверена.
+
+**Следующая проверка на Q8B:**
+
+```bash
+cd ~/gemma4-cli-stage1
+git pull --ff-only origin main
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DQAIRT_ROOT="$HOME/qairt247-headers"
+cmake --build build -j2
+ctest --test-dir build --output-on-failure
+
+cd ~/gemma4_qnn_test
+export LD_LIBRARY_PATH="$PWD/sdk247"
+export ADSP_LIBRARY_PATH="$PWD/sdk247"
+set -o pipefail
+../gemma4-cli-stage1/build/gemma4-qnn-run \
+  --system "$PWD/sdk247/libQnnSystem.so" \
+  --backend "$PWD/sdk247/libQnnHtp.so" \
+  --jobs persistent_jobs_decode_prefill_head.txt \
+  --chain-decode-head --kv-feedback-pos 3 2>&1 | tee kv_feedback.log
+```
+
+Здесь позиция `3` выбрана **только для механической проверки обновления слота**.
+Искомые строки: `KV_MAPPING_OK: 30 cache/slice links; pos=3`,
+`ALL_JOBS_REFERENCES_MATCH: 3 graphs 62 output tensors`,
+`CHAIN_DECODE_HEAD_OK`, `KV_FEEDBACK_OK: pos=3 cache_tensors=30`.
+
+**Проверка на реальной последовательности:** если точно установлено, что `auto_decode_step3_list.txt`
+предшествует `auto_decode_step4_list.txt`, и позиция в первом вызове равна 3, можно дополнить
+запуск флагом `--kv-next-list auto_decode_step4_list.txt`. Он сравнит **все 30 полных обновлённых
+кэш-буферов** с входами следующего сохранённого Decode. Тогда искомый итог:
+`KV_NEXT_CACHE_MATCH: 30 cache tensors byte-identical`.
+При `KV_NEXT_MISMATCH` сначала перепроверяем соответствие шагов и позиции, прежде чем менять код.
+
+**Ограничение:** пока это обновление RAM после одного сохранённого Decode, а не следующий шаг
+модели. Для цикла генерации нужны локальные CPU-модели embeddings, per-layer embeddings, masks,
+RoPE, точный контроль позиции и выбранного токена.
