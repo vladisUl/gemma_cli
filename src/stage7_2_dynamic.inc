@@ -320,8 +320,8 @@ void run_stage7_2_dynamic(
                         hash*=uint64_t{1099511628211};
                     }
                 };
-                uint64_t decode_hash=uint64_t{14695981039346656037};
-                uint64_t head_hash=uint64_t{14695981039346656037};
+                uint64_t decode_hash=uint64_t{14695981039346656037ULL};
+                uint64_t head_hash=uint64_t{14695981039346656037ULL};
                 for(const auto& v:decode->output_buffers)
                     fnv(decode_hash,v);
                 fnv(head_hash,head->output_buffers.at(0));
